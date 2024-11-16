@@ -5,6 +5,7 @@ from docker.errors import ImageNotFound
 from docker.models.containers import ExecResult
 from docker.models.images import Image
 
+from daiv_sandbox.config import settings
 from daiv_sandbox.sessions import SandboxDockerSession
 
 
@@ -28,13 +29,27 @@ def mock_docker_client(mock_image):
         yield mock_client
 
 
+@patch("daiv_sandbox.sessions.signal.alarm")
+def test_context_manager(mock_signal_alarm, mock_docker_client, mock_image):
+    with SandboxDockerSession(image="test-image") as session:
+        assert session.container is not None
+        mock_signal_alarm.assert_called_once_with(settings.MAX_EXECUTION_TIME)
+    mock_signal_alarm.assert_called_with(0)  # Ensure alarm is reset
+
+
+@patch("daiv_sandbox.sessions.signal.alarm", side_effect=[TimeoutError, None])
+def test_context_manager_timeout(mock_signal_alarm, mock_docker_client, mock_image):
+    with pytest.raises(RuntimeError, match="Execution timed out"):  # noqa: SIM117
+        with SandboxDockerSession(image="test-image"):
+            pass
+    mock_signal_alarm.assert_called_with(0)  # Ensure alarm is reset
+
+
 def test_open_with_image(mock_docker_client, mock_image):
     session = SandboxDockerSession(image="test-image")
     session.open()
     mock_docker_client.images.get.assert_called_once_with("test-image")
-    mock_docker_client.containers.run.assert_called_once_with(
-        mock_image, detach=True, tty=True, mounts=None, runtime="runc"
-    )
+    mock_docker_client.containers.run.assert_called_once_with(mock_image, detach=True, mounts=None, runtime="runc")
     assert session.image == mock_image
     assert session.container is not None
 
