@@ -1,0 +1,118 @@
+[project]
+name = "daiv-sandbox"
+version = "0.1.0"
+description = "Runtime sandbox to empower DAIV agents to run arbitrary code/commands."
+readme = "README.md"
+license = { file = "LICENSE" }
+maintainers = [
+  { name = "Sandro Rodrigues", email = "srtabs@gmail.com" },
+]
+authors = [
+  { name = "Sandro Rodrigues", email = "srtabs@gmail.com" },
+]
+requires-python = ">=3.12"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "docker==7.1.0",
+  "fastapi[standard]==0.115.5",
+  "get-docker-secret==2",
+  "ipython==8.29",
+  "pydantic-settings==2.6.1",
+  "pydantic==2.9.2",
+  "python-decouple==3.8",
+  "python-multipart==0.0.17",
+  "sentry-sdk==2.18.0",
+]
+
+urls."Bug Tracker" = "https://github.com/srtab/daiv-sandbox/issues"
+urls.Repository = "https://github.com/srtab/daiv-sandbox"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = [ "*/node_modules/*", "*/static/*" ]
+
+force-exclude = true
+preview = true
+show-fixes = true
+format.skip-magic-trailing-comma = true
+lint.select = [
+  # flake8-builtins
+  "A",
+  # flake8-bugbear
+  "B",
+  # flake8-comprehensions
+  "C4",
+  # pycodestyle
+  "E",
+  # eradicate
+  "ERA",
+  # Pyflakes
+  "F",
+  # flake8-logging-format
+  "G",
+  # isort
+  "I",
+  # flake8-logging
+  "LOG",
+  # pep8-naming
+  "N",
+  # flake8-use-pathlib
+  "PTH",
+  # flake8-bandit
+  "S",
+  # flake8-simplify
+  "SIM",
+  # flake8-print
+  "T20",
+  # flake8-type-checking
+  "TCH",
+  # pyupgrade
+  "UP",
+  # pycodestyle
+  "W",
+]
+lint.ignore = [ "N812", "S101" ]
+lint.isort.known-first-party = []
+lint.isort.section-order = [
+  "future",
+  "standard-library",
+  "third-party",
+  "first-party",
+  "local-folder",
+]
+lint.isort.split-on-trailing-comma = false
+
+[tool.pytest.ini_options]
+addopts = "--cov --cov-config=.coveragerc"
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+  "decouple.*",
+  "docker.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest_env]
+PROJECT_NAME = "daiv-sandbox"
+
+[tool.uv]
+dev-dependencies = [
+  "mypy==1.13.0",
+  "pre-commit==4.0.1",
+  "pyproject-fmt==2.5.0",
+  "pyopenssl==24.2.1",
+  "pytest-asyncio==0.24.0",
+  "pytest-cov==6.0.0",
+  "pytest-env==1.1.5",
+  "pytest-mock==3.14.0",
+  "pytest-xdist==3.6.1",
+  "ruff==0.7.2",
+]
