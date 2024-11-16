@@ -31,11 +31,11 @@ ENV PYTHONPATH=/app
 
 COPY ./pyproject.toml ./uv.lock /app/
 
-COPY ./src /app/src
+COPY ./daiv_sandbox /app/daiv_sandbox
 
 # Sync the project
 # Ref: https://docs.astral.sh/uv/guides/integration/docker/#intermediate-layers
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync
 
-CMD ["fastapi", "run", "--workers", "4", "src/main.py"]
+CMD ["fastapi", "run", "--workers", "4", "daiv_sandbox/main.py"]
