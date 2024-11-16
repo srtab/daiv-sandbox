@@ -1,14 +1,14 @@
 {
-  "python.autoComplete.extraPaths": ["./src"],
-  "python.testing.pytestEnabled": false,
-  "python.testing.unittestEnabled": true,
-  "python.analysis.extraPaths": ["./src"],
-  "python.analysis.typeCheckingMode": "off",
-  "[python]": {
-    "editor.defaultFormatter": "charliermarsh.ruff",
-    "editor.formatOnSave": true,
-    "editor.codeActionsOnSave": {
-      "source.fixAll.ruff": "explicit"
+    "python.autoComplete.extraPaths": ["./src"],
+    "python.testing.pytestEnabled": false,
+    "python.testing.unittestEnabled": true,
+    "python.analysis.extraPaths": ["./src"],
+    "python.analysis.typeCheckingMode": "off",
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.fixAll.ruff": "explicit"
+        }
     }
-  }
 }

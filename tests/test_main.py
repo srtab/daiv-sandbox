@@ -14,7 +14,7 @@ def client():
 
 
 @patch("daiv_sandbox.main.SandboxDockerSession")
-def test_run_commands_success(MockSession, client):
+def test_run_commands_success(MockSession, client):  # noqa: N803
     # Mock the session and its methods
     mock_session = MockSession.return_value.__enter__.return_value
     mock_session.execute_command.return_value = MagicMock(output=b"success", exit_code=0)
@@ -42,7 +42,7 @@ def test_run_commands_success(MockSession, client):
 
 
 @patch("daiv_sandbox.main.SandboxDockerSession")
-def test_run_commands_failure(MockSession, client):
+def test_run_commands_failure(MockSession, client):  # noqa: N803
     # Mock the session and its methods
     mock_session = MockSession.return_value.__enter__.return_value
     mock_session.execute_command.return_value = MagicMock(output=b"error", exit_code=1)
