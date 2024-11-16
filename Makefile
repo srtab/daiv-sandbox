@@ -1,6 +1,6 @@
 # Makefile
 
-.PHONY: help test test-ci lint lint-check lint-format lint-fix lint-typing
+.PHONY: help test test-ci lint lint-check lint-format lint-fix lint-typing lock
 
 help:
 	@echo "Available commands:"
@@ -35,8 +35,5 @@ lint-typing:
 lock:
 	uv lock
 
-makemessages:
-	uv run django-admin makemessages --ignore=*/node_modules/* --ignore=.venv --no-location --no-wrap --all
-
-compilemessages:
-	uv run django-admin compilemessages
+run:
+	uv run fastapi dev daiv_sandbox/main.py --reload --port 8888
