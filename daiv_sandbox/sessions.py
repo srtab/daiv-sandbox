@@ -1,5 +1,6 @@
 import io
 import logging
+import signal
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -11,7 +12,16 @@ from docker.models.containers import Container, ExecResult
 from docker.models.images import Image
 from docker.types import Mount
 
+from daiv_sandbox.config import settings
+
 logger = logging.getLogger("daiv-sandbox.sessions")
+
+
+def handler(signum, frame):
+    raise TimeoutError("Execution timed out")
+
+
+signal.signal(signal.SIGALRM, handler)
 
 
 class Session(ABC):
@@ -36,10 +46,20 @@ class Session(ABC):
         raise NotImplementedError
 
     def __enter__(self):
-        self.open()
-        return self
+        try:
+            signal.alarm(settings.MAX_EXECUTION_TIME)
+
+            self.open()
+            return self
+        except TimeoutError as e:
+            self.__exit__()
+            raise RuntimeError("Execution timed out") from e
+        except Exception as e:
+            self.__exit__()
+            raise e
 
     def __exit__(self, *args, **kwargs):
+        signal.alarm(0)
         self.close()
 
 
@@ -105,9 +125,7 @@ class SandboxDockerSession(Session):
         else:
             raise ValueError("Invalid image type")
 
-        self.container = self.client.containers.run(
-            self.image, detach=True, tty=True, mounts=self.mounts, runtime=self.runtime
-        )
+        self.container = self.client.containers.run(self.image, detach=True, mounts=self.mounts, runtime=self.runtime)
 
     def close(self):
         """

@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     SENTRY_DSN: HttpUrl | None = None
     API_V1_STR: str = "/api/v1"
     ENVIRONMENT: Literal["local", "staging", "production"] = "local"
+    MAX_EXECUTION_TIME: int = 600  # seconds
 
 
 settings = Settings()  # type: ignore
