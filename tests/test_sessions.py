@@ -49,7 +49,9 @@ def test_open_with_image(mock_docker_client, mock_image):
     session = SandboxDockerSession(image="test-image")
     session.open()
     mock_docker_client.images.get.assert_called_once_with("test-image")
-    mock_docker_client.containers.run.assert_called_once_with(mock_image, detach=True, mounts=None, runtime="runc")
+    mock_docker_client.containers.run.assert_called_once_with(
+        mock_image, detach=True, mounts=None, tty=True, runtime="runc"
+    )
     assert session.image == mock_image
     assert session.container is not None
 
