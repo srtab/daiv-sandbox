@@ -1,5 +1,6 @@
 import io
 import logging
+import shlex
 import signal
 import uuid
 from abc import ABC, abstractmethod
@@ -125,7 +126,10 @@ class SandboxDockerSession(Session):
         else:
             raise ValueError("Invalid image type")
 
-        self.container = self.client.containers.run(self.image, detach=True, mounts=self.mounts, runtime=self.runtime)
+        self.container = self.client.containers.run(
+            self.image, detach=True, tty=True, mounts=self.mounts, runtime=self.runtime
+        )
+        logger.info("Container %s created", self.container.short_id)
 
     def close(self):
         """
@@ -194,7 +198,7 @@ class SandboxDockerSession(Session):
 
         logger.info("Executing command '%s' in %s:%s...", command, self.container.short_id, workdir)
 
-        result = self.container.exec_run(command, workdir=workdir)
+        result = self.container.exec_run(f"/bin/sh -c {shlex.quote(command)}", workdir=workdir)
 
         if result.exit_code != 0:
             logger.error(
@@ -209,7 +213,8 @@ class SandboxDockerSession(Session):
         Extract the list of changed files in the container.
         """
         if not self.container:
-            raise RuntimeError("Session is not open. Please call open() method before extracting files.")
+            logger.info("Session already closed. Skipping extraction of changed files.")
+            return None
 
         logger.info("Extracting list of changed files from %s:%s...", self.container.short_id, workdir)
 

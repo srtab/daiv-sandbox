@@ -33,12 +33,12 @@ async def run_commands(request: RunRequest) -> RunResponse:
     Run a set of commands in a sandboxed container and return archive with changed files.
     """
     run_dir = f"/tmp/run-{request.run_id}"  # noqa: S108
+    results = {}
 
     with SandboxDockerSession(image=request.base_image, keep_template=True) as session:
         with io.BytesIO(request.archive) as archive:
             session.copy_to_runtime(run_dir, archive)
 
-        results = {}
         for command in request.commands:
             result = session.execute_command(command, workdir=run_dir)
             results[command] = {"output": result.output.decode(), "exit_code": result.exit_code}
