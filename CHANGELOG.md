@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `__version__` to the project.
+- Added `health` endpoint to check if the service is healthy.
+- Added `version` endpoint to get the version of the service.
+- Added API Key authentication to command run endpoint.
+- Added more metadata to the OpenAPI schema.
+- Added support to pass a `workdir` to the command run endpoint.
+
+### Changed
+
+- Changed `Pydantic` models to specific `schemas.py` file.
+
+### Removed
+
+- Removed `--workers` from the `CMD` in the `Dockerfile` to allow scaling using docker replicas.
+- Removed `PROJECT_NAME` from the configuration.
+
+### Fixed
+
+- Fixed issue on command quoting using `shlex.quote`, which was causing double quoting of the command.
+
 ## [0.1.0-alpha.2] - 2024-11-18
 
 ### Changed

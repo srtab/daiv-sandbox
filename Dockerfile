@@ -38,4 +38,4 @@ COPY ./daiv_sandbox /app/daiv_sandbox
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync
 
-CMD ["fastapi", "run", "--workers", "4", "daiv_sandbox/main.py"]
+CMD ["fastapi", "run", "daiv_sandbox/main.py", "--host", "0.0.0.0", "--port", "8000"]
