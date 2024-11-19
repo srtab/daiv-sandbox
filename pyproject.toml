@@ -91,7 +91,7 @@ lint.isort.split-on-trailing-comma = false
 addopts = "--cov --cov-config=.coveragerc"
 
 [tool.pytest_env]
-PROJECT_NAME = "daiv-sandbox"
+API_KEY = "notsosecret"
 
 [tool.mypy]
 python_version = "3.12"

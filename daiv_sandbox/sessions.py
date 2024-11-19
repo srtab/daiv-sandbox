@@ -198,13 +198,15 @@ class SandboxDockerSession(Session):
 
         logger.info("Executing command '%s' in %s:%s...", command, self.container.short_id, workdir)
 
-        result = self.container.exec_run(f"/bin/sh -c '{shlex.quote(command)}'", workdir=workdir)
+        result = self.container.exec_run(f"/bin/sh -c {shlex.quote(command)}", workdir=workdir)
 
         if result.exit_code != 0:
-            logger.error(
+            logger.warning(
                 "Command '%s' in %s:%s exited with code %s", command, self.container.short_id, workdir, result.exit_code
             )
-            logger.debug("Command output: %s", result.output.decode())
+            logger.debug(
+                "Command '%s' in %s:%s output: %s", command, self.container.short_id, workdir, result.output.decode()
+            )
 
         return result
 
