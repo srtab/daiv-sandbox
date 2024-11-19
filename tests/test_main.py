@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from daiv_sandbox.config import settings
 from daiv_sandbox.main import app
 
 
@@ -30,7 +31,7 @@ def test_run_commands_success(MockSession, client):  # noqa: N803
     }
 
     # Send a POST request to the endpoint
-    response = client.post("/run/commands/", json=request_payload)
+    response = client.post(f"{settings.API_V1_STR}/run/commands/", json=request_payload)
 
     # Assert the response
     assert response.status_code == 200, response.text
@@ -58,7 +59,7 @@ def test_run_commands_failure(MockSession, client):  # noqa: N803
     }
 
     # Send a POST request to the endpoint
-    response = client.post("/run/commands/", json=request_payload)
+    response = client.post(f"{settings.API_V1_STR}/run/commands/", json=request_payload)
 
     # Assert the response
     assert response.status_code == 200, response.text
