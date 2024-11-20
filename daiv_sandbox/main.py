@@ -1,4 +1,6 @@
+import base64
 import io
+import logging
 from pathlib import Path
 from typing import Literal
 
@@ -10,11 +12,25 @@ from starlette.status import HTTP_403_FORBIDDEN
 
 from . import __version__
 from .config import settings
-from .schemas import RunRequest, RunResponse
+from .schemas import RunRequest, RunResponse, RunResult
 from .sessions import SandboxDockerSession
 
 API_KEY_NAME = "X-API-Key"
 
+
+# Configure root logger
+logging.config.dictConfig({
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {"format": "[%(asctime)s] %(levelname)s - %(name)s - %(message)s", "datefmt": "%d-%m-%Y:%H:%M:%S %z"}
+    },
+    "handlers": {"console": {"level": "DEBUG", "class": "logging.StreamHandler", "formatter": "verbose"}},
+    "loggers": {
+        "": {"level": "INFO", "handlers": ["console"]},
+        "daiv_sandbox": {"level": "DEBUG", "handlers": ["console"], "propagate": False},
+    },
+})
 
 if settings.SENTRY_DSN and settings.ENVIRONMENT != "local":
     sentry_sdk.init(
@@ -40,11 +56,17 @@ app = FastAPI(
     version=__version__,
     license_info={"name": "Apache License 2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0"},
     contact={"name": "DAIV", "url": "https://github.com/srtab/daiv-sandbox"},
-    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    root_path=settings.API_V1_STR,
 )
 
 
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+api_key_header = APIKeyHeader(
+    name=API_KEY_NAME,
+    auto_error=False,
+    description=(
+        "The API key must match the one declared in the DAIV Sandbox environment variables: `DAIV_SANDBOX_API_KEY`."
+    ),
+)
 
 
 async def get_api_key(api_key_header: str | None = Security(api_key_header)) -> str:
@@ -55,28 +77,33 @@ async def get_api_key(api_key_header: str | None = Security(api_key_header)) -> 
     return api_key_header
 
 
-@app.post(f"{settings.API_V1_STR}/run/commands/")
+@app.post("/run/commands/")
 async def run_commands(request: RunRequest, api_key: str = Depends(get_api_key)) -> RunResponse:
     """
     Run a set of commands in a sandboxed container and return archive with changed files.
     """
+    results: list[RunResult] = []
+    archive: str | None = None
+
     run_dir = f"/tmp/run-{request.run_id}"  # noqa: S108
-    results = {}
 
     with SandboxDockerSession(image=request.base_image, keep_template=True) as session:
-        with io.BytesIO(request.archive) as archive:
-            session.copy_to_runtime(run_dir, archive)
+        with io.BytesIO(request.archive) as request_archive:
+            session.copy_to_runtime(run_dir, request_archive)
 
         command_workdir = Path(run_dir) / request.workdir if request.workdir else Path(run_dir)
 
-        for command in request.commands:
-            result = session.execute_command(command, workdir=command_workdir.as_posix())
-            results[command] = {"output": result.output.decode(), "exit_code": result.exit_code}
+        results = [session.execute_command(command, workdir=command_workdir.as_posix()) for command in request.commands]
 
-    return RunResponse(results=results, archive=session.extract_changed_files(run_dir))
+        # Only create archive with changed files for the last command.
+        if changed_files := results[-1].changed_files:
+            changed_files_archive = session.create_tar_gz_archive(command_workdir, changed_files)
+            archive = base64.b64encode(changed_files_archive.getvalue()).decode()
+
+    return RunResponse(results=results, archive=archive)
 
 
-@app.get(f"{settings.API_V1_STR}/health/")
+@app.get("/health/")
 async def health() -> dict[Literal["status"], Literal["ok"]]:
     """
     Check if the service is healthy.
@@ -84,7 +111,7 @@ async def health() -> dict[Literal["status"], Literal["ok"]]:
     return {"status": "ok"}
 
 
-@app.get(f"{settings.API_V1_STR}/version/")
+@app.get("/version/")
 async def version() -> dict[Literal["version"], str]:
     """
     Get the version of the service.

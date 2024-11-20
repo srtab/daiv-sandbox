@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added logging to the application.
 - Added `__version__` to the project.
 - Added `health` endpoint to check if the service is healthy.
 - Added `version` endpoint to get the version of the service.
@@ -19,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Changed `Pydantic` models to specific `schemas.py` file.
+- Changed way to declare `root_path` of endpoints to be more maintainable.
+- Changed the way to extract changed files from the container, now it returns changed files by the executed command.
 
 ### Removed
 
@@ -28,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Fixed issue on command quoting using `shlex.quote`, which was causing double quoting of the command.
+- Fixed issue on extracting changed files from the container, it was returning a `tar` inside another `tar`.
 
 ## [0.1.0-alpha.2] - 2024-11-18
 
