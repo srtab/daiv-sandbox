@@ -12,7 +12,7 @@ from starlette.status import HTTP_403_FORBIDDEN
 
 from . import __version__
 from .config import settings
-from .schemas import RunRequest, RunResponse, RunResult
+from .schemas import ForbiddenError, RunRequest, RunResponse, RunResult
 from .sessions import SandboxDockerSession
 
 HEADER_API_KEY_NAME = "X-API-Key"
@@ -78,7 +78,12 @@ async def get_api_key(api_key_header: str | None = Security(api_key_header)) -> 
     return api_key_header
 
 
-@app.post("/run/commands/")
+@app.post(
+    "/run/commands/",
+    responses={
+        403: {"content": {"application/json": {"example": {"detail": "Invalid API Key"}}}, "model": ForbiddenError}
+    },
+)
 async def run_commands(request: RunRequest, api_key: str = Depends(get_api_key)) -> RunResponse:
     """
     Run a set of commands in a sandboxed container and return archive with changed files.
@@ -106,7 +111,7 @@ async def run_commands(request: RunRequest, api_key: str = Depends(get_api_key))
     return RunResponse(results=results, archive=archive)
 
 
-@app.get("/health/")
+@app.get("/health/", responses={200: {"content": {"application/json": {"example": {"status": "ok"}}}}})
 async def health() -> dict[Literal["status"], Literal["ok"]]:
     """
     Check if the service is healthy.
@@ -114,7 +119,7 @@ async def health() -> dict[Literal["status"], Literal["ok"]]:
     return {"status": "ok"}
 
 
-@app.get("/version/")
+@app.get("/version/", responses={200: {"content": {"application/json": {"example": {"version": __version__}}}}})
 async def version() -> dict[Literal["version"], str]:
     """
     Get the version of the service.

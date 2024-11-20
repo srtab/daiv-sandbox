@@ -25,3 +25,7 @@ class RunResult(BaseModel):
 class RunResponse(BaseModel):
     results: list[RunResult] = Field(..., description="List of results of each command.")
     archive: str | None = Field(..., description="Base64-encoded archive with the changed files.")
+
+
+class ForbiddenError(BaseModel):
+    detail: str = Field(..., description="Error message.")
