@@ -1,6 +1,6 @@
 import base64
 import io
-import logging
+from logging.config import dictConfig
 from pathlib import Path
 from typing import Literal
 
@@ -15,11 +15,11 @@ from .config import settings
 from .schemas import RunRequest, RunResponse, RunResult
 from .sessions import SandboxDockerSession
 
-API_KEY_NAME = "X-API-Key"
+HEADER_API_KEY_NAME = "X-API-Key"
 
 
 # Configure root logger
-logging.config.dictConfig({
+dictConfig({
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
@@ -50,6 +50,7 @@ While `gVisor` significantly improves security, it may introduce some performanc
 """  # noqa: E501
 
 app = FastAPI(
+    debug=settings.ENVIRONMENT == "local",
     title="DAIV Runtime Sandbox",
     description=description,
     summary="Run commands in a sandboxed container.",
@@ -61,7 +62,7 @@ app = FastAPI(
 
 
 api_key_header = APIKeyHeader(
-    name=API_KEY_NAME,
+    name=HEADER_API_KEY_NAME,
     auto_error=False,
     description=(
         "The API key must match the one declared in the DAIV Sandbox environment variables: `DAIV_SANDBOX_API_KEY`."
@@ -87,7 +88,9 @@ async def run_commands(request: RunRequest, api_key: str = Depends(get_api_key))
 
     run_dir = f"/tmp/run-{request.run_id}"  # noqa: S108
 
-    with SandboxDockerSession(image=request.base_image, keep_template=True) as session:
+    with SandboxDockerSession(
+        image=request.base_image, keep_template=settings.KEEP_TEMPLATE, runtime=settings.RUNTIME
+    ) as session:
         with io.BytesIO(request.archive) as request_archive:
             session.copy_to_runtime(run_dir, request_archive)
 

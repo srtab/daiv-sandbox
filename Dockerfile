@@ -30,7 +30,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV PYTHONPATH=/app
 
 COPY ./pyproject.toml ./uv.lock /app/
-
 COPY ./daiv_sandbox /app/daiv_sandbox
 
 # Sync the project

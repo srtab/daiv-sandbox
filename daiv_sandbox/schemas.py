@@ -6,7 +6,7 @@ class RunRequest(BaseModel):
     base_image: str = Field(..., description="Docker image to be used as the base image for the sandbox.")
     commands: list[str] = Field(..., description="List of commands to be executed in the sandbox.")
     workdir: str | None = Field(
-        ...,
+        default=None,
         description=(
             "Working directory to be used for the commands. "
             "Defaults to the root directory where the archive is extracted."

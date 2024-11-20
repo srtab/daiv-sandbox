@@ -101,9 +101,9 @@ def test_execute_command():
     session = SandboxDockerSession(image="test-image")
     session.container = MagicMock()
     session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"output")
-    result = session.execute_command("echo hello")
+    result = session.execute_command("echo hello", "/")
     assert result.exit_code == 0
-    assert result.output == b"output"
+    assert result.output == "output"
 
 
 def test_copy_to_runtime_creates_directory():
