@@ -15,6 +15,13 @@ class RunRequest(BaseModel):
     archive: Base64Bytes = Field(..., description="Base64-encoded archive with files to be copied to the sandbox.")
 
 
+class RunResult(BaseModel):
+    command: str = Field(..., description="Command that was executed.")
+    output: str = Field(..., description="Output of the command.")
+    exit_code: int = Field(..., description="Exit code of the command.")
+    changed_files: list[str] = Field(..., description="List of changed files.", exclude=True)
+
+
 class RunResponse(BaseModel):
-    results: dict[str, dict[str, str | int]] = Field(..., description="Dictionary with the output of each command.")
-    archive: Base64Bytes | None = Field(..., description="Base64-encoded archive with the changed files.")
+    results: list[RunResult] = Field(..., description="List of results of each command.")
+    archive: str | None = Field(..., description="Base64-encoded archive with the changed files.")

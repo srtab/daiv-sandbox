@@ -1,21 +1,26 @@
+import datetime
 import io
 import logging
 import shlex
 import signal
+import tarfile
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import TYPE_CHECKING, BinaryIO, Literal
 
 from docker import DockerClient, from_env
 from docker.errors import ImageNotFound
-from docker.models.containers import Container, ExecResult
 from docker.models.images import Image
 from docker.types import Mount
 
 from daiv_sandbox.config import settings
+from daiv_sandbox.schemas import RunResult
 
-logger = logging.getLogger("daiv-sandbox.sessions")
+if TYPE_CHECKING:
+    from docker.models.containers import Container
+
+logger = logging.getLogger("daiv_sandbox")
 
 
 def handler(signum, frame):
@@ -43,7 +48,7 @@ class Session(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def execute_command(self, command: str) -> ExecResult:
+    def execute_command(self, command: str, workdir: str) -> RunResult:
         raise NotImplementedError
 
     def __enter__(self):
@@ -136,9 +141,6 @@ class SandboxDockerSession(Session):
         Remove the container.
         """
         if self.container:
-            if isinstance(self.image, Image):
-                self.container.commit(self.image.tags[-1])
-
             self.container.remove(force=True)
             self.container = None
 
@@ -160,16 +162,21 @@ class SandboxDockerSession(Session):
 
         logger.info("Copying archive from %s:%s...", self.container.short_id, src)
 
-        tarstream = io.BytesIO()
         bits, stat = self.container.get_archive(src)
-
         if stat["size"] == 0:
             raise FileNotFoundError(f"File {src} not found in the container {self.container.short_id}")
 
+        tarstream = io.BytesIO()
         for chunk in bits:
             tarstream.write(chunk)
+        tarstream.seek(0)
 
-        return tarstream
+        extracted_archive = io.BytesIO()
+        with tarfile.open(fileobj=tarstream, mode="r:*") as tar:
+            extracted_archive.write(tar.extractfile(stat["name"]).read())
+        extracted_archive.seek(0)
+
+        return extracted_archive
 
     def copy_to_runtime(self, dest: str, data: BinaryIO):
         """
@@ -189,7 +196,7 @@ class SandboxDockerSession(Session):
         else:
             raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{dest}")
 
-    def execute_command(self, command: str, workdir: str | None = None) -> ExecResult:
+    def execute_command(self, command: str, workdir: str) -> RunResult:
         """
         Execute a command in the container.
         """
@@ -198,51 +205,79 @@ class SandboxDockerSession(Session):
 
         logger.info("Executing command '%s' in %s:%s...", command, self.container.short_id, workdir)
 
+        before_run_date = datetime.datetime.now()
+
         result = self.container.exec_run(f"/bin/sh -c {shlex.quote(command)}", workdir=workdir)
 
         if result.exit_code != 0:
-            logger.warning(
-                "Command '%s' in %s:%s exited with code %s", command, self.container.short_id, workdir, result.exit_code
-            )
-            logger.debug(
-                "Command '%s' in %s:%s output: %s", command, self.container.short_id, workdir, result.output.decode()
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Command '%s' in %s:%s exited with code %s: %s",
+                    command,
+                    self.container.short_id,
+                    workdir,
+                    result.exit_code,
+                    result.output.decode(),
+                )
+            else:
+                logger.warning(
+                    "Command '%s' in %s:%s exited with code %s",
+                    command,
+                    self.container.short_id,
+                    workdir,
+                    result.exit_code,
+                )
 
-        return result
+        return RunResult(
+            command=command,
+            output=result.output.decode(),
+            exit_code=result.exit_code,
+            changed_files=self._extract_changed_file_names(workdir, before_run_date) if result.exit_code == 0 else [],
+        )
 
-    def extract_changed_files(self, workdir: str) -> BinaryIO | None:
+    def _extract_changed_file_names(self, workdir: str, modified_after: datetime.datetime) -> list[str]:
         """
         Extract the list of changed files in the container.
         """
         if not self.container:
             logger.info("Session already closed. Skipping extraction of changed files.")
-            return None
+            return []
 
         logger.info("Extracting list of changed files from %s:%s...", self.container.short_id, workdir)
 
-        # Get the list of changed files in the specified workdir
-        result = self.container.exec_run(f"find {workdir} -type f -mtime -1")
+        # Get the list of changed files in the specified workdir and modified after the specified date.
+        result = self.container.exec_run(
+            f'find {workdir} -type f ! -path "*/.*" '
+            f'-newermt "{modified_after:%Y-%m-%d %H:%M:%S}.{modified_after.microsecond // 1000:03d}"'
+        )
+
         if result.exit_code != 0:
             raise RuntimeError(
-                f"Failed to get the list of changed files from {self.container.short_id} in workdir {workdir}"
+                f"Failed to get the list of changed files from {self.container.short_id}:{workdir} "
+                f"(exit code {result.exit_code}) -> {result.output.decode()}"
             )
 
         changed_files = result.output.decode().splitlines()
 
         if not changed_files:
             logger.info("No changed files found in %s:%s", self.container.short_id, workdir)
-            return None
+            return []
+
+        return [file.replace(f"{workdir}/", "") for file in changed_files]
+
+    def create_tar_gz_archive(self, workdir: str, include_files: list[str]) -> BinaryIO:
+        """
+        Create a tar.gz archive with the specified files.
+        """
+        if not self.container:
+            raise RuntimeError("Session is not open. Please call open() method before creating tar.gz archive.")
 
         logger.info(
-            "Creating tar.gz file with %s changed files in %s:%s...",
-            len(changed_files),
-            self.container.short_id,
-            workdir,
+            "Creating tar.gz file with %s files in %s:%s...", len(include_files), self.container.short_id, workdir
         )
 
         tar_path = f"{workdir}/changed_files_{uuid.uuid4()}.tar.gz"
-
-        result = self.container.exec_run(f"tar -czf {tar_path} -C {workdir} {' '.join(changed_files)}")
+        result = self.container.exec_run(f"tar -czf {tar_path} -C {workdir} {' '.join(include_files)}")
 
         if result.exit_code != 0:
             logger.debug(
@@ -254,7 +289,7 @@ class SandboxDockerSession(Session):
             )
             raise RuntimeError(
                 f"Failed to create tar.gz file with changed files in {self.container.short_id}:{workdir} "
-                f"(exit code {result.exit_code})"
+                f"(exit code {result.exit_code}) -> {result.output.decode()}"
             )
 
         return self.copy_from_runtime(tar_path)
