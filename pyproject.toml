@@ -1,6 +1,6 @@
 [project]
 name = "daiv-sandbox"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 description = "Runtime sandbox to empower DAIV agents to run arbitrary code/commands."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -19,16 +19,14 @@ classifiers = [
 dependencies = [
   "docker==7.1",
   "fastapi[standard]==0.115.5",
-  "get-docker-secret==2",
-  "ipython==8.29",
-  "pydantic==2.9.2",
+  "pydantic==2.10",
   "pydantic-settings==2.6.1",
-  "python-decouple==3.8",
-  "python-multipart==0.0.17",
   "sentry-sdk==2.18",
 ]
 
 urls."Bug Tracker" = "https://github.com/srtab/daiv-sandbox/issues"
+urls.Changelog = "CHANGELOG.md"
+
 urls.Repository = "https://github.com/srtab/daiv-sandbox"
 
 [tool.ruff]
@@ -91,7 +89,7 @@ lint.isort.split-on-trailing-comma = false
 addopts = "--cov --cov-config=.coveragerc"
 
 [tool.pytest_env]
-API_KEY = "notsosecret"
+DAIV_SANDBOX_API_KEY = "notsosecret"
 
 [tool.mypy]
 python_version = "3.12"
@@ -99,21 +97,20 @@ check_untyped_defs = true
 
 [[tool.mypy.overrides]]
 module = [
-  "decouple.*",
   "docker.*",
 ]
 ignore_missing_imports = true
 
 [tool.uv]
 dev-dependencies = [
+  "ipython==8.29",
   "mypy==1.13.0",
   "pre-commit==4.0.1",
   "pyproject-fmt==2.5.0",
   "pyopenssl==24.2.1",
-  "pytest-asyncio==0.24.0",
   "pytest-cov==6.0.0",
   "pytest-env==1.1.5",
   "pytest-mock==3.14.0",
   "pytest-xdist==3.6.1",
-  "ruff==0.7.2",
+  "ruff==0.7.4",
 ]

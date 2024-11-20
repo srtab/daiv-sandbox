@@ -1,4 +1,4 @@
-name: docker
+name: Docker
 
 on:
   push:
@@ -14,14 +14,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # list of Docker images to use as base name for tags
           images: |
             ghcr.io/srtab/daiv-sandbox
-          # generate Docker tags based on the following events/attributes
           tags: |
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+          flavor: |
+            latest=true
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
