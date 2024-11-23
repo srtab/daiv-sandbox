@@ -26,10 +26,7 @@ dictConfig({
         "verbose": {"format": "[%(asctime)s] %(levelname)s - %(name)s - %(message)s", "datefmt": "%d-%m-%Y:%H:%M:%S %z"}
     },
     "handlers": {"console": {"level": "DEBUG", "class": "logging.StreamHandler", "formatter": "verbose"}},
-    "loggers": {
-        "": {"level": "INFO", "handlers": ["console"]},
-        "daiv_sandbox": {"level": "DEBUG", "handlers": ["console"], "propagate": False},
-    },
+    "loggers": {"daiv_sandbox": {"level": "DEBUG", "handlers": ["console"], "propagate": False}},
 })
 
 if settings.SENTRY_DSN and settings.ENVIRONMENT != "local":
@@ -91,10 +88,10 @@ async def run_commands(request: RunRequest, api_key: str = Depends(get_api_key))
     results: list[RunResult] = []
     archive: str | None = None
 
-    run_dir = f"/tmp/run-{request.run_id}"  # noqa: S108
+    run_dir = f"/runs/{request.run_id}"
 
     with SandboxDockerSession(
-        image=request.base_image, keep_template=settings.KEEP_TEMPLATE, runtime=settings.RUNTIME
+        image=request.base_image, keep_template=settings.KEEP_TEMPLATE, runtime=settings.RUNTIME, run_id=request.run_id
     ) as session:
         with io.BytesIO(request.archive) as request_archive:
             session.copy_to_runtime(run_dir, request_archive)

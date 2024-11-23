@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Improved `README.md` to include required security configuration options to use `gVisor` as the container runtime.
+- Changed folder where runs are stored to `/runs` instead of `/tmp`.
+- Changed run commands to extract changed files even if the command fails.
+
+### Removed
+
+- Removed `mounts` parameter from `SandboxDockerSession` because it was not being used.
+
 ## [0.1.0-rc.1] - 2024-11-20
 
 ### Added
