@@ -4,7 +4,6 @@ import logging
 import shlex
 import signal
 import tarfile
-import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Literal
@@ -12,7 +11,6 @@ from typing import TYPE_CHECKING, BinaryIO, Literal
 from docker import DockerClient, from_env
 from docker.errors import ImageNotFound
 from docker.models.images import Image
-from docker.types import Mount
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.schemas import RunResult
@@ -76,8 +74,8 @@ class SandboxDockerSession(Session):
         image: str | None = None,
         dockerfile: str | None = None,
         keep_template: bool = False,
-        mounts: list[Mount] | None = None,
         runtime: Literal["runc", "runsc"] = "runc",
+        run_id: str | None = None,
     ):
         """
         Create a new sandbox session using Docker.
@@ -87,7 +85,8 @@ class SandboxDockerSession(Session):
             image: Docker image to use
             dockerfile: Path to the Dockerfile, if image is not provided
             keep_template: if True, the image and container will not be removed after the session ends
-            mounts: Docker mounts
+            runtime: the container runtime to use, either "runc" or "runsc"
+            run_id: the run ID to use for the container
         """
         if image and dockerfile:
             raise ValueError("Only one of image or dockerfile should be provided")
@@ -104,8 +103,8 @@ class SandboxDockerSession(Session):
         self.container: Container | None = None
         self.keep_template = keep_template
         self.is_create_template: bool = False
-        self.mounts = mounts
         self.runtime = runtime
+        self.run_id = run_id
 
     def open(self):
         """
@@ -132,7 +131,7 @@ class SandboxDockerSession(Session):
             raise ValueError("Invalid image type")
 
         self.container = self.client.containers.run(
-            self.image, detach=True, tty=True, mounts=self.mounts, runtime=self.runtime
+            self.image, detach=True, tty=True, runtime=self.runtime, hostname="sandbox", name=f"sandbox-{self.run_id}"
         )
         logger.info("Container %s created", self.container.short_id)
 
@@ -191,7 +190,7 @@ class SandboxDockerSession(Session):
 
         logger.info("Copying archive to %s:%s...", self.container.short_id, dest)
 
-        if self.container.put_archive(dest, data.read()):
+        if self.container.put_archive(dest, data.getvalue()):
             logger.debug("Successfully copied archive to %s:%s", self.container.short_id, dest)
         else:
             raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{dest}")
@@ -232,7 +231,7 @@ class SandboxDockerSession(Session):
             command=command,
             output=result.output.decode(),
             exit_code=result.exit_code,
-            changed_files=self._extract_changed_file_names(workdir, before_run_date) if result.exit_code == 0 else [],
+            changed_files=self._extract_changed_file_names(workdir, before_run_date),
         )
 
     def _extract_changed_file_names(self, workdir: str, modified_after: datetime.datetime) -> list[str]:
@@ -276,7 +275,7 @@ class SandboxDockerSession(Session):
             "Creating tar.gz file with %s files in %s:%s...", len(include_files), self.container.short_id, workdir
         )
 
-        tar_path = f"{workdir}/changed_files_{uuid.uuid4()}.tar.gz"
+        tar_path = f"{workdir}/changed_files.tar.gz"
         result = self.container.exec_run(f"tar -czf {tar_path} -C {workdir} {' '.join(include_files)}")
 
         if result.exit_code != 0:
