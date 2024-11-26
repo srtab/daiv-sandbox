@@ -46,11 +46,11 @@ def test_context_manager_timeout(mock_signal_alarm, mock_docker_client, mock_ima
 
 
 def test_open_with_image(mock_docker_client, mock_image):
-    session = SandboxDockerSession(image="test-image")
+    session = SandboxDockerSession(image="test-image", run_id="test-run-id")
     session.open()
     mock_docker_client.images.get.assert_called_once_with("test-image")
     mock_docker_client.containers.run.assert_called_once_with(
-        mock_image, detach=True, mounts=None, tty=True, runtime="runc"
+        mock_image, detach=True, tty=True, runtime="runc", hostname="sandbox", name="sandbox-test-run-id"
     )
     assert session.image == mock_image
     assert session.container is not None

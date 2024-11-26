@@ -7,6 +7,7 @@ import tarfile
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Literal
+from uuid import uuid4
 
 from docker import DockerClient, from_env
 from docker.errors import ImageNotFound
@@ -104,7 +105,7 @@ class SandboxDockerSession(Session):
         self.keep_template = keep_template
         self.is_create_template: bool = False
         self.runtime = runtime
-        self.run_id = run_id
+        self.run_id = run_id or str(uuid4())
 
     def open(self):
         """
