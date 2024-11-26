@@ -19,9 +19,9 @@ classifiers = [
 dependencies = [
   "docker==7.1",
   "fastapi[standard]==0.115.5",
-  "pydantic==2.10",
+  "pydantic==2.10.2",
   "pydantic-settings==2.6.1",
-  "sentry-sdk==2.18",
+  "sentry-sdk==2.19",
 ]
 
 urls."Bug Tracker" = "https://github.com/srtab/daiv-sandbox/issues"
@@ -112,5 +112,5 @@ dev-dependencies = [
   "pytest-env==1.1.5",
   "pytest-mock==3.14.0",
   "pytest-xdist==3.6.1",
-  "ruff==0.7.4",
+  "ruff==0.8.0",
 ]

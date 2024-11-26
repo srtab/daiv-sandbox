@@ -47,7 +47,7 @@ class Session(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def execute_command(self, command: str, workdir: str) -> RunResult:
+    def execute_command(self, command: str, workdir: str, extract_changed_files: bool = False) -> RunResult:
         raise NotImplementedError
 
     def __enter__(self):
@@ -196,7 +196,7 @@ class SandboxDockerSession(Session):
         else:
             raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{dest}")
 
-    def execute_command(self, command: str, workdir: str) -> RunResult:
+    def execute_command(self, command: str, workdir: str, extract_changed_files: bool = False) -> RunResult:
         """
         Execute a command in the container.
         """
@@ -232,7 +232,7 @@ class SandboxDockerSession(Session):
             command=command,
             output=result.output.decode(),
             exit_code=result.exit_code,
-            changed_files=self._extract_changed_file_names(workdir, before_run_date),
+            changed_files=self._extract_changed_file_names(workdir, before_run_date) if extract_changed_files else [],
         )
 
     def _extract_changed_file_names(self, workdir: str, modified_after: datetime.datetime) -> list[str]:
