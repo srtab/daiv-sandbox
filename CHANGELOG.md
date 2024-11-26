@@ -5,13 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0-rc.2] - 2024-11-26
+
+### Added
+
+- Added endpoint to run python code.
 
 ### Changed
 
 - Improved `README.md` to include required security configuration options to use `gVisor` as the container runtime.
 - Changed folder where runs are stored to `/runs` instead of `/tmp`.
-- Changed run commands to extract changed files even if the command fails.
+- Changed `execute_command` to extract changed files even if the command fails.
+- Changed `execute_command` to allow conditionally extracting changed files.
+- Renamed `ForbiddenError` to `ErrorMessage` to be more generic.
+- Updated dependencies:
+  - `ruff` from 0.7.4 to 0.8.0
+  - `pydantic` from 2.10.0 to 2.10.2
+  - `sentry-sdk` from 2.18.0 to 2.19.0
 
 ### Removed
 

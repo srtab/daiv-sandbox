@@ -8,11 +8,13 @@ import sentry_sdk
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
 from sentry_sdk.integrations.fastapi import FastApiIntegration
-from starlette.status import HTTP_403_FORBIDDEN
+from starlette.status import HTTP_400_BAD_REQUEST, HTTP_403_FORBIDDEN
+
+from daiv_sandbox.languages import LanguageManager
 
 from . import __version__
 from .config import settings
-from .schemas import ForbiddenError, RunRequest, RunResponse, RunResult
+from .schemas import ErrorMessage, RunCodeRequest, RunCodeResponse, RunRequest, RunResponse, RunResult
 from .sessions import SandboxDockerSession
 
 HEADER_API_KEY_NAME = "X-API-Key"
@@ -75,12 +77,13 @@ async def get_api_key(api_key_header: str | None = Security(api_key_header)) -> 
     return api_key_header
 
 
-@app.post(
-    "/run/commands/",
-    responses={
-        403: {"content": {"application/json": {"example": {"detail": "Invalid API Key"}}}, "model": ForbiddenError}
-    },
-)
+common_responses = {
+    403: {"content": {"application/json": {"example": {"detail": "Invalid API Key"}}}, "model": ErrorMessage},
+    400: {"content": {"application/json": {"example": {"detail": "Error message"}}}, "model": ErrorMessage},
+}
+
+
+@app.post("/run/commands/", responses=common_responses)
 async def run_commands(request: RunRequest, api_key: str = Depends(get_api_key)) -> RunResponse:
     """
     Run a set of commands in a sandboxed container and return archive with changed files.
@@ -98,7 +101,10 @@ async def run_commands(request: RunRequest, api_key: str = Depends(get_api_key))
 
         command_workdir = Path(run_dir) / request.workdir if request.workdir else Path(run_dir)
 
-        results = [session.execute_command(command, workdir=command_workdir.as_posix()) for command in request.commands]
+        results = [
+            session.execute_command(command, workdir=command_workdir.as_posix(), extract_changed_files=True)
+            for command in request.commands
+        ]
 
         # Only create archive with changed files for the last command.
         if changed_files := results[-1].changed_files:
@@ -106,6 +112,36 @@ async def run_commands(request: RunRequest, api_key: str = Depends(get_api_key))
             archive = base64.b64encode(changed_files_archive.getvalue()).decode()
 
     return RunResponse(results=results, archive=archive)
+
+
+LANGUAGE_BASE_IMAGES = {"python": "python:3.12-slim"}
+
+
+@app.post("/run/code/", responses=common_responses)
+async def run_code(request: RunCodeRequest, api_key: str = Depends(get_api_key)) -> RunCodeResponse:
+    """
+    Run code in a sandboxed container and return the result.
+    """
+    run_dir = f"/runs/{request.run_id}"
+
+    with SandboxDockerSession(
+        image=LANGUAGE_BASE_IMAGES[request.language],
+        keep_template=True,
+        runtime=settings.RUNTIME,
+        run_id=request.run_id,
+    ) as session:
+        manager = LanguageManager.factory(request.language)
+
+        if request.dependencies:
+            install_result = manager.install_dependencies(session, request.dependencies)
+            if install_result.exit_code != 0:
+                raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=install_result.output)
+
+        run_result = manager.run_code(session, run_dir, request.code)
+        if run_result.exit_code != 0:
+            raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=run_result.output)
+
+    return RunCodeResponse(output=run_result.output)
 
 
 @app.get("/health/", responses={200: {"content": {"application/json": {"example": {"status": "ok"}}}}})
