@@ -1,40 +1,65 @@
-FROM python:3.12.7-slim-bookworm
+#########################################################################################################
+# Python compile image
+#########################################################################################################
+FROM python:3.12.7-slim-bookworm AS app-compiler
 
 ENV PYTHONUNBUFFERED=1
 
-WORKDIR /app/
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+  # dependencies for building Python packages
+  build-essential
 
 # Install uv
 # Ref: https://docs.astral.sh/uv/guides/integration/docker/#installing-uv
-COPY --from=ghcr.io/astral-sh/uv:0.4.15 /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-# Place executables in the environment at the front of the path
-# Ref: https://docs.astral.sh/uv/guides/integration/docker/#using-the-environment
-ENV PATH="/app/.venv/bin:$PATH"
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1
 
-# Compile bytecode
-# Ref: https://docs.astral.sh/uv/guides/integration/docker/#compiling-bytecode
-ENV UV_COMPILE_BYTECODE=1
+# Create a virtual environment and make it relocatable
+RUN uv venv .venv --relocatable
 
-# uv Cache
-# Ref: https://docs.astral.sh/uv/guides/integration/docker/#caching
-ENV UV_LINK_MODE=copy
-
-# Install dependencies
-# Ref: https://docs.astral.sh/uv/guides/integration/docker/#intermediate-layers
+# Install uv
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --no-install-project
+    uv sync --frozen --no-editable --no-group dev --no-install-project
 
-ENV PYTHONPATH=/app
+#########################################################################################################
+# Python build image
+#########################################################################################################
+FROM python:3.12.7-slim-bookworm AS python-builder
 
-COPY ./pyproject.toml ./uv.lock /app/
-COPY ./daiv_sandbox /app/daiv_sandbox
+LABEL maintainer="srtabs@gmail.com"
 
-# Sync the project
-# Ref: https://docs.astral.sh/uv/guides/integration/docker/#intermediate-layers
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+  # Used on healthcheckers
+  curl \
+  # Cleaning up unused files
+  && apt-get purge -y --auto-remove \
+  -o APT::AutoRemove::RecommendsImportant=0 \
+  -o APT::Autoremove::SuggestsImportant=0 \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/* /var/cache/* \
+  # Create aplication specific user
+  && addgroup --system app \
+  && adduser --system --ingroup app app
+
+ENV PATH="/home/app/.venv/bin:$PATH"
+ENV PYTHONPATH="$PYTHONPATH:/home/app/daiv_sandbox/"
+ENV PYTHONUNBUFFERED=1
+
+# Copy python compiled requirements
+COPY --chown=app:app --from=app-compiler /.venv /home/app/.venv
+
+# Copy application code
+COPY --chown=app:app ./daiv_sandbox /home/app/daiv_sandbox
+
+USER app
+WORKDIR /home/app
+
+RUN python -m compileall daiv_sandbox
 
 CMD ["fastapi", "run", "daiv_sandbox/main.py", "--host", "0.0.0.0", "--port", "8000"]

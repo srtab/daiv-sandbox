@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+## [0.1.0-rc.3] - 2024-12-07
+
+### Changed
+
+- Improved `Dockerfile` for production use.
+- Updated dependencies:
+  - `fastapi`;
+  - `pydantic`;
+  - `sentry-sdk`.
+
+### Fixed
+
+- Fixed issue on `run_id` being passed as an `UUID` to the `SandboxDockerSession` class instead of a `str`.
+- Fixed missing `curl` dependency on `Dockerfile` for healthcheck.
+
 ## [0.1.0-rc.2] - 2024-11-26
 
 ### Added
@@ -84,7 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.1...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.3...HEAD
+[0.1.0-rc.3]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.2...v0.1.0-rc.3
+[0.1.0-rc.2]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.1...v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-alpha.2...v0.1.0-rc.1
 [0.1.0-alpha.2]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-alpha...v0.1.0-alpha.2
 [0.1.0-alpha]: https://github.com/srtab/daiv-sandbox/releases/tag/v0.1.0-alpha
