@@ -124,12 +124,12 @@ def test_run_commands_with_workdir(MockSession, client):  # noqa: N803
 
 
 def test_health(client):
-    response = client.get("/health/")
+    response = client.get("/-/health/")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
 def test_version(client):
-    response = client.get("/version/")
+    response = client.get("/-/version/")
     assert response.status_code == 200
     assert response.json() == {"version": __version__}
