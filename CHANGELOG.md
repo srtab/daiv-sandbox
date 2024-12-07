@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0-rc.4] - 2024-12-07
 
+### Added
+
+- Added `HEALTHCHECK` to the `Dockerfile`.
+
 ### Fixed
 
 - Fixed `Dockerfile` to create the `app` user with the correct home directory defined.
