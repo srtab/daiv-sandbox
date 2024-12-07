@@ -147,7 +147,7 @@ async def run_code(request: RunCodeRequest, api_key: str = Depends(get_api_key))
     return RunCodeResponse(output=run_result.output)
 
 
-@app.get("/health/", responses={200: {"content": {"application/json": {"example": {"status": "ok"}}}}})
+@app.get("/-/health/", responses={200: {"content": {"application/json": {"example": {"status": "ok"}}}}})
 async def health() -> dict[Literal["status"], Literal["ok"]]:
     """
     Check if the service is healthy.
@@ -155,7 +155,7 @@ async def health() -> dict[Literal["status"], Literal["ok"]]:
     return {"status": "ok"}
 
 
-@app.get("/version/", responses={200: {"content": {"application/json": {"example": {"version": __version__}}}}})
+@app.get("/-/version/", responses={200: {"content": {"application/json": {"example": {"version": __version__}}}}})
 async def version() -> dict[Literal["version"], str]:
     """
     Get the version of the service.

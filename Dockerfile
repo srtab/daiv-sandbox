@@ -45,7 +45,7 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/* /var/cache/* \
   # Create aplication specific user
   && addgroup --system app \
-  && adduser --system --ingroup app app
+  && adduser --system --ingroup app --home /home/app app
 
 ENV PATH="/home/app/.venv/bin:$PATH"
 ENV PYTHONPATH="$PYTHONPATH:/home/app/daiv_sandbox/"
