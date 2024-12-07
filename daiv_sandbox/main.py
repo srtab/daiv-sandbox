@@ -94,7 +94,10 @@ async def run_commands(request: RunRequest, api_key: str = Depends(get_api_key))
     run_dir = f"/runs/{request.run_id}"
 
     with SandboxDockerSession(
-        image=request.base_image, keep_template=settings.KEEP_TEMPLATE, runtime=settings.RUNTIME, run_id=request.run_id
+        image=request.base_image,
+        keep_template=settings.KEEP_TEMPLATE,
+        runtime=settings.RUNTIME,
+        run_id=str(request.run_id),
     ) as session:
         with io.BytesIO(request.archive) as request_archive:
             session.copy_to_runtime(run_dir, request_archive)
@@ -128,7 +131,7 @@ async def run_code(request: RunCodeRequest, api_key: str = Depends(get_api_key))
         image=LANGUAGE_BASE_IMAGES[request.language],
         keep_template=True,
         runtime=settings.RUNTIME,
-        run_id=request.run_id,
+        run_id=str(request.run_id),
     ) as session:
         manager = LanguageManager.factory(request.language)
 
