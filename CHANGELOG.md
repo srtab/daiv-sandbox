@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.1.0-rc.4] - 2024-12-07
+
+### Fixed
+
+- Fixed `Dockerfile` to create the `app` user with the correct home directory defined.
+
+### Changed
+
+- Changed `/health/` endpoint to `/-/health/`.
+- Changed `/version/` endpoint to `/-/version/`.
+
 ## [0.1.0-rc.3] - 2024-12-07
 
 ### Changed
@@ -101,7 +112,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.3...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.4...HEAD
+[0.1.0-rc.4]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.3...v0.1.0-rc.4
 [0.1.0-rc.3]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.2...v0.1.0-rc.3
 [0.1.0-rc.2]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.1...v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-alpha.2...v0.1.0-rc.1
