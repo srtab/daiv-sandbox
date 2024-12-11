@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Added `SENTRY_CA_CERTS` configuration to support Sentry communicate through SSL from custom CA.
+- Added `SENTRY_ENABLE_TRACING` configuration to enable Sentry tracing.
+
 ## [0.1.0-rc.5] - 2024-12-11
 
 ### Added

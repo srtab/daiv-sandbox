@@ -35,7 +35,9 @@ if settings.SENTRY_DSN and settings.ENVIRONMENT != "local":
     sentry_sdk.init(
         dsn=str(settings.SENTRY_DSN),
         environment=settings.ENVIRONMENT,
-        enable_tracing=True,
+        enable_tracing=settings.SENTRY_ENABLE_TRACING,
+        profiles_sample_rate=1.0 if settings.SENTRY_ENABLE_TRACING else 0.0,
+        ca_certs=settings.SENTRY_CA_CERTS,
         release=__version__,
         integrations=[FastApiIntegration()],
     )
