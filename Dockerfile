@@ -33,6 +33,10 @@ FROM python:3.12.7-slim-bookworm AS python-builder
 
 LABEL maintainer="srtabs@gmail.com"
 
+ARG APP_UID=1001  # Default application UID, override during build or run
+ARG APP_GID=1001  # Default application GID, override during build or run
+ARG DOCKER_GID=999  # Default docker GID, override during build or run
+
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
   # Used on healthcheckers
@@ -43,9 +47,12 @@ RUN apt-get update \
   -o APT::Autoremove::SuggestsImportant=0 \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* /var/cache/* \
+  # Create docker group to allow docker socket access
+  && addgroup --gid $DOCKER_GID docker \
   # Create aplication specific user
-  && addgroup --system app \
-  && adduser --system --ingroup app --home /home/app app
+  && addgroup --system --gid $APP_GID app \
+  && adduser --system --ingroup app --uid $APP_UID --home /home/app app \
+  && adduser app docker
 
 ENV PATH="/home/app/.venv/bin:$PATH"
 ENV PYTHONPATH="$PYTHONPATH:/home/app/daiv_sandbox/"
