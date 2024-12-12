@@ -103,14 +103,14 @@ ignore_missing_imports = true
 
 [tool.uv]
 dev-dependencies = [
-  "ipython==8.29",
+  "ipython==8.30",
   "mypy==1.13.0",
   "pre-commit==4.0.1",
   "pyproject-fmt==2.5.0",
-  "pyopenssl==24.2.1",
+  "pyopenssl==24.3.0",
   "pytest-cov==6.0.0",
   "pytest-env==1.1.5",
   "pytest-mock==3.14.0",
   "pytest-xdist==3.6.1",
-  "ruff==0.8.0",
+  "ruff==0.8.2",
 ]

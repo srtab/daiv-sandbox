@@ -7,10 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.1.0-rc.6] - 2024-12-12
+
 ### Added
 
 - Added `SENTRY_ENABLE_TRACING` configuration to enable Sentry tracing.
 - Added `EXPOSE 8000` to the `Dockerfile` to explicitly expose the port.
+
+### Changed
+
+- Updated dependencies:
+  - `ipython` from 8.29 to 8.30
+  - `pyopenssl` from 24.2.1 to 24.3.0
+  - `ruff` from 0.8.0 to 0.8.2
 
 ## [0.1.0-rc.5] - 2024-12-11
 
@@ -132,7 +141,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.5...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.6...HEAD
+[0.1.0-rc.6]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.5...v0.1.0-rc.6
 [0.1.0-rc.5]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.4...v0.1.0-rc.5
 [0.1.0-rc.4]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.3...v0.1.0-rc.4
 [0.1.0-rc.3]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.2...v0.1.0-rc.3
