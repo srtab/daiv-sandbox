@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added `SENTRY_CA_CERTS` configuration to support Sentry communicate through SSL from custom CA.
 - Added `SENTRY_ENABLE_TRACING` configuration to enable Sentry tracing.
+- Added `EXPOSE 8000` to the `Dockerfile` to explicitly expose the port.
 
 ## [0.1.0-rc.5] - 2024-12-11
 
