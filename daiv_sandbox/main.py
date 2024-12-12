@@ -37,7 +37,6 @@ if settings.SENTRY_DSN and settings.ENVIRONMENT != "local":
         environment=settings.ENVIRONMENT,
         enable_tracing=settings.SENTRY_ENABLE_TRACING,
         profiles_sample_rate=1.0 if settings.SENTRY_ENABLE_TRACING else 0.0,
-        ca_certs=settings.SENTRY_CA_CERTS,
         release=__version__,
         integrations=[FastApiIntegration()],
     )

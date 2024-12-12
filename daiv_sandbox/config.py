@@ -16,7 +16,6 @@ class Settings(BaseSettings):
 
     # Sentry
     SENTRY_DSN: HttpUrl | None = None
-    SENTRY_CA_CERTS: str | None = None
     SENTRY_ENABLE_TRACING: bool = False
 
     # Execution
