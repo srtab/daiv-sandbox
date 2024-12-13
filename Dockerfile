@@ -35,7 +35,7 @@ LABEL maintainer="srtabs@gmail.com"
 
 ARG APP_UID=1001  # Default application UID, override during build or run
 ARG APP_GID=1001  # Default application GID, override during build or run
-ARG DOCKER_GID=999  # Default docker GID, override during build or run
+ARG DOCKER_GID=991  # Default docker GID, override during build or run
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Added `ping` method to `SandboxDockerSession` to check if the Docker client is responding.
+
+### Changed
+
+- Changed `health` endpoint to check if the Docker client is responding and avoid starting the service if it is not responding.
+- Changed default `DOCKER_GID` to `991`.
+
 ## [0.1.0-rc.6] - 2024-12-12
 
 ### Added

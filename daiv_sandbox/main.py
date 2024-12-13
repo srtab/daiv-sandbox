@@ -5,10 +5,9 @@ from pathlib import Path
 from typing import Literal
 
 import sentry_sdk
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import Depends, FastAPI, HTTPException, Security, status
 from fastapi.security.api_key import APIKeyHeader
 from sentry_sdk.integrations.fastapi import FastApiIntegration
-from starlette.status import HTTP_400_BAD_REQUEST, HTTP_403_FORBIDDEN
 
 from daiv_sandbox.languages import LanguageManager
 
@@ -41,7 +40,7 @@ if settings.SENTRY_DSN and settings.ENVIRONMENT != "local":
         integrations=[FastApiIntegration()],
     )
 
-description = """
+description = """\
 FastAPI application designed to securely execute arbitrary commands and untrusted code within a controlled environment. Each execution is isolated in a transient Docker container, which is automatically created and destroyed with every request, ensuring a clean and secure execution space.
 
 To enhance security, `daiv-sandbox` leverages [`gVisor`](https://github.com/google/gvisor) as its container runtime. This provides an additional layer of protection by restricting the running code's ability to interact with the host system, thereby minimizing the risk of sandbox escape.
@@ -72,15 +71,21 @@ api_key_header = APIKeyHeader(
 
 async def get_api_key(api_key_header: str | None = Security(api_key_header)) -> str:
     if api_key_header is None:
-        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="API Key header is missing")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="API Key header is missing")
     if api_key_header != settings.API_KEY:
-        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="Invalid API Key")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid API Key")
     return api_key_header
 
 
 common_responses = {
-    403: {"content": {"application/json": {"example": {"detail": "Invalid API Key"}}}, "model": ErrorMessage},
-    400: {"content": {"application/json": {"example": {"detail": "Error message"}}}, "model": ErrorMessage},
+    status.HTTP_403_FORBIDDEN: {
+        "content": {"application/json": {"example": {"detail": "Invalid API Key"}}},
+        "model": ErrorMessage,
+    },
+    status.HTTP_400_BAD_REQUEST: {
+        "content": {"application/json": {"example": {"detail": "Error message"}}},
+        "model": ErrorMessage,
+    },
 }
 
 
@@ -139,11 +144,11 @@ async def run_code(request: RunCodeRequest, api_key: str = Depends(get_api_key))
         if request.dependencies:
             install_result = manager.install_dependencies(session, request.dependencies)
             if install_result.exit_code != 0:
-                raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=install_result.output)
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=install_result.output)
 
         run_result = manager.run_code(session, run_dir, request.code)
         if run_result.exit_code != 0:
-            raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=run_result.output)
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=run_result.output)
 
     return RunCodeResponse(output=run_result.output)
 
@@ -153,6 +158,8 @@ async def health() -> dict[Literal["status"], Literal["ok"]]:
     """
     Check if the service is healthy.
     """
+    if not SandboxDockerSession.ping():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Docker client is not responding")
     return {"status": "ok"}
 
 

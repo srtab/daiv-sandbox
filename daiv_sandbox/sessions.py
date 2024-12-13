@@ -107,6 +107,14 @@ class SandboxDockerSession(Session):
         self.runtime = runtime
         self.run_id = run_id or str(uuid4())
 
+    @staticmethod
+    def ping() -> bool:
+        """
+        Ping the Docker client.
+        """
+        client = from_env()
+        return client.ping()
+
     def open(self):
         """
         Create a new container from the image.
