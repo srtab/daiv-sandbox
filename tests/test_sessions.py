@@ -1,3 +1,4 @@
+import signal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -6,7 +7,7 @@ from docker.models.containers import ExecResult
 from docker.models.images import Image
 
 from daiv_sandbox.config import settings
-from daiv_sandbox.sessions import SandboxDockerSession
+from daiv_sandbox.sessions import SandboxDockerSession, handler
 
 
 @pytest.fixture
@@ -121,3 +122,35 @@ def test_copy_from_runtime_raises_error_if_file_not_found():
     session.container.get_archive.return_value = ([], {"size": 0})
     with pytest.raises(FileNotFoundError):
         session.copy_from_runtime("/path/to/src")
+
+
+@patch("daiv_sandbox.sessions.from_env")
+def test_ping_successful(mock_from_env):
+    mock_client = MagicMock()
+    mock_client.ping.return_value = True
+    mock_from_env.return_value = mock_client
+
+    assert SandboxDockerSession.ping() is True
+    mock_client.ping.assert_called_once()
+
+
+@patch("daiv_sandbox.sessions.from_env")
+def test_ping_unsuccessful(mock_from_env):
+    mock_client = MagicMock()
+    mock_client.ping.return_value = False
+    mock_from_env.return_value = mock_client
+
+    assert SandboxDockerSession.ping() is False
+    mock_client.ping.assert_called_once()
+
+
+def test_handler_raises_timeout_error():
+    """Test that the handler function raises TimeoutError when called"""
+    with pytest.raises(TimeoutError, match="Execution timed out"):
+        handler(signal.SIGALRM, None)
+
+
+def test_handler_is_registered_for_sigalrm():
+    """Test that the handler is properly registered for SIGALRM"""
+    current_handler = signal.getsignal(signal.SIGALRM)
+    assert current_handler == handler, "Handler should be registered for SIGALRM"
