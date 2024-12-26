@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Added `HOST` and `PORT` settings to allow overriding the host and port of the service.
+- Added `LOG_LEVEL` setting to allow overriding the log level of the service.
+
+### Fixed
+
+- Fixed logging configuration for `daiv_sandbox` logger, no logs where being written to the console.
+- Fixed `SENTRY_ENABLE_TRACING` setting to be a boolean or an integer.
+
 ## [0.1.0-rc.7] - 2024-12-16
 
 ### Added

@@ -74,4 +74,4 @@ HEALTHCHECK --interval=10s \
 
 EXPOSE 8000
 
-CMD ["fastapi", "run", "daiv_sandbox/main.py", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "daiv_sandbox/main.py"]
