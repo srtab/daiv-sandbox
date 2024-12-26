@@ -1,43 +1,31 @@
 import base64
 import io
-from logging.config import dictConfig
 from pathlib import Path
 from typing import Literal
 
 import sentry_sdk
 from fastapi import Depends, FastAPI, HTTPException, Security, status
 from fastapi.security.api_key import APIKeyHeader
-from sentry_sdk.integrations.fastapi import FastApiIntegration
 
+from daiv_sandbox import __version__
+from daiv_sandbox.config import settings
 from daiv_sandbox.languages import LanguageManager
-
-from . import __version__
-from .config import settings
-from .schemas import ErrorMessage, RunCodeRequest, RunCodeResponse, RunRequest, RunResponse, RunResult
-from .sessions import SandboxDockerSession
+from daiv_sandbox.logs import LOGGING_CONFIG
+from daiv_sandbox.schemas import ErrorMessage, RunCodeRequest, RunCodeResponse, RunRequest, RunResponse, RunResult
+from daiv_sandbox.sessions import SandboxDockerSession
 
 HEADER_API_KEY_NAME = "X-API-Key"
 
 
-# Configure root logger
-dictConfig({
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "verbose": {"format": "[%(asctime)s] %(levelname)s - %(name)s - %(message)s", "datefmt": "%d-%m-%Y:%H:%M:%S %z"}
-    },
-    "handlers": {"console": {"level": "DEBUG", "class": "logging.StreamHandler", "formatter": "verbose"}},
-    "loggers": {"daiv_sandbox": {"level": "DEBUG", "handlers": ["console"], "propagate": False}},
-})
+# Configure Sentry
 
 if settings.SENTRY_DSN and settings.ENVIRONMENT != "local":
     sentry_sdk.init(
         dsn=str(settings.SENTRY_DSN),
         environment=settings.ENVIRONMENT,
-        enable_tracing=settings.SENTRY_ENABLE_TRACING,
+        enable_tracing=bool(settings.SENTRY_ENABLE_TRACING),
         profiles_sample_rate=1.0 if settings.SENTRY_ENABLE_TRACING else 0.0,
         release=__version__,
-        integrations=[FastApiIntegration()],
     )
 
 description = """\
@@ -169,3 +157,16 @@ async def version() -> dict[Literal["version"], str]:
     Get the version of the service.
     """
     return {"version": __version__}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "daiv_sandbox.main:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        log_config=LOGGING_CONFIG,
+        reload=settings.ENVIRONMENT == "local",
+        reload_dirs=["daiv_sandbox"],
+    )
