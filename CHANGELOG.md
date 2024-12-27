@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.1.0-rc.9] - 2024-12-27
+
+### Fixed
+
+- Fixed issue when images have limited privileges.
+
+### Chore:
+
+- Updated dependencies:
+  - `ipython` from 8.30 to 8.31
+  - `pydantic` from 2.10.3 to 2.10.4
+  - `pydantic-settings` from 2.6.1 to 2.7.0
+  - `ruff` from 0.8.2 to 0.8.4
+  - `mypy` from 1.13.0 to 1.14.0
+
 ## [0.1.0-rc.8] - 2024-12-27
 
 ### Added
@@ -164,7 +179,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.8...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.9...HEAD
+[0.1.0-rc.9]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.8...v0.1.0-rc.9
 [0.1.0-rc.8]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.7...v0.1.0-rc.8
 [0.1.0-rc.7]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.6...v0.1.0-rc.7
 [0.1.0-rc.6]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.5...v0.1.0-rc.6
