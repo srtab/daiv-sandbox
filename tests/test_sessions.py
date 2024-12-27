@@ -7,7 +7,7 @@ from docker.models.containers import ExecResult
 from docker.models.images import Image
 
 from daiv_sandbox.config import settings
-from daiv_sandbox.sessions import SandboxDockerSession, handler
+from daiv_sandbox.sessions import PRIVILEGED_USER, SandboxDockerSession, handler
 
 
 @pytest.fixture
@@ -110,10 +110,10 @@ def test_execute_command():
 def test_copy_to_runtime_creates_directory():
     session = SandboxDockerSession(image="test-image")
     session.container = MagicMock()
-    session.container.exec_run.return_value = (1, b"")  # Simulate directory not existing
+    session.container.exec_run.side_effect = [ExecResult(exit_code=1, output=b""), ExecResult(exit_code=0, output=b"")]
     with patch("io.BytesIO", return_value=MagicMock()) as mock_data:
         session.copy_to_runtime("/path/to/dest", mock_data)
-        session.container.exec_run.assert_any_call("mkdir -p /path/to/dest")
+        session.container.exec_run.assert_any_call("mkdir -p /path/to/dest", privileged=True, user=PRIVILEGED_USER)
 
 
 def test_copy_from_runtime_raises_error_if_file_not_found():
