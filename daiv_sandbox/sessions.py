@@ -19,6 +19,8 @@ from daiv_sandbox.schemas import RunResult
 if TYPE_CHECKING:
     from docker.models.containers import Container
 
+PRIVILEGED_USER = "root"
+
 logger = logging.getLogger("daiv_sandbox")
 
 
@@ -193,9 +195,14 @@ class SandboxDockerSession(Session):
         if not self.container:
             raise RuntimeError("Session is not open. Please call open() method before copying files.")
 
-        if dest and self.container.exec_run(f"test -d {dest}")[0] != 0:
+        if dest and self.container.exec_run(f"test -d {dest}", privileged=True, user=PRIVILEGED_USER)[0] != 0:
             logger.info("Creating directory %s:%s...", self.container.short_id, dest)
-            self.container.exec_run(f"mkdir -p {dest}")
+            result = self.container.exec_run(f"mkdir -p {dest}", privileged=True, user=PRIVILEGED_USER)
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to create directory {self.container.short_id}:{dest} "
+                    f"(exit code {result.exit_code}) -> {result.output.decode()}"
+                )
 
         logger.info("Copying archive to %s:%s...", self.container.short_id, dest)
 
@@ -215,7 +222,9 @@ class SandboxDockerSession(Session):
 
         before_run_date = datetime.datetime.now()
 
-        result = self.container.exec_run(f"/bin/sh -c {shlex.quote(command)}", workdir=workdir)
+        result = self.container.exec_run(
+            f"/bin/sh -c {shlex.quote(command)}", workdir=workdir, privileged=True, user=PRIVILEGED_USER
+        )
 
         if result.exit_code != 0:
             if logger.isEnabledFor(logging.DEBUG):
@@ -256,7 +265,9 @@ class SandboxDockerSession(Session):
         # Get the list of changed files in the specified workdir and modified after the specified date.
         result = self.container.exec_run(
             f'find {workdir} -type f ! -path "*/.*" '
-            f'-newermt "{modified_after:%Y-%m-%d %H:%M:%S}.{modified_after.microsecond // 1000:03d}"'
+            f'-newermt "{modified_after:%Y-%m-%d %H:%M:%S}.{modified_after.microsecond // 1000:03d}"',
+            privileged=True,
+            user=PRIVILEGED_USER,
         )
 
         if result.exit_code != 0:
@@ -285,7 +296,9 @@ class SandboxDockerSession(Session):
         )
 
         tar_path = f"{workdir}/changed_files.tar.gz"
-        result = self.container.exec_run(f"tar -czf {tar_path} -C {workdir} {' '.join(include_files)}")
+        result = self.container.exec_run(
+            f"tar -czf {tar_path} -C {workdir} {' '.join(include_files)}", privileged=True, user=PRIVILEGED_USER
+        )
 
         if result.exit_code != 0:
             logger.debug(
