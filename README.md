@@ -38,15 +38,18 @@ $ docker run --rm -d -p 8000:8000 -e DAIV_SANDBOX_API_KEY=my-secret-api-key -e D
 
 All settings are configurable via environment variables. The available settings are:
 
-| Environment Variable                   | Description                                                 | Options/Default                                               |
-| -------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------- |
-| **DAIV_SANDBOX_API_KEY**               | The API key required to access the sandbox API.             |                                                               |
-| **DAIV_SANDBOX_ENVIRONMENT**           | The deployment environment.                                 | Options: `local`, `staging`, `production`<br>Default: "local" |
-| **DAIV_SANDBOX_SENTRY_DSN**            | The DSN for Sentry error tracking.                          | Optional                                                      |
-| **DAIV_SANDBOX_SENTRY_ENABLE_TRACING** | Whether to enable tracing for Sentry error tracking.        | Default: False                                                |
-| **DAIV_SANDBOX_MAX_EXECUTION_TIME**    | The maximum allowed execution time for commands in seconds. | Default: 600                                                  |
-| **DAIV_SANDBOX_RUNTIME**               | The container runtime to use.                               | Options: `runc`, `runsc`<br>Default: "runc"                   |
-| **DAIV_SANDBOX_KEEP_TEMPLATE**         | Whether to keep the execution template after finishing.     | Default: False                                                |
+| Environment Variable                   | Description                                                 | Options/Default                                                             |
+| -------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------- |
+| **DAIV_SANDBOX_API_KEY**               | The API key required to access the sandbox API.             |                                                                             |
+| **DAIV_SANDBOX_ENVIRONMENT**           | The deployment environment.                                 | Options: `local`, `production`<br>Default: "production"                     |
+| **DAIV_SANDBOX_SENTRY_DSN**            | The DSN for Sentry error tracking.                          | Optional                                                                    |
+| **DAIV_SANDBOX_SENTRY_ENABLE_TRACING** | Whether to enable tracing for Sentry error tracking.        | Default: False                                                              |
+| **DAIV_SANDBOX_MAX_EXECUTION_TIME**    | The maximum allowed execution time for commands in seconds. | Default: 600                                                                |
+| **DAIV_SANDBOX_RUNTIME**               | The container runtime to use.                               | Options: `runc`, `runsc`<br>Default: "runc"                                 |
+| **DAIV_SANDBOX_KEEP_TEMPLATE**         | Whether to keep the execution template after finishing.     | Default: False                                                              |
+| **DAIV_SANDBOX_HOST**                  | The host to bind the service to.                            | Default: "0.0.0.0"                                                          |
+| **DAIV_SANDBOX_PORT**                  | The port to bind the service to.                            | Default: 8000                                                               |
+| **DAIV_SANDBOX_LOG_LEVEL**             | The log level to use.                                       | Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`<br>Default: "INFO" |
 
 ## Usage
 
