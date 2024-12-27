@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.1.0-rc.8] - 2024-12-27
+
 ### Added
 
 - Added `HOST` and `PORT` settings to allow overriding the host and port of the service.
@@ -162,7 +164,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.7...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.8...HEAD
+[0.1.0-rc.8]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.7...v0.1.0-rc.8
 [0.1.0-rc.7]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.6...v0.1.0-rc.7
 [0.1.0-rc.6]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.5...v0.1.0-rc.6
 [0.1.0-rc.5]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.4...v0.1.0-rc.5
