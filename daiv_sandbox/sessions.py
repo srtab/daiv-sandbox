@@ -5,6 +5,7 @@ import shlex
 import signal
 import tarfile
 from abc import ABC, abstractmethod
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Literal
 from uuid import uuid4
@@ -18,8 +19,6 @@ from daiv_sandbox.schemas import RunResult
 
 if TYPE_CHECKING:
     from docker.models.containers import Container
-
-PRIVILEGED_USER = "root"
 
 logger = logging.getLogger("daiv_sandbox")
 
@@ -45,7 +44,7 @@ class Session(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def copy_to_runtime(self, dest: str, data: BinaryIO):
+    def copy_to_runtime(self, data: BinaryIO):
         raise NotImplementedError
 
     @abstractmethod
@@ -146,6 +145,35 @@ class SandboxDockerSession(Session):
         )
         logger.info("Container %s created", self.container.short_id)
 
+    @property
+    def run_path(self) -> str:
+        """
+        Get the path to the run directory.
+        """
+        if self._image_user == "root":
+            return f"/runs/{self.run_id}"
+
+        return (Path(self._image_working_dir) / "runs" / self.run_id).as_posix()
+
+    @property
+    def _image_user(self) -> str:
+        # If it's empty, Docker defaults to root
+        return self._image_inspection["Config"]["User"] or "root"
+
+    @property
+    def _image_working_dir(self) -> str:
+        if not self._image_inspection["Config"]["WorkingDir"]:
+            raise ValueError("Can't determine the working dir of image %s", self._image_inspection["RepoTags"][0])
+
+        return self._image_inspection["Config"]["WorkingDir"]
+
+    @cached_property
+    def _image_inspection(self) -> dict:
+        if not self.container or not self.image:
+            raise RuntimeError("Session is not open. Please call open() method before copying files.")
+
+        return self.client.api.inspect_image(self.image.tags[-1])
+
     def close(self):
         """
         Remove the container.
@@ -188,43 +216,50 @@ class SandboxDockerSession(Session):
 
         return extracted_archive
 
-    def copy_to_runtime(self, dest: str, data: BinaryIO):
+    def copy_to_runtime(self, data: BinaryIO):
         """
         Copy a file or directory to the container.
         """
         if not self.container:
             raise RuntimeError("Session is not open. Please call open() method before copying files.")
 
-        if dest and self.container.exec_run(f"test -d {dest}", privileged=True, user=PRIVILEGED_USER)[0] != 0:
-            logger.info("Creating directory %s:%s...", self.container.short_id, dest)
-            result = self.container.exec_run(f"mkdir -p {dest}", privileged=True, user=PRIVILEGED_USER)
+        if self.container.exec_run(f"test -d {self.run_path}")[0] != 0:
+            logger.info("Creating directory %s:%s...", self.container.short_id, self.run_path)
+            result = self.container.exec_run(f"mkdir -p {self.run_path}")
             if result.exit_code != 0:
                 raise RuntimeError(
-                    f"Failed to create directory {self.container.short_id}:{dest} "
+                    f"Failed to create directory {self.container.short_id}:{self.run_path} "
                     f"(exit code {result.exit_code}) -> {result.output.decode()}"
                 )
 
-        logger.info("Copying archive to %s:%s...", self.container.short_id, dest)
+        logger.info("Copying archive to %s:%s...", self.container.short_id, self.run_path)
 
-        if self.container.put_archive(dest, data.getvalue()):
-            logger.debug("Successfully copied archive to %s:%s", self.container.short_id, dest)
+        if self.container.put_archive(self.run_path, data.getvalue()):
+            # we need to normalizer folder permissions
+            logger.debug("Normalizing folder permissions for %s:%s", self.container.short_id, self.run_path)
+            self.container.exec_run(
+                f"chown -R {self._image_user}:{self._image_user} {self.run_path}", privileged=True, user="root"
+            )
+            logger.debug("Successfully copied archive to %s:%s", self.container.short_id, self.run_path)
         else:
-            raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{dest}")
+            raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{self.run_path}")
 
-    def execute_command(self, command: str, workdir: str, extract_changed_files: bool = False) -> RunResult:
+    def execute_command(
+        self, command: str, workdir: str | None = None, extract_changed_files: bool = False
+    ) -> RunResult:
         """
         Execute a command in the container.
         """
         if not self.container:
             raise RuntimeError("Session is not open. Please call open() method before executing commands.")
 
-        logger.info("Executing command '%s' in %s:%s...", command, self.container.short_id, workdir)
+        command_workdir = (Path(self.run_path) / workdir).as_posix() if workdir else self.run_path
+
+        logger.info("Executing command '%s' in %s:%s...", command, self.container.short_id, command_workdir)
 
         before_run_date = datetime.datetime.now()
 
-        result = self.container.exec_run(
-            f"/bin/sh -c {shlex.quote(command)}", workdir=workdir, privileged=True, user=PRIVILEGED_USER
-        )
+        result = self.container.exec_run(f"/bin/sh -c {shlex.quote(command)}", workdir=command_workdir)
 
         if result.exit_code != 0:
             if logger.isEnabledFor(logging.DEBUG):
@@ -232,7 +267,7 @@ class SandboxDockerSession(Session):
                     "Command '%s' in %s:%s exited with code %s: %s",
                     command,
                     self.container.short_id,
-                    workdir,
+                    command_workdir,
                     result.exit_code,
                     result.output.decode(),
                 )
@@ -241,7 +276,7 @@ class SandboxDockerSession(Session):
                     "Command '%s' in %s:%s exited with code %s",
                     command,
                     self.container.short_id,
-                    workdir,
+                    command_workdir,
                     result.exit_code,
                 )
 
@@ -249,7 +284,10 @@ class SandboxDockerSession(Session):
             command=command,
             output=result.output.decode(),
             exit_code=result.exit_code,
-            changed_files=self._extract_changed_file_names(workdir, before_run_date) if extract_changed_files else [],
+            workdir=command_workdir,
+            changed_files=self._extract_changed_file_names(command_workdir, before_run_date)
+            if extract_changed_files
+            else [],
         )
 
     def _extract_changed_file_names(self, workdir: str, modified_after: datetime.datetime) -> list[str]:
@@ -265,9 +303,7 @@ class SandboxDockerSession(Session):
         # Get the list of changed files in the specified workdir and modified after the specified date.
         result = self.container.exec_run(
             f'find {workdir} -type f ! -path "*/.*" '
-            f'-newermt "{modified_after:%Y-%m-%d %H:%M:%S}.{modified_after.microsecond // 1000:03d}"',
-            privileged=True,
-            user=PRIVILEGED_USER,
+            f'-newermt "{modified_after:%Y-%m-%d %H:%M:%S}.{modified_after.microsecond // 1000:03d}"'
         )
 
         if result.exit_code != 0:
@@ -277,6 +313,9 @@ class SandboxDockerSession(Session):
             )
 
         changed_files = result.output.decode().splitlines()
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Extracted changed files: %s", changed_files)
 
         if not changed_files:
             logger.info("No changed files found in %s:%s", self.container.short_id, workdir)
@@ -296,9 +335,7 @@ class SandboxDockerSession(Session):
         )
 
         tar_path = f"{workdir}/changed_files.tar.gz"
-        result = self.container.exec_run(
-            f"tar -czf {tar_path} -C {workdir} {' '.join(include_files)}", privileged=True, user=PRIVILEGED_USER
-        )
+        result = self.container.exec_run(f"tar -czf {tar_path} -C {workdir} {' '.join(include_files)}")
 
         if result.exit_code != 0:
             logger.debug(

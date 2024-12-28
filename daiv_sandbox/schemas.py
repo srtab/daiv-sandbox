@@ -21,6 +21,7 @@ class RunResult(BaseModel):
     command: str = Field(..., description="Command that was executed.")
     output: str = Field(..., description="Output of the command.")
     exit_code: int = Field(..., description="Exit code of the command.")
+    workdir: str = Field(..., description="Working directory of the command.", exclude=True)
     changed_files: list[str] = Field(default_factory=list, description="List of changed files.", exclude=True)
 
 
