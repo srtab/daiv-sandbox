@@ -38,7 +38,7 @@ def test_run_commands_success(MockSession, client):  # noqa: N803
     # Mock the session and its methods
     mock_session = MockSession.return_value.__enter__.return_value
     mock_session.execute_command.return_value = RunResult(
-        command="echo 'Hello, World!'", output=b"success", exit_code=0, changed_files=[]
+        command="echo 'Hello, World!'", output=b"success", exit_code=0, changed_files=[], workdir="/"
     )
     # Use a valid Base64-encoded string
     mock_session.create_tar_gz_archive.return_value = io.BytesIO(b"mocked_archive")
@@ -68,7 +68,7 @@ def test_run_commands_failure(MockSession, client):  # noqa: N803
     # Mock the session and its methods
     mock_session = MockSession.return_value.__enter__.return_value
     mock_session.execute_command.return_value = RunResult(
-        command="exit 1", output=b"error", exit_code=1, changed_files=[]
+        command="exit 1", output=b"error", exit_code=1, changed_files=[], workdir="/"
     )
     # Use a valid Base64-encoded string
     mock_session.create_tar_gz_archive.return_value = io.BytesIO(b"mocked_archive")
@@ -98,7 +98,7 @@ def test_run_commands_with_workdir(MockSession, client):  # noqa: N803
     # Mock the session and its methods
     mock_session = MockSession.return_value.__enter__.return_value
     mock_session.execute_command.return_value = RunResult(
-        command="echo 'Hello, World!'", output=b"success", exit_code=0, changed_files=[]
+        command="echo 'Hello, World!'", output=b"success", exit_code=0, changed_files=[], workdir="/"
     )
     mock_session.create_tar_gz_archive.return_value = io.BytesIO(b"mocked_archive")
 

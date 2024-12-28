@@ -28,7 +28,9 @@ def test_install_dependencies(setup_manager):
     session, manager = setup_manager
 
     # Mock the expected result
-    expected_result = RunResult(command="pip install numpy pandas", output="Dependencies installed", exit_code=0)
+    expected_result = RunResult(
+        command="pip install numpy pandas", output="Dependencies installed", exit_code=0, workdir="/"
+    )
     session.execute_command.return_value = expected_result
 
     # Call the method
@@ -43,14 +45,14 @@ def test_run_code(setup_manager):
     session, manager = setup_manager
 
     # Mock the expected result
-    expected_result = RunResult(command="python main.py", output="Code executed", exit_code=0)
+    expected_result = RunResult(command="python main.py", output="Code executed", exit_code=0, workdir="/")
     session.execute_command.return_value = expected_result
 
     # Call the method
     code = "print('Hello, World!')"
-    result = manager.run_code(session, "/workdir", code)
+    result = manager.run_code(session, code)
 
     # Assertions
     session.copy_to_runtime.assert_called_once()
-    session.execute_command.assert_called_once_with("python main.py", workdir="/workdir")
+    session.execute_command.assert_called_once_with("python main.py")
     assert result == expected_result

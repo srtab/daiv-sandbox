@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- Moved `LANGUAGE_BASE_IMAGES` from `daiv_sandbox/main.py` to `daiv_sandbox/languages.py`.
+
+### Fixed
+
+- Changed strategy to determine where the run will execute inside the container. Now the default user and working directory are considered to avoid privileges issues.
+
 ## [0.1.0-rc.9] - 2024-12-27
 
 ### Fixed

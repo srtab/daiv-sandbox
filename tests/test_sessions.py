@@ -1,5 +1,5 @@
 import signal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 from docker.errors import ImageNotFound
@@ -7,7 +7,7 @@ from docker.models.containers import ExecResult
 from docker.models.images import Image
 
 from daiv_sandbox.config import settings
-from daiv_sandbox.sessions import PRIVILEGED_USER, SandboxDockerSession, handler
+from daiv_sandbox.sessions import SandboxDockerSession, handler
 
 
 @pytest.fixture
@@ -99,21 +99,31 @@ def test_close_removes_container():
 
 
 def test_execute_command():
-    session = SandboxDockerSession(image="test-image")
-    session.container = MagicMock()
-    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"output")
-    result = session.execute_command("echo hello", "/")
-    assert result.exit_code == 0
-    assert result.output == "output"
+    with patch.object(SandboxDockerSession, "run_path", new_callable=PropertyMock, return_value="/"):
+        session = SandboxDockerSession(image="test-image")
+        session.container = MagicMock()
+        session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"output")
+        result = session.execute_command("echo hello")
+        assert result.exit_code == 0
+        assert result.output == "output"
 
 
 def test_copy_to_runtime_creates_directory():
-    session = SandboxDockerSession(image="test-image")
-    session.container = MagicMock()
-    session.container.exec_run.side_effect = [ExecResult(exit_code=1, output=b""), ExecResult(exit_code=0, output=b"")]
-    with patch("io.BytesIO", return_value=MagicMock()) as mock_data:
-        session.copy_to_runtime("/path/to/dest", mock_data)
-        session.container.exec_run.assert_any_call("mkdir -p /path/to/dest", privileged=True, user=PRIVILEGED_USER)
+    with (
+        patch.object(SandboxDockerSession, "run_path", new_callable=PropertyMock, return_value="/path/to/dest"),
+        patch.object(SandboxDockerSession, "_image_user", new_callable=PropertyMock, return_value="root"),
+    ):
+        session = SandboxDockerSession(image="test-image")
+        session.container = MagicMock()
+        session.container.exec_run.side_effect = [
+            ExecResult(exit_code=1, output=b""),
+            ExecResult(exit_code=0, output=b""),
+            ExecResult(exit_code=0, output=b""),
+        ]
+        with patch("io.BytesIO", return_value=MagicMock()) as mock_data:
+            session.copy_to_runtime(mock_data)
+            session.container.exec_run.assert_any_call("mkdir -p /path/to/dest")
+            session.container.exec_run.assert_any_call("chown -R root:root /path/to/dest", privileged=True, user="root")
 
 
 def test_copy_from_runtime_raises_error_if_file_not_found():
@@ -154,3 +164,70 @@ def test_handler_is_registered_for_sigalrm():
     """Test that the handler is properly registered for SIGALRM"""
     current_handler = signal.getsignal(signal.SIGALRM)
     assert current_handler == handler, "Handler should be registered for SIGALRM"
+
+
+def test_image_inspection_raises_when_not_open():
+    session = SandboxDockerSession(image="test-image")
+    with pytest.raises(RuntimeError, match="Session is not open"):
+        _ = session._image_inspection
+
+
+def test_image_inspection():
+    with patch.object(SandboxDockerSession, "run_path", new_callable=PropertyMock, return_value="/"):
+        session = SandboxDockerSession(image="test-image")
+        session.container = MagicMock()
+        session.image = MagicMock(tags=["test-image:latest"])
+
+        mock_inspection = {"Config": {"User": "testuser", "WorkingDir": "/app"}}
+        session.client = MagicMock()
+        session.client.api.inspect_image.return_value = mock_inspection
+
+        assert session._image_inspection == mock_inspection
+        session.client.api.inspect_image.assert_called_once_with("test-image:latest")
+
+
+def test_image_user_root_when_empty():
+    with patch.object(SandboxDockerSession, "_image_inspection", new_callable=PropertyMock) as mock_inspection:
+        mock_inspection.return_value = {"Config": {"User": ""}}
+        session = SandboxDockerSession(image="test-image")
+        assert session._image_user == "root"
+
+
+def test_image_user_from_config():
+    with patch.object(SandboxDockerSession, "_image_inspection", new_callable=PropertyMock) as mock_inspection:
+        mock_inspection.return_value = {"Config": {"User": "testuser"}}
+        session = SandboxDockerSession(image="test-image")
+        assert session._image_user == "testuser"
+
+
+def test_image_working_dir_raises_when_empty():
+    with patch.object(SandboxDockerSession, "_image_inspection", new_callable=PropertyMock) as mock_inspection:
+        mock_inspection.return_value = {"Config": {"WorkingDir": ""}, "RepoTags": ["test-image:latest"]}
+        session = SandboxDockerSession(image="test-image")
+        with pytest.raises(ValueError, match="Can't determine the working dir"):
+            _ = session._image_working_dir
+
+
+def test_image_working_dir_from_config():
+    with patch.object(SandboxDockerSession, "_image_inspection", new_callable=PropertyMock) as mock_inspection:
+        mock_inspection.return_value = {"Config": {"WorkingDir": "/app"}}
+        session = SandboxDockerSession(image="test-image")
+        assert session._image_working_dir == "/app"
+
+
+def test_run_path_for_root_user():
+    with patch.object(SandboxDockerSession, "_image_user", new_callable=PropertyMock) as mock_user:
+        mock_user.return_value = "root"
+        session = SandboxDockerSession(image="test-image", run_id="test-run")
+        assert session.run_path == "/runs/test-run"
+
+
+def test_run_path_for_non_root_user():
+    with (
+        patch.object(SandboxDockerSession, "_image_user", new_callable=PropertyMock) as mock_user,
+        patch.object(SandboxDockerSession, "_image_working_dir", new_callable=PropertyMock) as mock_working_dir,
+    ):
+        mock_user.return_value = "testuser"
+        mock_working_dir.return_value = "/app"
+        session = SandboxDockerSession(image="test-image", run_id="test-run")
+        assert session.run_path == "/app/runs/test-run"

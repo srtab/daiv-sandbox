@@ -10,6 +10,9 @@ if TYPE_CHECKING:
     from daiv_sandbox.sessions import SandboxDockerSession
 
 
+LANGUAGE_BASE_IMAGES = {"python": "python:3.12-slim"}
+
+
 class LanguageManager(abc.ABC):
     """
     Abstract base class for language managers.
@@ -20,7 +23,7 @@ class LanguageManager(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def run_code(self, session: SandboxDockerSession, workdir: str, code: str) -> RunResult:
+    def run_code(self, session: SandboxDockerSession, code: str) -> RunResult:
         pass
 
     @staticmethod
@@ -41,7 +44,7 @@ class PythonLanguageManager(LanguageManager):
         """
         return session.execute_command(f"pip install {' '.join(dependencies)}", workdir="/")
 
-    def run_code(self, session: SandboxDockerSession, workdir: str, code: str) -> RunResult:
+    def run_code(self, session: SandboxDockerSession, code: str) -> RunResult:
         """
         Run code.
         """
@@ -52,6 +55,6 @@ class PythonLanguageManager(LanguageManager):
                 tar.addfile(tarinfo, io.BytesIO(code.encode()))
 
             tar_file.seek(0)
-            session.copy_to_runtime(workdir, tar_file)
+            session.copy_to_runtime(tar_file)
 
-        return session.execute_command("python main.py", workdir=workdir)
+        return session.execute_command("python main.py")
