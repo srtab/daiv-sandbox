@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.1.0-rc.10] - 2024-12-30
+
 ### Changed
 
 - Moved `LANGUAGE_BASE_IMAGES` from `daiv_sandbox/main.py` to `daiv_sandbox/languages.py`.
@@ -187,7 +189,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.9...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.10...HEAD
+[0.1.0-rc.10]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.9...v0.1.0-rc.10
 [0.1.0-rc.9]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.8...v0.1.0-rc.9
 [0.1.0-rc.8]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.7...v0.1.0-rc.8
 [0.1.0-rc.7]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.6...v0.1.0-rc.7
