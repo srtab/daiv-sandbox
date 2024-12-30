@@ -211,7 +211,7 @@ wheels = [
 
 [[package]]
 name = "daiv-sandbox"
-version = "0.1.0rc9"
+version = "0.1.0rc10"
 source = { virtual = "." }
 dependencies = [
     { name = "docker" },
@@ -241,7 +241,7 @@ requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = "==0.115.6" },
     { name = "ipython", specifier = "==8.31" },
     { name = "pydantic", specifier = "==2.10.4" },
-    { name = "pydantic-settings", specifier = "==2.7.0" },
+    { name = "pydantic-settings", specifier = "==2.7" },
     { name = "sentry-sdk", specifier = "==2.19.2" },
 ]
 
