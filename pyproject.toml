@@ -21,7 +21,7 @@ dependencies = [
   "fastapi[standard]==0.115.6",
   "ipython==8.31",
   "pydantic==2.10.4",
-  "pydantic-settings==2.7",
+  "pydantic-settings==2.7.1",
   "sentry-sdk==2.19.2",
 ]
 
