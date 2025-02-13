@@ -22,7 +22,7 @@ dependencies = [
   "ipython==8.31",
   "pydantic==2.10.4",
   "pydantic-settings==2.7",
-  "sentry-sdk==2.19.2",
+  "sentry-sdk==2.21.0",
 ]
 
 urls."Bug Tracker" = "https://github.com/srtab/daiv-sandbox/issues"
