@@ -141,7 +141,13 @@ class SandboxDockerSession(Session):
             raise ValueError("Invalid image type")
 
         self.container = self.client.containers.run(
-            self.image, detach=True, tty=True, runtime=self.runtime, hostname="sandbox", name=f"sandbox-{self.run_id}"
+            self.image, 
+            command="tail -f /dev/null",  # Keep container running indefinitely
+            detach=True, 
+            tty=True, 
+            runtime=self.runtime, 
+            hostname="sandbox", 
+            name=f"sandbox-{self.run_id}"
         )
         logger.info("Container %s created", self.container.short_id)
 
@@ -191,13 +197,38 @@ class SandboxDockerSession(Session):
             else:
                 image.remove(force=True)
 
+    def ensure_container_running(self):
+        """
+        Check if the container exists and is running. If not, attempt to restart it.
+        """
+        if not self.container:
+            raise RuntimeError("Session is not open. Please call open() method before executing commands.")
+            
+        try:
+            # Refresh container status
+            self.container.reload()
+            
+            # Check if container is running
+            if self.container.status != "running":
+                logger.warning("Container %s is not running (status: %s). Attempting to restart...", 
+                              self.container.short_id, self.container.status)
+                self.container.restart()
+                self.container.reload()
+                
+                if self.container.status != "running":
+                    raise RuntimeError(f"Failed to restart container {self.container.short_id}. Current status: {self.container.status}")
+                
+                logger.info("Container %s successfully restarted", self.container.short_id)
+        except Exception as e:
+            logger.error("Error ensuring container is running: %s", str(e))
+            raise RuntimeError(f"Failed to ensure container {self.container.short_id} is running: {str(e)}") from e
+
     def copy_from_runtime(self, src: str) -> BinaryIO:
         """
         Copy a file or directory from the container to the host.
         """
-        if not self.container:
-            raise RuntimeError("Session is not open. Please call open() method before copying files.")
-
+        self.ensure_container_running()
+        
         logger.info("Copying archive from %s:%s...", self.container.short_id, src)
 
         bits, stat = self.container.get_archive(src)
@@ -220,29 +251,58 @@ class SandboxDockerSession(Session):
         """
         Copy a file or directory to the container.
         """
-        if not self.container:
-            raise RuntimeError("Session is not open. Please call open() method before copying files.")
+        try:
+            self.ensure_container_running()
+            
+            try:
+                # Check if run path directory exists
+                if self.container.exec_run(f"test -d {self.run_path}")[0] != 0:
+                    logger.info("Creating directory %s:%s...", self.container.short_id, self.run_path)
+                    result = self.container.exec_run(f"mkdir -p {self.run_path}")
+                    if result.exit_code != 0:
+                        error_msg = result.output.decode()
+                        logger.error("Directory creation failed with exit code %d: %s", result.exit_code, error_msg)
+                        raise RuntimeError(
+                            f"Failed to create directory {self.container.short_id}:{self.run_path} "
+                            f"(exit code {result.exit_code}) -> {error_msg}"
+                        )
+            except Exception as e:
+                logger.error("Error checking/creating run directory: %s", str(e))
+                raise RuntimeError(f"Failed to prepare run directory in container {self.container.short_id}: {str(e)}") from e
 
-        if self.container.exec_run(f"test -d {self.run_path}")[0] != 0:
-            logger.info("Creating directory %s:%s...", self.container.short_id, self.run_path)
-            result = self.container.exec_run(f"mkdir -p {self.run_path}")
-            if result.exit_code != 0:
-                raise RuntimeError(
-                    f"Failed to create directory {self.container.short_id}:{self.run_path} "
-                    f"(exit code {result.exit_code}) -> {result.output.decode()}"
-                )
-
-        logger.info("Copying archive to %s:%s...", self.container.short_id, self.run_path)
-
-        if self.container.put_archive(self.run_path, data.getvalue()):
-            # we need to normalizer folder permissions
-            logger.debug("Normalizing folder permissions for %s:%s", self.container.short_id, self.run_path)
-            self.container.exec_run(
-                f"chown -R {self._image_user}:{self._image_user} {self.run_path}", privileged=True, user="root"
-            )
-            logger.debug("Successfully copied archive to %s:%s", self.container.short_id, self.run_path)
-        else:
-            raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{self.run_path}")
+            logger.info("Copying archive to %s:%s...", self.container.short_id, self.run_path)
+            
+            try:
+                # Attempt to copy the archive to the container
+                if self.container.put_archive(self.run_path, data.getvalue()):
+                    # we need to normalize folder permissions
+                    logger.debug("Normalizing folder permissions for %s:%s", self.container.short_id, self.run_path)
+                    
+                    perm_result = self.container.exec_run(
+                        f"chown -R {self._image_user}:{self._image_user} {self.run_path}", 
+                        privileged=True, 
+                        user="root"
+                    )
+                    
+                    if perm_result.exit_code != 0:
+                        logger.warning(
+                            "Failed to normalize permissions for %s:%s (exit code %d): %s", 
+                            self.container.short_id, 
+                            self.run_path, 
+                            perm_result.exit_code, 
+                            perm_result.output.decode()
+                        )
+                    
+                    logger.debug("Successfully copied archive to %s:%s", self.container.short_id, self.run_path)
+                else:
+                    raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{self.run_path} - operation returned False")
+            except Exception as e:
+                logger.error("Error during archive copy operation: %s", str(e))
+                raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{self.run_path}: {str(e)}") from e
+                
+        except Exception as e:
+            logger.error("Copy to runtime operation failed: %s", str(e))
+            raise RuntimeError(f"Copy to runtime operation failed for container {self.container.short_id}: {str(e)}") from e
 
     def execute_command(
         self, command: str, workdir: str | None = None, extract_changed_files: bool = False
@@ -250,8 +310,7 @@ class SandboxDockerSession(Session):
         """
         Execute a command in the container.
         """
-        if not self.container:
-            raise RuntimeError("Session is not open. Please call open() method before executing commands.")
+        self.ensure_container_running()
 
         command_workdir = (Path(self.run_path) / workdir).as_posix() if workdir else self.run_path
 
@@ -297,6 +356,8 @@ class SandboxDockerSession(Session):
         if not self.container:
             logger.info("Session already closed. Skipping extraction of changed files.")
             return []
+            
+        self.ensure_container_running()
 
         logger.info("Extracting list of changed files from %s:%s...", self.container.short_id, workdir)
 
@@ -327,8 +388,7 @@ class SandboxDockerSession(Session):
         """
         Create a tar.gz archive with the specified files.
         """
-        if not self.container:
-            raise RuntimeError("Session is not open. Please call open() method before creating tar.gz archive.")
+        self.ensure_container_running()
 
         logger.info(
             "Creating tar.gz file with %s files in %s:%s...", len(include_files), self.container.short_id, workdir
