@@ -51,7 +51,13 @@ def test_open_with_image(mock_docker_client, mock_image):
     session.open()
     mock_docker_client.images.get.assert_called_once_with("test-image")
     mock_docker_client.containers.run.assert_called_once_with(
-        mock_image, detach=True, tty=True, runtime="runc", hostname="sandbox", name="sandbox-test-run-id"
+        mock_image,
+        command="tail -f /dev/null",
+        detach=True,
+        tty=True,
+        runtime="runc",
+        hostname="sandbox",
+        name="sandbox-test-run-id",
     )
     assert session.image == mock_image
     assert session.container is not None
@@ -102,6 +108,7 @@ def test_execute_command():
     with patch.object(SandboxDockerSession, "run_path", new_callable=PropertyMock, return_value="/"):
         session = SandboxDockerSession(image="test-image")
         session.container = MagicMock()
+        session.container.status = "running"
         session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"output")
         result = session.execute_command("echo hello")
         assert result.exit_code == 0
@@ -115,6 +122,7 @@ def test_copy_to_runtime_creates_directory():
     ):
         session = SandboxDockerSession(image="test-image")
         session.container = MagicMock()
+        session.container.status = "running"
         session.container.exec_run.side_effect = [
             ExecResult(exit_code=1, output=b""),
             ExecResult(exit_code=0, output=b""),
@@ -129,6 +137,7 @@ def test_copy_to_runtime_creates_directory():
 def test_copy_from_runtime_raises_error_if_file_not_found():
     session = SandboxDockerSession(image="test-image")
     session.container = MagicMock()
+    session.container.status = "running"
     session.container.get_archive.return_value = ([], {"size": 0})
     with pytest.raises(FileNotFoundError):
         session.copy_from_runtime("/path/to/src")
