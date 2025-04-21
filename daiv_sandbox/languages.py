@@ -45,6 +45,7 @@ class PythonLanguageManager(LanguageManager):
     def run_code(self, session: SandboxDockerSession, code: str, dependencies: list[str] = None) -> RunResult:
         """
         Run code with uv, incorporating dependencies directly into the code file.
+        See https://docs.astral.sh/uv/guides/scripts/#declaring-script-dependencies for more information on how dependencies are declared.
         """
         # Format dependencies in uv format if they exist
         formatted_dependencies = ""
