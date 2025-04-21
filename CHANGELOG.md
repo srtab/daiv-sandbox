@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migrated from pip to uv for Python package management.
 - Removed separate dependency installation step and integrated it directly into the code execution process.
 - Updated `run_code` method in `PythonLanguageManager` to accept dependencies as a parameter and incorporate them directly into the code file using uv's script dependencies format.
-- Updated tests to reflect the changes in dependency management and code execution.
 
+### Fixed
+
+- Sometimes the container was not running even when open was called, causing issues when trying to do operations on it. Now the container is ensured to be running before any operation is done.
 
 ## [0.1.0-rc.10] - 2024-12-30
 
