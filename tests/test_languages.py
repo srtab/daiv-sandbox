@@ -42,11 +42,11 @@ def test_run_code(setup_manager):
 
     # Reset mocks
     session.reset_mock()
-    
+
     # Test with dependencies
     dependencies = ["numpy", "pandas"]
     result = manager.run_code(session, code, dependencies)
-    
+
     # Verify dependencies are correctly prepended to the code
     session.copy_to_runtime.assert_called_once()
     session.execute_command.assert_called_once_with("uv run main.py")
