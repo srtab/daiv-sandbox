@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- Changed Python base image from `python:3.12-slim` to `ghcr.io/astral-sh/uv:python3.12-bookworm-slim`.
+- Migrated from pip to uv for Python package management.
+- Removed separate dependency installation step and integrated it directly into the code execution process.
+- Updated `run_code` method in `PythonLanguageManager` to accept dependencies as a parameter and incorporate them directly into the code file using uv's script dependencies format.
+- Updated tests to reflect the changes in dependency management and code execution.
+
+
 ## [0.1.0-rc.10] - 2024-12-30
 
 ### Changed
