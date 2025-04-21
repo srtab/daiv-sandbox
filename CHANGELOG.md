@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- Changed Python base image from `python:3.12-slim` to `ghcr.io/astral-sh/uv:python3.12-bookworm-slim`.
+- Migrated from pip to uv for Python package management.
+- Removed separate dependency installation step and integrated it directly into the code execution process.
+- Updated `run_code` method in `PythonLanguageManager` to accept dependencies as a parameter and incorporate them directly into the code file using uv's script dependencies format.
+
 ### Fixed
 
 - Sometimes the container was not running even when open was called, causing issues when trying to do operations on it. Now the container is ensured to be running before any operation is done.

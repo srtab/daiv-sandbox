@@ -119,12 +119,7 @@ async def run_code(request: RunCodeRequest, api_key: str = Depends(get_api_key))
     ) as session:
         manager = LanguageManager.factory(request.language)
 
-        if request.dependencies:
-            install_result = manager.install_dependencies(session, request.dependencies)
-            if install_result.exit_code != 0:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=install_result.output)
-
-        run_result = manager.run_code(session, request.code)
+        run_result = manager.run_code(session, request.code, request.dependencies)
         if run_result.exit_code != 0:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=run_result.output)
 

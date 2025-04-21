@@ -24,35 +24,30 @@ def test_factory_unsupported_language():
         LanguageManager.factory("unsupported")
 
 
-def test_install_dependencies(setup_manager):
-    session, manager = setup_manager
-
-    # Mock the expected result
-    expected_result = RunResult(
-        command="pip install numpy pandas", output="Dependencies installed", exit_code=0, workdir="/"
-    )
-    session.execute_command.return_value = expected_result
-
-    # Call the method
-    result = manager.install_dependencies(session, ["numpy", "pandas"])
-
-    # Assertions
-    session.execute_command.assert_called_once_with("pip install numpy pandas", workdir="/")
-    assert result == expected_result
-
-
 def test_run_code(setup_manager):
     session, manager = setup_manager
 
     # Mock the expected result
-    expected_result = RunResult(command="python main.py", output="Code executed", exit_code=0, workdir="/")
+    expected_result = RunResult(command="uv run main.py", output="Code executed", exit_code=0, workdir="/")
     session.execute_command.return_value = expected_result
 
-    # Call the method
+    # Test without dependencies
     code = "print('Hello, World!')"
     result = manager.run_code(session, code)
 
     # Assertions
     session.copy_to_runtime.assert_called_once()
-    session.execute_command.assert_called_once_with("python main.py")
+    session.execute_command.assert_called_once_with("uv run main.py")
+    assert result == expected_result
+
+    # Reset mocks
+    session.reset_mock()
+
+    # Test with dependencies
+    dependencies = ["numpy", "pandas"]
+    result = manager.run_code(session, code, dependencies)
+
+    # Verify dependencies are correctly prepended to the code
+    session.copy_to_runtime.assert_called_once()
+    session.execute_command.assert_called_once_with("uv run main.py")
     assert result == expected_result
