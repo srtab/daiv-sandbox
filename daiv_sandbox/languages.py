@@ -19,10 +19,6 @@ class LanguageManager(abc.ABC):
     """
 
     @abc.abstractmethod
-    def install_dependencies(self, session: SandboxDockerSession, dependencies: list[str]) -> RunResult:
-        pass
-
-    @abc.abstractmethod
     def run_code(self, session: SandboxDockerSession, code: str) -> RunResult:
         pass
 
@@ -37,10 +33,6 @@ class PythonLanguageManager(LanguageManager):
     """
     Language manager for Python.
     """
-
-    def install_dependencies(self, session: SandboxDockerSession, dependencies: list[str]) -> RunResult:
-        """Install dependencies using uv."""
-        return session.execute_command(f"uv pip install {' '.join(dependencies)}", workdir="/")
 
     def run_code(self, session: SandboxDockerSession, code: str, dependencies: list[str] = None) -> RunResult:
         """
