@@ -141,7 +141,13 @@ class SandboxDockerSession(Session):
             raise ValueError("Invalid image type")
 
         self.container = self.client.containers.run(
-            self.image, detach=True, tty=True, runtime=self.runtime, hostname="sandbox", name=f"sandbox-{self.run_id}"
+            self.image,
+            command="tail -f /dev/null",  # Keep container running indefinitely
+            detach=True,
+            tty=True,
+            runtime=self.runtime,
+            hostname="sandbox",
+            name=f"sandbox-{self.run_id}",
         )
         logger.info("Container %s created", self.container.short_id)
 
@@ -191,12 +197,42 @@ class SandboxDockerSession(Session):
             else:
                 image.remove(force=True)
 
+    def _ensure_container_running(self):
+        """
+        Check if the container exists and is running. If not, attempt to restart it.
+        """
+        if not self.container:
+            raise RuntimeError("Session is not open. Please call open() method before executing commands.")
+
+        try:
+            # Refresh container status
+            self.container.reload()
+
+            # Check if container is running
+            if self.container.status != "running":
+                logger.warning(
+                    "Container %s is not running (status: %s). Attempting to restart...",
+                    self.container.short_id,
+                    self.container.status,
+                )
+                self.container.restart()
+                self.container.reload()
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to ensure container {self.container.short_id} is running: {str(e)}") from e
+        else:
+            if self.container.status != "running":
+                raise RuntimeError(
+                    f"Failed to restart container {self.container.short_id}. Current status: {self.container.status}"
+                )
+
+            logger.info("Container %s successfully restarted", self.container.short_id)
+
     def copy_from_runtime(self, src: str) -> BinaryIO:
         """
         Copy a file or directory from the container to the host.
         """
-        if not self.container:
-            raise RuntimeError("Session is not open. Please call open() method before copying files.")
+        self._ensure_container_running()
 
         logger.info("Copying archive from %s:%s...", self.container.short_id, src)
 
@@ -220,8 +256,7 @@ class SandboxDockerSession(Session):
         """
         Copy a file or directory to the container.
         """
-        if not self.container:
-            raise RuntimeError("Session is not open. Please call open() method before copying files.")
+        self._ensure_container_running()
 
         if self.container.exec_run(f"test -d {self.run_path}")[0] != 0:
             logger.info("Creating directory %s:%s...", self.container.short_id, self.run_path)
@@ -250,8 +285,7 @@ class SandboxDockerSession(Session):
         """
         Execute a command in the container.
         """
-        if not self.container:
-            raise RuntimeError("Session is not open. Please call open() method before executing commands.")
+        self._ensure_container_running()
 
         command_workdir = (Path(self.run_path) / workdir).as_posix() if workdir else self.run_path
 
@@ -298,6 +332,8 @@ class SandboxDockerSession(Session):
             logger.info("Session already closed. Skipping extraction of changed files.")
             return []
 
+        self._ensure_container_running()
+
         logger.info("Extracting list of changed files from %s:%s...", self.container.short_id, workdir)
 
         # Get the list of changed files in the specified workdir and modified after the specified date.
@@ -327,8 +363,7 @@ class SandboxDockerSession(Session):
         """
         Create a tar.gz archive with the specified files.
         """
-        if not self.container:
-            raise RuntimeError("Session is not open. Please call open() method before creating tar.gz archive.")
+        self._ensure_container_running()
 
         logger.info(
             "Creating tar.gz file with %s files in %s:%s...", len(include_files), self.container.short_id, workdir

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- Sometimes the container was not running even when open was called, causing issues when trying to do operations on it. Now the container is ensured to be running before any operation is done.
+
 ## [0.1.0-rc.10] - 2024-12-30
 
 ### Changed
