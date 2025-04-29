@@ -105,6 +105,9 @@ with tarfile.open(fileobj=tarstream, mode="r:*") as tar:
     resp = response.json()
 ```
 
+> [!WARNING]
+> The `base_image` need to be a ditro image. Distroless images will not work as there is no shell available in the container to maintain the image running indefinitely.
+
 ## License
 
 `daiv-sandbox` is licensed under the [Apache License 2.0](LICENSE).
