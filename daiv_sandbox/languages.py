@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import io
 import tarfile
+from textwrap import dedent
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -44,8 +45,16 @@ class PythonLanguageManager(LanguageManager):
         # Format dependencies in uv format if they exist
         formatted_dependencies = ""
         if dependencies:
-            deps_list = [f'  "{dep}",' for dep in dependencies]
-            formatted_dependencies = "# /// script\n# dependencies = [\n" + "\n".join(deps_list) + "\n# ]\n# ///\n\n"
+            deps_list = [f'#    "{dep}",' for dep in dependencies]
+            formatted_dependencies = dedent(
+                """\
+                # /// script
+                # dependencies = [
+                {dependencies}
+                # ]
+                # ///
+                """
+            ).format(dependencies="\n".join(deps_list))
 
         # Prepend formatted dependencies to the code
         combined_code = formatted_dependencies + code
