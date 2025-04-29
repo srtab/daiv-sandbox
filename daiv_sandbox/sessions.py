@@ -142,7 +142,7 @@ class SandboxDockerSession(Session):
 
         self.container = self.client.containers.run(
             self.image,
-            command="tail -f /dev/null",  # Keep container running indefinitely
+            command='sh -c "tail -f /dev/null"',  # Keep container running indefinitely
             detach=True,
             tty=True,
             runtime=self.runtime,

@@ -1,6 +1,12 @@
+# DAIV Sandbox
+
+![Python Version](https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fraw.githubusercontent.com%2Fsrtab%2Fdaiv-sandbox%2Fmain%2Fpyproject.toml)
+[![GitHub License](https://img.shields.io/github/license/srtab/daiv-sandbox)](https://github.com/srtab/daiv-sandbox/blob/main/LICENSE)
+[![Actions Status](https://github.com/srtab/daiv-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/srtab/daiv-sandbox/actions)
+
 ## What is `daiv-sandbox`?
 
-`daiv-sandbox` is a FastAPI application designed to securely execute arbitrary commands and untrusted code within a controlled environment. Each execution is isolated in a transient Docker container, which is automatically created and destroyed with every request, ensuring a clean and secure execution space.
+`daiv-sandbox` is a FastAPI application designed to securely execute arbitrary commands and untrusted code within a controlled environment. Each execution is isolated in a transient Docker container, which is automatically created and destroyed with every request, ensuring a clean and secure execution space. It is designed to be used as a code/commands executor for [DAIV](https://github.com/srtab/daiv).
 
 To enhance security, `daiv-sandbox` leverages [`gVisor`](https://github.com/google/gvisor) as its container runtime. This provides an additional layer of protection by restricting the running code's ability to interact with the host system, thereby minimizing the risk of sandbox escape.
 
@@ -105,6 +111,19 @@ with tarfile.open(fileobj=tarstream, mode="r:*") as tar:
     resp = response.json()
 ```
 
+> [!WARNING]
+> The `base_image` need to be a ditro image. Distroless images will not work as there is no shell available in the container to maintain the image running indefinitely.
+
+## Contributing
+
+We welcome contributions! Whether you want to fix a bug, add a new feature, or improve documentation, please refer to the [CONTRIBUTING.md](CONTRIBUTING.md) file for more information.
+
 ## License
 
-`daiv-sandbox` is licensed under the [Apache License 2.0](LICENSE).
+This project is licensed under the [Apache 2.0 License](LICENSE).
+
+## Support & Community
+
+For questions or support, please open an issue in the GitHub repository. Contributions, suggestions, and feedback are greatly appreciated!
+
+**Happy Coding!**

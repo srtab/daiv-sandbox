@@ -52,7 +52,7 @@ def test_open_with_image(mock_docker_client, mock_image):
     mock_docker_client.images.get.assert_called_once_with("test-image")
     mock_docker_client.containers.run.assert_called_once_with(
         mock_image,
-        command="tail -f /dev/null",
+        command='sh -c "tail -f /dev/null"',
         detach=True,
         tty=True,
         runtime="runc",
