@@ -212,7 +212,7 @@ wheels = [
 
 [[package]]
 name = "daiv-sandbox"
-version = "0.1.0rc10"
+version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "docker" },

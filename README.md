@@ -59,9 +59,23 @@ All settings are configurable via environment variables. The available settings 
 
 ## Usage
 
+### Running Commands
+
 `daiv-sandbox` provides a REST API that can be used to execute arbitrary commands on a provided archive, for instance, a `tar.gz` archive containing a repository codebase. The archive is extracted to a temporary directory and the commands are executed in the root of the extracted directory. The output of the commands is returned in the response along with a list of changed files by the last command.
 
 This is very useful to increase the capabilities of an AI agent with code editing capabilities. For instance, you can use it to apply formatting changes to a repository codebase like running `black`, `isort`, `ruff`, `prettier`, etc...
+
+The following table describes the parameters for the `run/commands` endpoint:
+
+| Parameter    | Description                                         | Required | Valid Values                    |
+| ------------ | --------------------------------------------------- | -------- | ------------------------------- |
+| `run_id`     | The unique identifier for the run.                  | Yes      | Any UUID4                       |
+| `base_image` | The base image to use for the container.            | Yes      | Any valid Docker image          |
+| `archive`    | The archive to extract and execute the commands on. | Yes      | Base64 encoded `tar.gz` archive |
+| `commands`   | The commands to execute.                            | Yes      | List of strings                 |
+
+> [!WARNING]
+> The `base_image` need to be a ditro image. Distroless images will not work as there is no shell available in the container to maintain the image running indefinitely.
 
 Here is an example using `curl`:
 
@@ -111,8 +125,53 @@ with tarfile.open(fileobj=tarstream, mode="r:*") as tar:
     resp = response.json()
 ```
 
-> [!WARNING]
-> The `base_image` need to be a ditro image. Distroless images will not work as there is no shell available in the container to maintain the image running indefinitely.
+### Running Code
+
+`daiv-sandbox` also provides a REST API that can be used to execute arbitrary code. The code is executed in a temporary directory and the output of the code is returned in the response.
+
+The following table describes the parameters for the `run/code` endpoint:
+
+| Parameter      | Description                                   | Required | Valid Values    |
+| -------------- | --------------------------------------------- | -------- | --------------- |
+| `run_id`       | The unique identifier for the run.            | Yes      | Any UUID4       |
+| `language`     | The language to use for the code execution.   | Yes      | `python`        |
+| `dependencies` | The dependencies to install in the container. | No       | List of strings |
+| `code`         | The code to execute.                          | Yes      | String          |
+
+> [!NOTE]
+> Currently, only `python` language is supported. But it's planned to support more languages in the future. Reach out to us or open a PR if you need a specific language.
+
+Here is an example using `curl`:
+
+```sh
+$ curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-API-KEY: notsosecret" \
+  -d "{\"run_id\": \"550e8400-e29b-41d4-a716-446655440000\", \"language\": \"python\", \"dependencies\": [\"requests\"], \"code\": \"print('Hello, World!')\"}" \
+  http://localhost:8888/api/v1/run/code/
+```
+
+The response will be a JSON object with the following structure:
+
+```json
+{
+  "output": "Hello, World!"
+}
+```
+
+Here is an example using `python`:
+
+```python
+import httpx
+
+response = httpx.post(
+    "http://localhost:8888/api/v1/run/code/",
+    headers={"X-API-KEY": "notsosecret"},
+    json={"run_id": "550e8400-e29b-41d4-a716-446655440000", "language": "python", "dependencies": ["requests"], "code": "print('Hello, World!')"},
+)
+response.raise_for_status()
+resp = response.json()
+```
 
 ## Contributing
 
