@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Added `CONTRIBUTING.md` file to provide guidelines for contributing to the project.
+
 ### Changed
 
 - Changed Python base image from `python:3.12-slim` to `ghcr.io/astral-sh/uv:python3.12-bookworm-slim`.
