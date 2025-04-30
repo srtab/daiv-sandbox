@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- Migrated `pyproject.toml` to use standard dev dependencies group declaration.
+- Updated urls declared in `pyproject.toml` to use standard labels.
+
 ## [0.1.0] - 2025-04-29
 
 ### Added
