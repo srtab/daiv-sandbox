@@ -10,25 +10,36 @@ maintainers = [
 authors = [
   { name = "Sandro Rodrigues", email = "srtabs@gmail.com" },
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 classifiers = [
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
   "docker==7.1",
   "fastapi[standard]==0.115.12",
-  "ipython==8.31",
-  "pydantic==2.11.3",
+  "ipython==9.2",
+  "pydantic==2.11.4",
   "pydantic-settings==2.9.1",
-  "sentry-sdk==2.26.1",
+  "sentry-sdk==2.27",
 ]
 
-urls."Bug Tracker" = "https://github.com/srtab/daiv-sandbox/issues"
-urls.Changelog = "CHANGELOG.md"
+urls.changelog = "https://github.com/srtab/daiv-sandbox/blob/main/CHANGELOG.md"
+urls.issues = "https://github.com/srtab/daiv-sandbox/issues"
+urls.source = "https://github.com/srtab/daiv-sandbox"
 
-urls.Repository = "https://github.com/srtab/daiv-sandbox"
+[dependency-groups]
+dev = [
+  "mypy==1.15",
+  "pre-commit==4.2",
+  "pyopenssl==25",
+  "pyproject-fmt==2.5.1",
+  "pytest-cov==6.1.1",
+  "pytest-env==1.1.5",
+  "pytest-mock==3.14",
+  "pytest-xdist==3.6.1",
+  "ruff==0.11.7",
+]
 
 [tool.ruff]
 target-version = "py312"
@@ -101,16 +112,3 @@ module = [
   "docker.*",
 ]
 ignore_missing_imports = true
-
-[tool.uv]
-dev-dependencies = [
-  "mypy==1.14.0",
-  "pre-commit==4.0.1",
-  "pyproject-fmt==2.5.0",
-  "pyopenssl==24.3.0",
-  "pytest-cov==6.0.0",
-  "pytest-env==1.1.5",
-  "pytest-mock==3.14.0",
-  "pytest-xdist==3.6.1",
-  "ruff==0.8.4",
-]
