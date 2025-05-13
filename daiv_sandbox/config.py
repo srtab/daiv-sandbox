@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import Field, HttpUrl
+from pydantic import Field, HttpUrl, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # API
     API_V1_STR: str = "/api/v1"
-    API_KEY: str
+    API_KEY: SecretStr
 
     # Sentry
     SENTRY_DSN: HttpUrl | None = None

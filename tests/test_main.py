@@ -14,7 +14,7 @@ from daiv_sandbox.schemas import RunResult
 
 @pytest.fixture
 def client():
-    return TestClient(app, headers={"X-API-Key": settings.API_KEY}, root_path=settings.API_V1_STR)
+    return TestClient(app, headers={"X-API-Key": settings.API_KEY.get_secret_value()}, root_path=settings.API_V1_STR)
 
 
 def test_missing_api_key(client):

@@ -59,7 +59,7 @@ api_key_header = APIKeyHeader(
 async def get_api_key(api_key_header: str | None = Security(api_key_header)) -> str:
     if api_key_header is None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="API Key header is missing")
-    if api_key_header != settings.API_KEY:
+    if api_key_header != settings.API_KEY.get_secret_value():
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid API Key")
     return api_key_header
 
