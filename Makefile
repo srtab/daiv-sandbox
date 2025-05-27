@@ -1,6 +1,6 @@
 # Makefile
 
-.PHONY: help test test-ci lint lint-check lint-format lint-fix lint-typing lock
+.PHONY: help test lint lint-check lint-format lint-fix lint-typing run
 
 help:
 	@echo "Available commands:"
@@ -10,30 +10,27 @@ help:
 	@echo "  make lint-format    - Check code formatting"
 	@echo "  make lint-fix       - Fix linting and formatting issues"
 	@echo "  make lint-typing    - Run type checking with mypy"
-	@echo "  make lock           - Update uv lock"
+	@echo "  make run            - Run the application"
 
 test:
-	uv run pytest tests
+	uv run --all-extras pytest tests
 
 lint: lint-check lint-format
 
 lint-check:
-	uv run ruff check .
+	uv run --only-group=dev ruff check .
 
 lint-format:
-	uv run ruff format . --check
-	uv run pyproject-fmt pyproject.toml --check
+	uv run --only-group=dev ruff format . --check
+	uv run --only-group=dev pyproject-fmt pyproject.toml --check
 
 lint-fix:
-	uv run ruff check . --fix
-	uv run ruff format .
-	uv run pyproject-fmt pyproject.toml
+	uv run --only-group=dev ruff check . --fix
+	uv run --only-group=dev ruff format .
+	uv run --only-group=dev pyproject-fmt pyproject.toml
 
 lint-typing:
-	uv run mypy daiv
-
-lock:
-	uv lock
+	uv run --only-group=dev mypy daiv_sandbox
 
 run:
 	uv run fastapi dev daiv_sandbox/main.py --reload --port 8888

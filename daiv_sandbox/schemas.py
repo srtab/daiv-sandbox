@@ -17,7 +17,10 @@ class RunRequest(BaseModel):
     archive: Base64Bytes = Field(..., description="Base64-encoded archive with files to be copied to the sandbox.")
     fail_fast: bool = Field(
         default=False,
-        description="Stop execution immediately if any command fails (exit_code != 0). Defaults to False for backward compatibility.",
+        description=(
+            "Stop execution immediately if any command fails (exit_code != 0). "
+            "Defaults to False for backward compatibility."
+        ),
     )
 
 
