@@ -133,3 +133,139 @@ def test_version(client):
     response = client.get("/-/version/")
     assert response.status_code == 200
     assert response.json() == {"version": __version__}
+
+
+@patch("daiv_sandbox.main.SandboxDockerSession")
+def test_run_commands_multiple_success_fail_fast_false(MockSession, client):  # noqa: N803
+    # Mock the session and its methods
+    mock_session = MockSession.return_value.__enter__.return_value
+    mock_session.execute_command.side_effect = [
+        RunResult(command="echo 'first'", output=b"first", exit_code=0, changed_files=[], workdir="/"),
+        RunResult(command="echo 'second'", output=b"second", exit_code=0, changed_files=[], workdir="/"),
+    ]
+    mock_session.create_tar_gz_archive.return_value = io.BytesIO(b"mocked_archive")
+
+    request_payload = {
+        "run_id": str(uuid.uuid4()),
+        "base_image": "python:3.9",
+        "commands": ["echo 'first'", "echo 'second'"],
+        "archive": base64.b64encode(b"test").decode(),
+        "fail_fast": False,
+    }
+
+    response = client.post("/run/commands/", json=request_payload)
+
+    assert response.status_code == 200
+    response_data = response.json()
+    assert len(response_data["results"]) == 2
+    assert mock_session.execute_command.call_count == 2
+
+
+@patch("daiv_sandbox.main.SandboxDockerSession")
+def test_run_commands_multiple_success_fail_fast_true(MockSession, client):  # noqa: N803
+    # Mock the session and its methods
+    mock_session = MockSession.return_value.__enter__.return_value
+    mock_session.execute_command.side_effect = [
+        RunResult(command="echo 'first'", output=b"first", exit_code=0, changed_files=[], workdir="/"),
+        RunResult(command="echo 'second'", output=b"second", exit_code=0, changed_files=[], workdir="/"),
+    ]
+    mock_session.create_tar_gz_archive.return_value = io.BytesIO(b"mocked_archive")
+
+    request_payload = {
+        "run_id": str(uuid.uuid4()),
+        "base_image": "python:3.9",
+        "commands": ["echo 'first'", "echo 'second'"],
+        "archive": base64.b64encode(b"test").decode(),
+        "fail_fast": True,
+    }
+
+    response = client.post("/run/commands/", json=request_payload)
+
+    assert response.status_code == 200
+    response_data = response.json()
+    assert len(response_data["results"]) == 2
+    assert mock_session.execute_command.call_count == 2
+
+
+@patch("daiv_sandbox.main.SandboxDockerSession")
+def test_run_commands_fail_fast_stops_on_failure(MockSession, client):  # noqa: N803
+    # Mock the session and its methods
+    mock_session = MockSession.return_value.__enter__.return_value
+    mock_session.execute_command.side_effect = [
+        RunResult(command="echo 'first'", output=b"first", exit_code=0, changed_files=[], workdir="/"),
+        RunResult(command="exit 1", output=b"error", exit_code=1, changed_files=[], workdir="/"),
+    ]
+    mock_session.create_tar_gz_archive.return_value = io.BytesIO(b"mocked_archive")
+
+    request_payload = {
+        "run_id": str(uuid.uuid4()),
+        "base_image": "python:3.9",
+        "commands": ["echo 'first'", "exit 1", "echo 'third'"],
+        "archive": base64.b64encode(b"test").decode(),
+        "fail_fast": True,
+    }
+
+    response = client.post("/run/commands/", json=request_payload)
+
+    assert response.status_code == 200
+    response_data = response.json()
+    assert len(response_data["results"]) == 2  # Only first two commands executed
+    assert response_data["results"][0]["exit_code"] == 0
+    assert response_data["results"][1]["exit_code"] == 1
+    assert mock_session.execute_command.call_count == 2  # Third command not executed
+
+
+@patch("daiv_sandbox.main.SandboxDockerSession")
+def test_run_commands_fail_fast_false_continues_on_failure(MockSession, client):  # noqa: N803
+    # Mock the session and its methods
+    mock_session = MockSession.return_value.__enter__.return_value
+    mock_session.execute_command.side_effect = [
+        RunResult(command="echo 'first'", output=b"first", exit_code=0, changed_files=[], workdir="/"),
+        RunResult(command="exit 1", output=b"error", exit_code=1, changed_files=[], workdir="/"),
+        RunResult(command="echo 'third'", output=b"third", exit_code=0, changed_files=[], workdir="/"),
+    ]
+    mock_session.create_tar_gz_archive.return_value = io.BytesIO(b"mocked_archive")
+
+    request_payload = {
+        "run_id": str(uuid.uuid4()),
+        "base_image": "python:3.9",
+        "commands": ["echo 'first'", "exit 1", "echo 'third'"],
+        "archive": base64.b64encode(b"test").decode(),
+        "fail_fast": False,
+    }
+
+    response = client.post("/run/commands/", json=request_payload)
+
+    assert response.status_code == 200
+    response_data = response.json()
+    assert len(response_data["results"]) == 3  # All commands executed
+    assert response_data["results"][0]["exit_code"] == 0
+    assert response_data["results"][1]["exit_code"] == 1
+    assert response_data["results"][2]["exit_code"] == 0
+    assert mock_session.execute_command.call_count == 3  # All commands executed
+
+
+@patch("daiv_sandbox.main.SandboxDockerSession")
+def test_run_commands_single_command_fail_fast_true(MockSession, client):  # noqa: N803
+    # Mock the session and its methods
+    mock_session = MockSession.return_value.__enter__.return_value
+    mock_session.execute_command.return_value = RunResult(
+        command="echo 'single'", output=b"single", exit_code=0, changed_files=[], workdir="/"
+    )
+    mock_session.create_tar_gz_archive.return_value = io.BytesIO(b"mocked_archive")
+
+    request_payload = {
+        "run_id": str(uuid.uuid4()),
+        "base_image": "python:3.9",
+        "commands": ["echo 'single'"],
+        "archive": base64.b64encode(b"test").decode(),
+        "fail_fast": True,
+    }
+
+    response = client.post("/run/commands/", json=request_payload)
+
+    assert response.status_code == 200
+    response_data = response.json()
+    assert len(response_data["results"]) == 1
+    assert response_data["results"][0]["exit_code"] == 0
+    assert mock_session.execute_command.call_count == 1

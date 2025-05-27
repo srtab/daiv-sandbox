@@ -63,6 +63,8 @@ All settings are configurable via environment variables. The available settings 
 
 `daiv-sandbox` provides a REST API that can be used to execute arbitrary commands on a provided archive, for instance, a `tar.gz` archive containing a repository codebase. The archive is extracted to a temporary directory and the commands are executed in the root of the extracted directory. The output of the commands is returned in the response along with a list of changed files by the last command.
 
+By default, all commands are executed sequentially regardless of their exit codes. However, you can enable fail-fast behavior by setting the `fail_fast` parameter to `true`, which will stop execution immediately if any command fails (returns a non-zero exit code).
+
 This is very useful to increase the capabilities of an AI agent with code editing capabilities. For instance, you can use it to apply formatting changes to a repository codebase like running `black`, `isort`, `ruff`, `prettier`, etc...
 
 The following table describes the parameters for the `run/commands` endpoint:
@@ -73,6 +75,7 @@ The following table describes the parameters for the `run/commands` endpoint:
 | `base_image` | The base image to use for the container.            | Yes      | Any valid Docker image          |
 | `archive`    | The archive to extract and execute the commands on. | Yes      | Base64 encoded `tar.gz` archive |
 | `commands`   | The commands to execute.                            | Yes      | List of strings                 |
+| `fail_fast`  | Stop execution if any command fails.               | No       | `true` or `false` (default: `false`) |
 
 > [!WARNING]
 > The `base_image` need to be a ditro image. Distroless images will not work as there is no shell available in the container to maintain the image running indefinitely.
@@ -83,7 +86,7 @@ Here is an example using `curl`:
 $ curl -X POST \
   -H "Content-Type: application/json" \
   -H "X-API-KEY: notsosecret" \
-  -d "{\"run_id\": \"550e8400-e29b-41d4-a716-446655440000\", \"base_image\": \"python:3.12\", \"archive\": \"$(base64 -w 0 django-webhooks-master.tar.gz)\", \"commands\": [\"ls -la\"]}" \
+  -d "{\"run_id\": \"550e8400-e29b-41d4-a716-446655440000\", \"base_image\": \"python:3.12\", \"archive\": \"$(base64 -w 0 django-webhooks-master.tar.gz)\", \"commands\": [\"ls -la\"], \"fail_fast\": true}" \
   http://localhost:8888/api/v1/run/commands/
 
 ```
@@ -119,6 +122,7 @@ with tarfile.open(fileobj=tarstream, mode="r:*") as tar:
             "base_image": "python:3.12",
             "archive": base64.b64encode(tarstream.getvalue()).decode(),
             "commands": ["ls -la"],
+            "fail_fast": True,
         },
     )
     response.raise_for_status()

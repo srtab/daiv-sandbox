@@ -93,10 +93,14 @@ async def run_commands(request: RunRequest, api_key: str = Depends(get_api_key))
         with io.BytesIO(request.archive) as request_archive:
             session.copy_to_runtime(request_archive)
 
-        results = [
-            session.execute_command(command, workdir=request.workdir, extract_changed_files=True)
-            for command in request.commands
-        ]
+        results: list[RunResult] = []
+        for command in request.commands:
+            result = session.execute_command(command, workdir=request.workdir, extract_changed_files=True)
+            results.append(result)
+
+            # Stop execution if fail_fast is enabled and command failed
+            if request.fail_fast and result.exit_code != 0:
+                break
 
         # Only create archive with changed files for the last command.
         if changed_files := results[-1].changed_files:
