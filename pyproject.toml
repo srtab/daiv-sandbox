@@ -21,7 +21,7 @@ dependencies = [
   "ipython==9.2",
   "pydantic==2.11.5",
   "pydantic-settings==2.9.1",
-  "sentry-sdk==2.27",
+  "sentry-sdk==2.29.1",
 ]
 
 urls.changelog = "https://github.com/srtab/daiv-sandbox/blob/main/CHANGELOG.md"
