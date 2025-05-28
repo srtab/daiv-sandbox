@@ -20,7 +20,7 @@ class LanguageManager(abc.ABC):
     """
 
     @abc.abstractmethod
-    def run_code(self, session: SandboxDockerSession, code: str) -> RunResult:
+    def run_code(self, session: SandboxDockerSession, code: str, dependencies: list[str] | None = None) -> RunResult:
         pass
 
     @staticmethod
