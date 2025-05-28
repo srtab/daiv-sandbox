@@ -1,7 +1,12 @@
+import warnings
 from typing import Literal
 
 from pydantic import Field, HttpUrl, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+warnings.filterwarnings(
+    "ignore", message=r'directory "/run/secrets" does not exist', module="pydantic_settings.sources.providers.secrets"
+)
 
 
 class Settings(BaseSettings):

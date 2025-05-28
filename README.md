@@ -32,7 +32,8 @@ To enhance security, `daiv-sandbox` can be used with `gVisor` as its container r
 
 To benefit from this additional layer of protection, you need to install `gVisor` on the host machine. Follow the instructions [here](https://gvisor.dev/docs/user_guide/install/) and [here](https://gvisor.dev/docs/user_guide/quick_start/docker/). You will need to configure `gVisor` with a shared root filesystem to allow `daiv-sandbox` copy files to the container, see the [gVisor documentation](https://gvisor.dev/docs/user_guide/filesystem/#shared-root-filesystem) for more details.
 
-> **Note:** If you're getting an error `"overlay flag is incompatible with shared file access for rootfs"`, you need to add `--overlay2=none` flag to the `gVisor` configuration.
+> [!TIP]
+> If you're getting an error `"overlay flag is incompatible with shared file access for rootfs"`, you need to add `--overlay2=none` flag to the `gVisor` configuration.
 
 After installing `gVisor`, you need to define the `DAIV_SANDBOX_RUNTIME` environment variable to use `runsc` when running the container:
 
@@ -69,13 +70,13 @@ This is very useful to increase the capabilities of an AI agent with code editin
 
 The following table describes the parameters for the `run/commands` endpoint:
 
-| Parameter    | Description                                         | Required | Valid Values                    |
-| ------------ | --------------------------------------------------- | -------- | ------------------------------- |
-| `run_id`     | The unique identifier for the run.                  | Yes      | Any UUID4                       |
-| `base_image` | The base image to use for the container.            | Yes      | Any valid Docker image          |
-| `archive`    | The archive to extract and execute the commands on. | Yes      | Base64 encoded `tar.gz` archive |
-| `commands`   | The commands to execute.                            | Yes      | List of strings                 |
-| `fail_fast`  | Stop execution if any command fails.               | No       | `true` or `false` (default: `false`) |
+| Parameter    | Description                                         | Required | Valid Values                         |
+| ------------ | --------------------------------------------------- | -------- | ------------------------------------ |
+| `run_id`     | The unique identifier for the run.                  | Yes      | Any UUID4                            |
+| `base_image` | The base image to use for the container.            | Yes      | Any valid Docker image               |
+| `archive`    | The archive to extract and execute the commands on. | Yes      | Base64 encoded `tar.gz` archive      |
+| `commands`   | The commands to execute.                            | Yes      | List of strings                      |
+| `fail_fast`  | Stop execution if any command fails.                | No       | `true` or `false` (default: `false`) |
 
 > [!WARNING]
 > The `base_image` need to be a ditro image. Distroless images will not work as there is no shell available in the container to maintain the image running indefinitely.

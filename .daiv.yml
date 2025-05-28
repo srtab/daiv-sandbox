@@ -1,7 +1,7 @@
-repository_description: "FastAPI based project to run commands / code on a sandbox environment."
+repository_description: "FastAPI based project to run commands / code on a sandboxed environment."
 branch_name_convention: "Use 'feat/', 'fix/', or 'chore/' prefixes."
 
 commands:
   base_image: "ghcr.io/astral-sh/uv:python3.12-bookworm-slim"
-  install_dependencies: "uv sync"
-  format_code: "uv run ruff check . --fix; uv run ruff format .; uv run pyproject-fmt pyproject.toml"
+  install_dependencies: "uv sync --only-group=dev"
+  format_code: "uv run --only-group=dev ruff check . --fix; uv run --only-group=dev ruff format .; uv run --only-group=dev pyproject-fmt pyproject.toml"

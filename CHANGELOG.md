@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Added `fail_fast` parameter to allow stopping execution immediately if any command fails.
+
+### Changed
+
+- Ignored `directory "/run/secrets" does not exist` warning.
+
+### Fixed
+
+- Fixed logging configuration to avoid logging health check requests to the console.
+- Fixed `dependencies` parameter on abstract method `run_code` in `LanguageManager` class.
+
 ## [0.1.1] - 2025-05-13
 
 ### Changed
