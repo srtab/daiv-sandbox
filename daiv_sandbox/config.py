@@ -1,7 +1,7 @@
 import warnings
 from typing import Literal
 
-from pydantic import Field, HttpUrl, SecretStr
+from pydantic import HttpUrl, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 warnings.filterwarnings(
@@ -32,8 +32,6 @@ class Settings(BaseSettings):
 
     # Execution
     RUNTIME: Literal["runc", "runsc"] = "runc"
-    KEEP_TEMPLATE: bool = False
-    MAX_EXECUTION_TIME: int = Field(default=600, description="Maximum execution time in seconds")
 
 
 settings = Settings()  # type: ignore

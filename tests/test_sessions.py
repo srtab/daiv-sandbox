@@ -47,7 +47,7 @@ def test_context_manager_timeout(mock_signal_alarm, mock_docker_client, mock_ima
 
 
 def test_open_with_image(mock_docker_client, mock_image):
-    session = SandboxDockerSession(image="test-image", run_id="test-run-id")
+    session = SandboxDockerSession(image="test-image", session_id="test-run-id")
     session.open()
     mock_docker_client.images.get.assert_called_once_with("test-image")
     mock_docker_client.containers.run.assert_called_once_with(
@@ -129,7 +129,7 @@ def test_copy_to_runtime_creates_directory():
             ExecResult(exit_code=0, output=b""),
         ]
         with patch("io.BytesIO", return_value=MagicMock()) as mock_data:
-            session.copy_to_runtime(mock_data)
+            session.copy_to_container(mock_data)
             session.container.exec_run.assert_any_call("mkdir -p /path/to/dest")
             session.container.exec_run.assert_any_call("chown -R root:root /path/to/dest", privileged=True, user="root")
 
@@ -140,7 +140,7 @@ def test_copy_from_runtime_raises_error_if_file_not_found():
     session.container.status = "running"
     session.container.get_archive.return_value = ([], {"size": 0})
     with pytest.raises(FileNotFoundError):
-        session.copy_from_runtime("/path/to/src")
+        session.copy_from_container("/path/to/src")
 
 
 @patch("daiv_sandbox.sessions.from_env")
@@ -227,8 +227,8 @@ def test_image_working_dir_from_config():
 def test_run_path_for_root_user():
     with patch.object(SandboxDockerSession, "_image_user", new_callable=PropertyMock) as mock_user:
         mock_user.return_value = "root"
-        session = SandboxDockerSession(image="test-image", run_id="test-run")
-        assert session.run_path == "/runs/test-run"
+        session = SandboxDockerSession(image="test-image", session_id="test-run")
+        assert session._run_path == "/runs/test-run"
 
 
 def test_run_path_for_non_root_user():
@@ -238,5 +238,5 @@ def test_run_path_for_non_root_user():
     ):
         mock_user.return_value = "testuser"
         mock_working_dir.return_value = "/app"
-        session = SandboxDockerSession(image="test-image", run_id="test-run")
-        assert session.run_path == "/app/runs/test-run"
+        session = SandboxDockerSession(image="test-image", session_id="test-run")
+        assert session._run_path == "/app/runs/test-run"

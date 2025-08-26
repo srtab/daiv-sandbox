@@ -1,12 +1,32 @@
-from typing import Literal
+import uuid
 
-from pydantic import UUID4, Base64Bytes, BaseModel, Field
+from pydantic import Base64Bytes, BaseModel, Field, field_validator
+
+
+def generate_session_id() -> str:
+    return str(uuid.uuid4())
+
+
+class StartSessionRequest(BaseModel):
+    base_image: str | None = Field(
+        default=None, description="Docker image to be used as the base image for the sandbox."
+    )
+    dockerfile: str | None = Field(default=None, description="Dockerfile content to be used to build the image.")
+
+    @classmethod
+    @field_validator("base_image", "dockerfile")
+    def validate_base_image_or_dockerfile(cls, v, values):
+        if not v and not values.get("dockerfile"):
+            raise ValueError("Either base_image or dockerfile must be provided. Both cannot be None.")
+        return v
+
+
+class StartSessionResponse(BaseModel):
+    session_id: str = Field(description="Unique identifier for the session.")
 
 
 class RunRequest(BaseModel):
-    run_id: UUID4 = Field(..., description="Unique identifier for the run.")
-    base_image: str = Field(..., description="Docker image to be used as the base image for the sandbox.")
-    commands: list[str] = Field(..., description="List of commands to be executed in the sandbox.")
+    commands: list[str] = Field(description="List of bash commands to be executed in the sandbox.")
     workdir: str | None = Field(
         default=None,
         description=(
@@ -14,7 +34,12 @@ class RunRequest(BaseModel):
             "Defaults to the root directory where the archive is extracted."
         ),
     )
-    archive: Base64Bytes = Field(..., description="Base64-encoded archive with files to be copied to the sandbox.")
+    archive: Base64Bytes | None = Field(
+        default=None, description="Base64-encoded archive with files to be copied to the sandbox."
+    )
+    extract_changed_files: bool = Field(
+        default=False, description="Extract the changed files by the executed commands."
+    )
     fail_fast: bool = Field(
         default=False,
         description=(
@@ -25,30 +50,26 @@ class RunRequest(BaseModel):
 
 
 class RunResult(BaseModel):
-    command: str = Field(..., description="Command that was executed.")
-    output: str = Field(..., description="Output of the command.")
-    exit_code: int = Field(..., description="Exit code of the command.")
-    workdir: str = Field(..., description="Working directory of the command.", exclude=True)
+    command: str = Field(description="Command that was executed.")
+    output: str = Field(description="Output of the command.")
+    exit_code: int = Field(description="Exit code of the command.")
+    workdir: str = Field(description="Working directory of the command.", exclude=True)
     changed_files: list[str] = Field(default_factory=list, description="List of changed files.", exclude=True)
 
 
 class RunResponse(BaseModel):
-    results: list[RunResult] = Field(..., description="List of results of each command.")
-    archive: str | None = Field(..., description="Base64-encoded archive with the changed files.")
+    results: list[RunResult] = Field(description="List of results of each command.")
+    archive: str | None = Field(description="Base64-encoded archive with the changed files.")
 
 
 class ErrorMessage(BaseModel):
-    detail: str = Field(..., description="Error message.")
+    detail: str = Field(description="Error message.")
 
 
-class RunCodeRequest(BaseModel):
-    run_id: UUID4 = Field(..., description="Unique identifier for the run.")
-    language: Literal["python"] = Field(..., description="Language to be used for the code execution.")
-    dependencies: list[str] = Field(
-        default_factory=list, description="List of dependencies to be installed in the sandbox."
-    )
-    code: str = Field(..., description="Code to be executed.")
+class ImageInspection(BaseModel):
+    user: str = Field(description="User of the image.")
+    working_dir: str = Field(description="Working directory of the image.")
 
-
-class RunCodeResponse(BaseModel):
-    output: str = Field(..., description="Output of the code execution.")
+    @classmethod
+    def from_inspection(cls, inspection: dict) -> "ImageInspection":
+        return cls(user=inspection["Config"]["User"], working_dir=inspection["Config"]["WorkingDir"])

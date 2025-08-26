@@ -1,16 +1,22 @@
 import base64
 import io
-from typing import Literal
+from typing import Annotated, Literal
 
 import sentry_sdk
-from fastapi import Depends, FastAPI, HTTPException, Security, status
+from fastapi import Depends, FastAPI, HTTPException, Path, Response, Security, status
 from fastapi.security.api_key import APIKeyHeader
 
 from daiv_sandbox import __version__
 from daiv_sandbox.config import settings
-from daiv_sandbox.languages import LANGUAGE_BASE_IMAGES, LanguageManager
 from daiv_sandbox.logs import LOGGING_CONFIG
-from daiv_sandbox.schemas import ErrorMessage, RunCodeRequest, RunCodeResponse, RunRequest, RunResponse, RunResult
+from daiv_sandbox.schemas import (
+    ErrorMessage,
+    RunRequest,
+    RunResponse,
+    RunResult,
+    StartSessionRequest,
+    StartSessionResponse,
+)
 from daiv_sandbox.sessions import SandboxDockerSession
 
 HEADER_API_KEY_NAME = "X-API-Key"
@@ -28,7 +34,7 @@ if settings.SENTRY_DSN and settings.ENVIRONMENT != "local":
     )
 
 description = """\
-FastAPI application designed to securely execute arbitrary commands and untrusted code within a controlled environment. Each execution is isolated in a transient Docker container, which is automatically created and destroyed with every request, ensuring a clean and secure execution space.
+FastAPI application designed to securely execute arbitrary commands within a controlled environment. Each execution is isolated in a Docker container with a secure execution space.
 
 To enhance security, `daiv-sandbox` leverages [`gVisor`](https://github.com/google/gvisor) as its container runtime. This provides an additional layer of protection by restricting the running code's ability to interact with the host system, thereby minimizing the risk of sandbox escape.
 
@@ -39,7 +45,7 @@ app = FastAPI(
     debug=settings.ENVIRONMENT == "local",
     title="DAIV Runtime Sandbox",
     description=description,
-    summary="Run commands in a sandboxed container.",
+    summary="Run commands in a secure environment.",
     version=__version__,
     license_info={"name": "Apache License 2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0"},
     contact={"name": "DAIV", "url": "https://github.com/srtab/daiv-sandbox"},
@@ -76,64 +82,77 @@ common_responses = {
 }
 
 
-@app.post("/run/commands/", responses=common_responses)
-async def run_commands(request: RunRequest, api_key: str = Depends(get_api_key)) -> RunResponse:
+@app.post("/session/", responses=common_responses, name="Obtain a session ID")
+async def start_session(request: StartSessionRequest, api_key: str = Depends(get_api_key)) -> StartSessionResponse:
     """
-    Run a set of commands in a sandboxed container and return archive with changed files.
+    Start a session and return the session ID.
+
+    A Docker container is created with the base image or the Dockerfile provided.
+    The session ID is used to identify the created container in subsequent requests.
+
+    This session ID ensures a consistent execution environment for the commands, including files and directories.
     """
+    session_id = SandboxDockerSession.start(image=request.base_image, dockerfile=request.dockerfile)
+    return StartSessionResponse(session_id=session_id)
+
+
+@app.post("/session/{session_id}/", responses=common_responses, name="Run commands on a session")
+async def run_on_session(
+    session_id: Annotated[str, Path(title="The ID of the session to run commands in.")],
+    request: RunRequest,
+    api_key: str = Depends(get_api_key),
+) -> RunResponse:
+    """
+    Run a set of commands on a session and return the results, including the archive with changed files.
+    """
+    session = SandboxDockerSession()
+    container = session.get_container(session_id)
+
+    if not container:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+
+    if request.archive:
+        with io.BytesIO(request.archive) as request_archive:
+            session.copy_to_container(container, request_archive)
+
     results: list[RunResult] = []
+    for command in request.commands:
+        result = session.execute_command(
+            container, command, workdir=request.workdir, extract_changed_files=request.extract_changed_files
+        )
+        results.append(result)
+
+        # Stop execution if fail_fast is enabled and command failed
+        if request.fail_fast and result.exit_code != 0:
+            break
+
+    # Only create archive with changed files for the last command.
     archive: str | None = None
 
-    with SandboxDockerSession(
-        image=request.base_image,
-        keep_template=settings.KEEP_TEMPLATE,
-        runtime=settings.RUNTIME,
-        run_id=str(request.run_id),
-    ) as session:
-        with io.BytesIO(request.archive) as request_archive:
-            session.copy_to_runtime(request_archive)
-
-        results: list[RunResult] = []
-        for command in request.commands:
-            result = session.execute_command(command, workdir=request.workdir, extract_changed_files=True)
-            results.append(result)
-
-            # Stop execution if fail_fast is enabled and command failed
-            if request.fail_fast and result.exit_code != 0:
-                break
-
-        # Only create archive with changed files for the last command.
-        if changed_files := results[-1].changed_files:
-            changed_files_archive = session.create_tar_gz_archive(results[-1].workdir, changed_files)
-            archive = base64.b64encode(changed_files_archive.getvalue()).decode()
+    if request.extract_changed_files and (changed_files := results[-1].changed_files):
+        changed_files_archive = session.create_tar_gz_archive(container, results[-1].workdir, changed_files)
+        archive = base64.b64encode(changed_files_archive.getvalue()).decode()
 
     return RunResponse(results=results, archive=archive)
 
 
-@app.post("/run/code/", responses=common_responses)
-async def run_code(request: RunCodeRequest, api_key: str = Depends(get_api_key)) -> RunCodeResponse:
+@app.delete("/session/{session_id}/", responses=common_responses, name="Close a session")
+async def close_session(
+    session_id: Annotated[str, Path(title="The ID of the session to close")], api_key: str = Depends(get_api_key)
+) -> Response:
     """
-    Run code in a sandboxed container and return the result.
+    Close a session by removing the Docker container.
     """
-    with SandboxDockerSession(
-        image=LANGUAGE_BASE_IMAGES[request.language],
-        keep_template=True,
-        runtime=settings.RUNTIME,
-        run_id=str(request.run_id),
-    ) as session:
-        manager = LanguageManager.factory(request.language)
-
-        run_result = manager.run_code(session, request.code, request.dependencies)
-        if run_result.exit_code != 0:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=run_result.output)
-
-    return RunCodeResponse(output=run_result.output)
+    SandboxDockerSession.end(session_id=session_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@app.get("/-/health/", responses={200: {"content": {"application/json": {"example": {"status": "ok"}}}}})
+@app.get(
+    "/-/health/", responses={200: {"content": {"application/json": {"example": {"status": "ok"}}}}}, name="Healthcheck"
+)
 async def health() -> dict[Literal["status"], Literal["ok"]]:
     """
-    Check if the service is healthy.
+    Check if the Docker client is responding.
     """
     if not SandboxDockerSession.ping():
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Docker client is not responding")
@@ -143,7 +162,7 @@ async def health() -> dict[Literal["status"], Literal["ok"]]:
 @app.get("/-/version/", responses={200: {"content": {"application/json": {"example": {"version": __version__}}}}})
 async def version() -> dict[Literal["version"], str]:
     """
-    Get the version of the service.
+    Get the version of the application.
     """
     return {"version": __version__}
 
