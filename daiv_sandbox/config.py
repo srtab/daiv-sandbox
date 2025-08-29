@@ -33,5 +33,8 @@ class Settings(BaseSettings):
     # Execution
     RUNTIME: Literal["runc", "runsc"] = "runc"
 
+    # Git
+    GIT_IMAGE: str = "alpine/git"
+
 
 settings = Settings()  # type: ignore

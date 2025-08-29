@@ -1,9 +1,11 @@
 import base64
 import io
+from pathlib import Path
 from typing import Annotated, Literal
 
 import sentry_sdk
-from fastapi import Depends, FastAPI, HTTPException, Path, Response, Security, status
+from fastapi import Depends, FastAPI, HTTPException, Response, Security, status
+from fastapi import Path as FastAPIPath
 from fastapi.security.api_key import APIKeyHeader
 
 from daiv_sandbox import __version__
@@ -20,6 +22,29 @@ from daiv_sandbox.schemas import (
 from daiv_sandbox.sessions import SandboxDockerSession
 
 HEADER_API_KEY_NAME = "X-API-Key"
+
+DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
+DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL = "daiv.sandbox.patch_extractor_session_id"
+
+TYPE_PATCH_EXTRACTOR = "patch_extractor"
+TYPE_CMD_EXECUTOR = "cmd_executor"
+
+# Command to create an ephemeral repo and makes two throwaway commits.
+# Git will then respect the repo’s .gitignore automatically, and the diff won’t include them.
+CMD_EPHEMERAL_REPO = """set -euo pipefail
+A=/a/{workdir}
+B=/b/{workdir}
+W=/tmp/work; rm -rf "$W"; mkdir -p "$W"; cd "$W"
+git config --global --add safe.directory /tmp/work
+git init -q
+git config user.name sandbox
+git config user.email sandbox@example.local
+cp -a "$A"/. .
+git add -A && git commit -q -m baseline
+find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {{}} +
+cp -a "$B"/. .
+git add -A && git commit -q --allow-empty -m after
+"""
 
 
 # Configure Sentry
@@ -92,48 +117,69 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
 
     This session ID ensures a consistent execution environment for the commands, including files and directories.
     """
-    session_id = SandboxDockerSession.start(image=request.base_image, dockerfile=request.dockerfile)
-    return StartSessionResponse(session_id=session_id)
+    patch_extractor = SandboxDockerSession.start(
+        image=settings.GIT_IMAGE, labels={DAIV_SANDBOX_TYPE_LABEL: TYPE_PATCH_EXTRACTOR}, network_mode="none"
+    )
+    cmd_executor = SandboxDockerSession.start(
+        image=request.base_image,
+        dockerfile=request.dockerfile,
+        labels={
+            DAIV_SANDBOX_TYPE_LABEL: TYPE_CMD_EXECUTOR,
+            DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL: patch_extractor.session_id,
+        },
+    )
+    return StartSessionResponse(session_id=cmd_executor.session_id)
 
 
 @app.post("/session/{session_id}/", responses=common_responses, name="Run commands on a session")
 async def run_on_session(
-    session_id: Annotated[str, Path(title="The ID of the session to run commands in.")],
+    session_id: Annotated[str, FastAPIPath(title="The ID of the session to run commands in.")],
     request: RunRequest,
     api_key: str = Depends(get_api_key),
 ) -> RunResponse:
     """
     Run a set of commands on a session and return the results, including the archive with changed files.
     """
-    session = SandboxDockerSession()
-    container = session.get_container(session_id)
+    cmd_executor = SandboxDockerSession(session_id=session_id)
 
-    if not container:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    if not cmd_executor.container:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
+
+    # Patch with the changes applied by the commands.
+    base64_patch: str | None = None
+    # Results of the commands.
+    results: list[RunResult] = []
 
     if request.archive:
-        with io.BytesIO(request.archive) as request_archive:
-            session.copy_to_container(container, request_archive)
+        cmd_executor.copy_to_container(io.BytesIO(request.archive))
 
-    results: list[RunResult] = []
     for command in request.commands:
-        result = session.execute_command(
-            container, command, workdir=request.workdir, extract_changed_files=request.extract_changed_files
-        )
+        result = cmd_executor.execute_command(command, workdir=request.workdir)
         results.append(result)
 
         # Stop execution if fail_fast is enabled and command failed
         if request.fail_fast and result.exit_code != 0:
             break
 
-    # Only create archive with changed files for the last command.
-    archive: str | None = None
+    if request.archive and request.extract_patch:
+        patch_extractor = SandboxDockerSession(
+            session_id=cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
+        )
 
-    if request.extract_changed_files and (changed_files := results[-1].changed_files):
-        changed_files_archive = session.create_tar_gz_archive(container, results[-1].workdir, changed_files)
-        archive = base64.b64encode(changed_files_archive.getvalue()).decode()
+        patch_extractor.copy_to_container(io.BytesIO(request.archive), dest="/a")
+        patch_extractor.copy_to_container(cmd_executor.copy_from_container(request.workdir), dest="/b")
 
-    return RunResponse(results=results, archive=archive)
+        if patch_extractor.execute_command(CMD_EPHEMERAL_REPO.format(workdir=request.workdir)).exit_code != 0:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to extract patch")
+
+        patch = patch_extractor.execute_command(
+            "git -c core.quotepath=false diff --binary HEAD~1 HEAD || true",
+            workdir="/tmp/work",  # noqa: S108
+        ).output
+
+        base64_patch = base64.b64encode(patch.encode()).decode()
+
+    return RunResponse(results=results, patch=base64_patch)
 
 
 @app.delete("/session/{session_id}/", responses=common_responses, name="Close a session")
@@ -143,7 +189,14 @@ async def close_session(
     """
     Close a session by removing the Docker container.
     """
-    SandboxDockerSession.end(session_id=session_id)
+    cmd_executor = SandboxDockerSession(session_id=session_id)
+    patch_extractor = SandboxDockerSession(
+        session_id=cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
+    )
+
+    cmd_executor.remove_container()
+    patch_extractor.remove_container()
+
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

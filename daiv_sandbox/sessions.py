@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import datetime
 import io
 import logging
-import shlex
 import signal
-import tarfile
 import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -15,7 +12,7 @@ from docker import DockerClient, from_env
 from docker.errors import ImageNotFound, NotFound
 
 from daiv_sandbox.config import settings
-from daiv_sandbox.schemas import ImageInspection, RunResult
+from daiv_sandbox.schemas import ImageAttrs, RunResult
 
 if TYPE_CHECKING:
     from docker.models.containers import Container
@@ -45,29 +42,20 @@ class Session(ABC):
         Start a new session.
         """
 
-    @classmethod
     @abstractmethod
-    def end(cls, client: DockerClient | None = None):
-        """
-        End the session.
-        """
-
-    @abstractmethod
-    def copy_from_container(self, session_id: str, src: str) -> BinaryIO:
+    def copy_from_container(self, host_dir: str) -> BinaryIO:
         """
         Copy a file or directory from the container to the host.
         """
 
     @abstractmethod
-    def copy_to_container(self, session_id: str, data: BinaryIO):
+    def copy_to_container(self, data: BinaryIO, dest: str | None = None):
         """
         Copy a file or directory to the container.
         """
 
     @abstractmethod
-    def execute_command(
-        self, session_id: str, command: str, workdir: str, extract_changed_files: bool = False
-    ) -> RunResult:
+    def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
         """
         Execute a command in the container.
         """
@@ -78,14 +66,19 @@ class SandboxDockerSession(Session):
     A session is a Docker container that is used to execute commands.
     """
 
-    def __init__(self, client: DockerClient | None = None):
+    def __init__(self, session_id: str | None = None, client: DockerClient | None = None):
         """
         Create a new sandbox session using Docker.
 
         Args:
             client: Docker client, if not provided, a new client will be created based on local Docker context
         """
+        self.session_id: str | None = session_id
         self.client: DockerClient = client or from_env()
+        self.container: Container | None = self._get_container(session_id) if session_id else None
+        self.image_attrs: ImageAttrs | None = (
+            self._inspect_image(self.container.image.tags[-1]) if self.container else None
+        )
 
     @classmethod
     def ping(cls, *, client: DockerClient | None = None) -> bool:
@@ -103,8 +96,8 @@ class SandboxDockerSession(Session):
 
     @classmethod
     def start(
-        cls, image: str | None = None, dockerfile: str | None = None, *, client: DockerClient | None = None
-    ) -> str:
+        cls, image: str | None = None, dockerfile: str | None = None, *, client: DockerClient | None = None, **kwargs
+    ) -> SandboxDockerSession:
         """
         Start a new session by building or pulling the image and creating a new container.
 
@@ -115,11 +108,11 @@ class SandboxDockerSession(Session):
                 local Docker context.
 
         Returns:
-            str: The ID of the created container.
+            SandboxDockerSession: The session object.
         """
         assert dockerfile or image, "Either image or dockerfile should be provided"
 
-        instance = cls(client)
+        instance = cls(client=client)
 
         if image:
             instance._pull_image(image)
@@ -130,20 +123,8 @@ class SandboxDockerSession(Session):
                 f.flush()
                 image = instance._build_image(Path(f.name))
 
-        return instance._start_container(image)
-
-    @classmethod
-    def end(cls, session_id: str, *, client: DockerClient | None = None):
-        """
-        End the session by removing the container.
-
-        Args:
-            session_id (str): The ID of the container to remove.
-            client (DockerClient | None): Docker client, if not provided, a new client will be created based on
-                local Docker context.
-        """
-        instance = cls(client)
-        instance._remove_container(session_id)
+        instance._start_container(image, **kwargs)
+        return instance
 
     def _ping(self) -> bool:
         """
@@ -182,28 +163,30 @@ class SandboxDockerSession(Session):
 
         return image.tags[-1]
 
-    def _start_container(self, image: str) -> str:
+    def _start_container(self, image: str, **kwargs):
         """
         Create a new container from the image.
 
         Args:
             image (str): The tag of the image to use.
-
-        Returns:
-            str: The ID of the created container.
         """
         container = self.client.containers.run(
             image,
-            command='sh -c "tail -f /dev/null"',  # Keep container running indefinitely
+            entrypoint="/bin/sh",
+            command=["-lc", "sleep infinity"],
             detach=True,
             tty=True,
             runtime=settings.RUNTIME,
-            hostname="sandbox",
+            remove=True,
+            **kwargs,
         )
-        logger.info("Container '%s' created", container.short_id)
-        return container.id
 
-    def _remove_container(self, session_id: str):
+        self.session_id = container.id
+        self.container = container
+
+        logger.info("Container '%s' created (status: %s)", container.short_id, container.status)
+
+    def remove_container(self):
         """
         Remove the container.
 
@@ -211,78 +194,75 @@ class SandboxDockerSession(Session):
             session_id (str): The ID of the container to remove.
         """
         try:
-            self.client.containers.get(session_id).remove(force=True)
+            self.client.containers.get(self.session_id).remove(force=True)
         except NotFound:
-            logger.warning("Container '%s' not found", session_id)
+            logger.warning("Container '%s' not found", self.session_id)
         else:
-            logger.info("Container '%s' removed", session_id)
+            logger.info("Container '%s' removed", self.session_id)
 
-    def copy_from_container(self, container: Container, src: str) -> BinaryIO:
+    def copy_from_container(self, host_dir: str) -> BinaryIO:
         """
         Copy a file or directory from the container to the host.
 
         Args:
             session_id (str): The ID of the container to copy the archive from.
-            src (str): The path to the file or directory to copy from the container.
+            host_dir (str): The path to the file or directory to copy from the container.
 
         Returns:
             BinaryIO: The copied archive.
         """
-        logger.info("Copying archive from %s:%s...", container.short_id, src)
+        logger.info("Copying archive from %s:%s...", self.container.short_id, host_dir)
 
-        bits, stat = container.get_archive(src)
+        bits, stat = self.container.get_archive((Path(self.image_attrs.working_dir) / host_dir).as_posix())
+
         if stat["size"] == 0:
-            raise FileNotFoundError(f"File {src} not found in the container {container.short_id}")
+            raise FileNotFoundError(f"File {host_dir} not found in the container {self.container.short_id}")
 
-        tarstream = io.BytesIO()
-        for chunk in bits:
-            tarstream.write(chunk)
-        tarstream.seek(0)
+        return io.BytesIO(b"".join(bits))
 
-        extracted_archive = io.BytesIO()
-        with tarfile.open(fileobj=tarstream, mode="r:*") as tar:
-            extracted_archive.write(tar.extractfile(stat["name"]).read())
-        extracted_archive.seek(0)
-
-        return extracted_archive
-
-    def copy_to_container(self, container: Container, data: BinaryIO):
+    def copy_to_container(self, tardata: BinaryIO, dest: str | None = None):
         """
-        Copy a file or directory to the container.
+        Copy a file or directory to a specific path in the container.
 
         Args:
             session_id (str): The ID of the container to copy the archive to.
-            data (BinaryIO): The archive to copy to the container.
-
+            tardata (BinaryIO): The tar archive to be copied to the container.
+            dest (str | None): The destination path to copy the archive to. Defaults to the working directory of the
+                image.
         """
-        image_inspection = self._get_image_inspection(container.image.tags[-1])
+        dest = dest or self.image_attrs.working_dir
 
-        if container.exec_run(f"test -d {image_inspection.working_dir}")[0] != 0:
-            logger.info("Creating directory %s:%s...", container.short_id, image_inspection.working_dir)
-            result = container.exec_run(f"mkdir -p {image_inspection.working_dir}")
-            if result.exit_code != 0:
-                raise RuntimeError(
-                    f"Failed to create directory {container.short_id}:{image_inspection.working_dir} "
-                    f"(exit code {result.exit_code}) -> {result.output.decode()}"
-                )
+        logger.info("Creating directory %s:%s...", self.container.short_id, dest)
 
-        logger.info("Copying archive to %s:%s...", container.short_id, image_inspection.working_dir)
-
-        if container.put_archive(image_inspection.working_dir, data.getvalue()):
-            # we need to normalizer folder permissions
-            logger.debug("Normalizing folder permissions for %s:%s", container.short_id, image_inspection.working_dir)
-            container.exec_run(
-                f"chown -R {image_inspection.user}:{image_inspection.user} {image_inspection.working_dir}",
-                privileged=True,
-                user="root",
+        rm_result = self.container.exec_run(["rm", "-rf", "--", dest])
+        if rm_result.exit_code != 0:
+            raise RuntimeError(
+                f"Failed to remove directory {self.container.short_id}:{dest} "
+                f"(exit code {rm_result.exit_code}) -> {rm_result.output}"
             )
-            logger.debug("Successfully copied archive to %s:%s", container.short_id, image_inspection.working_dir)
-        else:
-            raise RuntimeError(f"Failed to copy archive to {container.short_id}:{image_inspection.working_dir}")
 
-    def execute_command(
-        self, container: Container, command: str, workdir: str | None = None, extract_changed_files: bool = False
-    ) -> RunResult:
+        mkdir_result = self.container.exec_run(["mkdir", "-p", "--", dest])
+        if mkdir_result.exit_code != 0:
+            raise RuntimeError(
+                f"Failed to create directory {self.container.short_id}:{dest} "
+                f"(exit code {mkdir_result.exit_code}) -> {mkdir_result.output}"
+            )
+
+        logger.info("Copying archive to %s:%s...", self.container.short_id, dest)
+
+        if self.container.put_archive(dest, tardata.getvalue()):
+            user = f"{self.image_attrs.user}:{self.image_attrs.user}"
+
+            logger.debug("Normalizing folder permissions '%s' for %s:%s", user, self.container.short_id, dest)
+
+            # We need to normalize folder permissions.
+            self.container.exec_run(["chown", "-R", user, "--", dest], privileged=True, user="root")
+
+            logger.debug("Successfully copied archive to %s:%s", self.container.short_id, dest)
+        else:
+            raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{dest}")
+
+    def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
         """
         Execute a command in the container.
 
@@ -290,124 +270,37 @@ class SandboxDockerSession(Session):
             session_id (str): The ID of the container to execute the command in.
             command (str): The command to execute.
             workdir (str | None): The working directory of the command.
-            extract_changed_files (bool): Whether to extract the changed files.
 
         Returns:
             RunResult: The result of the command.
         """
-        image_inspection = self._get_image_inspection(container.image.tags[-1])
-
         command_workdir = (
-            (Path(image_inspection.working_dir) / workdir).as_posix() if workdir else image_inspection.working_dir
+            (Path(self.image_attrs.working_dir) / workdir).as_posix() if workdir else self.image_attrs.working_dir
         )
 
-        logger.info("Executing command '%s' in %s:%s...", command, container.short_id, command_workdir)
+        logger.info("Executing command in %s:%s -> %s ", self.container.short_id, command_workdir, command)
 
-        before_run_date = datetime.datetime.now()
-
-        result = container.exec_run(f"/bin/sh -c {shlex.quote(command)}", workdir=command_workdir)
+        result = self.container.exec_run(["/bin/sh", "-lc", command], workdir=command_workdir)
 
         if result.exit_code != 0:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    "Command '%s' in %s:%s exited with code %s: %s",
-                    command,
-                    container.short_id,
+                    "Command in %s:%s exited with code %s: %s",
+                    self.container.short_id,
                     command_workdir,
                     result.exit_code,
                     result.output.decode(),
                 )
             else:
                 logger.warning(
-                    "Command '%s' in %s:%s exited with code %s",
-                    command,
-                    container.short_id,
-                    command_workdir,
-                    result.exit_code,
+                    "Command in %s:%s exited with code %s", self.container.short_id, command_workdir, result.exit_code
                 )
 
         return RunResult(
-            command=command,
-            output=result.output.decode(),
-            exit_code=result.exit_code,
-            workdir=command_workdir,
-            changed_files=self._extract_changed_file_names(container, command_workdir, before_run_date)
-            if extract_changed_files
-            else [],
+            command=command, output=result.output.decode(), exit_code=result.exit_code, workdir=command_workdir
         )
 
-    def _extract_changed_file_names(
-        self, container: Container, workdir: str, modified_after: datetime.datetime
-    ) -> list[str]:
-        """
-        Extract the list of changed files in the container.
-
-        Args:
-            container (Container): The container to extract the changed files from.
-            workdir (str): The working directory of the container to extract the changed files from.
-            modified_after (datetime.datetime): The date after which the files were modified.
-
-        Returns:
-            list[str]: The list of changed files.
-        """
-        logger.info("Extracting list of changed files from %s:%s...", container.short_id, workdir)
-
-        # Get the list of changed files in the specified workdir and modified after the specified date.
-        result = container.exec_run(
-            f'find {workdir} -type f ! -path "*/.*" '
-            f'-newermt "{modified_after:%Y-%m-%d %H:%M:%S}.{modified_after.microsecond // 1000:03d}"'
-        )
-
-        if result.exit_code != 0:
-            raise RuntimeError(
-                f"Failed to get the list of changed files from {container.short_id}:{workdir} "
-                f"(exit code {result.exit_code}) -> {result.output.decode()}"
-            )
-
-        changed_files = result.output.decode().splitlines()
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("Extracted changed files: %s", changed_files)
-
-        if not changed_files:
-            logger.info("No changed files found in %s:%s", container.short_id, workdir)
-            return []
-
-        return [file.replace(f"{workdir}/", "") for file in changed_files]
-
-    def create_tar_gz_archive(self, container: Container, workdir: str, include_files: list[str]) -> BinaryIO:
-        """
-        Create a tar.gz archive with the specified files.
-
-        Args:
-            session_id (str): The ID of the container to create the archive from.
-            workdir (str): The working directory of the container to create the archive from.
-            include_files (list[str]): The list of files to include in the archive.
-
-        Returns:
-            BinaryIO: The tar.gz archive.
-        """
-        logger.info("Creating tar.gz file with %s files in %s:%s...", len(include_files), container.short_id, workdir)
-
-        tar_path = f"{workdir}/changed_files.tar.gz"
-        result = container.exec_run(f"tar -czf {tar_path} -C {workdir} {' '.join(include_files)}")
-
-        if result.exit_code != 0:
-            logger.debug(
-                "Failed to create tar.gz file with changed files in %s:%s (exit code %s) -> %s",
-                container.short_id,
-                workdir,
-                result.exit_code,
-                result.output.decode(),
-            )
-            raise RuntimeError(
-                f"Failed to create tar.gz file with changed files in {container.short_id}:{workdir} "
-                f"(exit code {result.exit_code}) -> {result.output.decode()}"
-            )
-
-        return self.copy_from_container(container, tar_path)
-
-    def get_container(self, session_id: str) -> Container | None:
+    def _get_container(self, session_id: str) -> Container | None:
         """
         Get the container by ID. If the container is not running, attempt to restart it.
 
@@ -444,9 +337,9 @@ class SandboxDockerSession(Session):
 
         return container
 
-    def _get_image_inspection(self, image: str) -> ImageInspection:
+    def _inspect_image(self, image: str) -> ImageAttrs:
         """
-        Get the inspection of the image.
+        Inspect the image to get the user and working directory.
 
         Args:
             image (str): The tag of the image to inspect.
@@ -454,4 +347,16 @@ class SandboxDockerSession(Session):
         Returns:
             ImageInspection: The inspection of the image.
         """
-        return ImageInspection.from_inspection(self.client.api.inspect_image(image))
+        return ImageAttrs.from_inspection(self.client.api.inspect_image(image))
+
+    def get_label(self, label: str) -> str | None:
+        """
+        Get a label from the container.
+
+        Args:
+            label (str): The label to get.
+
+        Returns:
+            str | None: The value of the label, or None if the label is not set.
+        """
+        return self.container.attrs["Config"].get("Labels", {}).get(label)

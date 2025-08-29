@@ -37,8 +37,8 @@ class RunRequest(BaseModel):
     archive: Base64Bytes | None = Field(
         default=None, description="Base64-encoded archive with files to be copied to the sandbox."
     )
-    extract_changed_files: bool = Field(
-        default=False, description="Extract the changed files by the executed commands."
+    extract_patch: bool = Field(
+        default=False, description="Extract a patch with the changes made by the executed commands."
     )
     fail_fast: bool = Field(
         default=False,
@@ -54,22 +54,27 @@ class RunResult(BaseModel):
     output: str = Field(description="Output of the command.")
     exit_code: int = Field(description="Exit code of the command.")
     workdir: str = Field(description="Working directory of the command.", exclude=True)
-    changed_files: list[str] = Field(default_factory=list, description="List of changed files.", exclude=True)
 
 
 class RunResponse(BaseModel):
     results: list[RunResult] = Field(description="List of results of each command.")
-    archive: str | None = Field(description="Base64-encoded archive with the changed files.")
+    patch: str | None = Field(description="Base64-encoded patch with the changes.")
 
 
 class ErrorMessage(BaseModel):
     detail: str = Field(description="Error message.")
 
 
-class ImageInspection(BaseModel):
+class ImageAttrs(BaseModel):
     user: str = Field(description="User of the image.")
     working_dir: str = Field(description="Working directory of the image.")
 
     @classmethod
-    def from_inspection(cls, inspection: dict) -> "ImageInspection":
-        return cls(user=inspection["Config"]["User"], working_dir=inspection["Config"]["WorkingDir"])
+    def from_inspection(cls, inspection: dict) -> "ImageAttrs":
+        user = inspection["Config"]["User"]
+        working_dir = inspection["Config"]["WorkingDir"]
+
+        if user == "root" or working_dir == "" and user == "":
+            working_dir = "/archives"
+
+        return cls(user=user, working_dir=working_dir)
