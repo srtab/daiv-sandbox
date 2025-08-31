@@ -1,13 +1,14 @@
-import signal
-from unittest.mock import MagicMock, PropertyMock, patch
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
-from docker.errors import ImageNotFound
+from docker.errors import ImageNotFound, NotFound
 from docker.models.containers import ExecResult
 from docker.models.images import Image
 
 from daiv_sandbox.config import settings
-from daiv_sandbox.sessions import SandboxDockerSession, handler
+from daiv_sandbox.schemas import ImageAttrs
+from daiv_sandbox.sessions import SandboxDockerSession
 
 
 @pytest.fixture
@@ -23,6 +24,7 @@ def mock_docker_client(mock_image):
                 build=MagicMock(return_value=(mock_image, None)),
                 get=MagicMock(return_value=mock_image),
                 pull=MagicMock(return_value=mock_image),
+                ping=MagicMock(return_value=True),
             )
         )
         mock_from_env.return_value = mock_client
@@ -30,213 +32,132 @@ def mock_docker_client(mock_image):
         yield mock_client
 
 
-@patch("daiv_sandbox.sessions.signal.alarm")
-def test_context_manager(mock_signal_alarm, mock_docker_client, mock_image):
-    with SandboxDockerSession(image="test-image") as session:
-        assert session.container is not None
-        mock_signal_alarm.assert_called_once_with(settings.MAX_EXECUTION_TIME)
-    mock_signal_alarm.assert_called_with(0)  # Ensure alarm is reset
+def test_ping(mock_docker_client):
+    with patch.object(SandboxDockerSession, "_ping", return_value=True) as mock_ping:
+        assert SandboxDockerSession.ping() is True
+        mock_ping.assert_called_once()
 
 
-@patch("daiv_sandbox.sessions.signal.alarm", side_effect=[TimeoutError, None])
-def test_context_manager_timeout(mock_signal_alarm, mock_docker_client, mock_image):
-    with pytest.raises(RuntimeError, match="Execution timed out"):  # noqa: SIM117
-        with SandboxDockerSession(image="test-image"):
-            pass
-    mock_signal_alarm.assert_called_with(0)  # Ensure alarm is reset
+def test_start_with_image(mock_docker_client, mock_image):
+    with (
+        patch.object(SandboxDockerSession, "_pull_image") as mock_pull_image,
+        patch.object(SandboxDockerSession, "_start_container") as mock_start_container,
+    ):
+        SandboxDockerSession.start(image="test-image")
+        mock_pull_image.assert_called_once_with("test-image")
+        mock_start_container.assert_called_once_with("test-image")
 
 
-def test_open_with_image(mock_docker_client, mock_image):
-    session = SandboxDockerSession(image="test-image", session_id="test-run-id")
-    session.open()
+@patch("daiv_sandbox.sessions.tempfile.NamedTemporaryFile")
+def test_start_with_dockerfile(mock_named_temporary_file, mock_docker_client):
+    mock_named_temporary_file.return_value.__enter__.return_value.name = "test-dockerfile"
+    with (
+        patch.object(SandboxDockerSession, "_build_image") as mock_build_image,
+        patch.object(SandboxDockerSession, "_start_container") as mock_start_container,
+    ):
+        SandboxDockerSession.start(dockerfile="/home/user/Dockerfile")
+        mock_build_image.assert_called_once_with(Path("test-dockerfile"))
+        mock_start_container.assert_called_once_with(mock_build_image.return_value)
+
+
+def test__pull_image_with_image_not_found(mock_docker_client):
+    mock_docker_client.images.get.side_effect = ImageNotFound("test-image")
+    session = SandboxDockerSession()
+    session._pull_image("test-image")
+    mock_docker_client.images.pull.assert_called_once_with("test-image")
+
+
+def test__pull_image_with_image_found(mock_docker_client):
+    session = SandboxDockerSession()
+    session._pull_image("test-image")
     mock_docker_client.images.get.assert_called_once_with("test-image")
+
+
+def test__build_image(mock_docker_client):
+    session = SandboxDockerSession()
+    dockerfile = MagicMock(name="test-dockerfile")
+    result = session._build_image(dockerfile)
+    mock_docker_client.images.build.assert_called_once_with(
+        path=dockerfile.parent.as_posix(), dockerfile=dockerfile.name, tag=f"sandbox-{dockerfile.name}"
+    )
+    assert result == mock_docker_client.images.build.return_value[0].tags[-1]
+
+
+def test__start_container(mock_docker_client):
+    session = SandboxDockerSession()
+    session._start_container("test-image")
     mock_docker_client.containers.run.assert_called_once_with(
-        mock_image,
-        command='sh -c "tail -f /dev/null"',
+        "test-image",
+        entrypoint="/bin/sh",
+        command=["-lc", "sleep infinity"],
         detach=True,
         tty=True,
-        runtime="runc",
-        hostname="sandbox",
-        name="sandbox-test-run-id",
+        runtime=settings.RUNTIME,
+        remove=True,
     )
-    assert session.image == mock_image
     assert session.container is not None
+    assert session.container.id == mock_docker_client.containers.run.return_value.id
+    assert session.session_id == mock_docker_client.containers.run.return_value.id
 
 
-def test_open_with_image_not_found_pulls_image(mock_docker_client):
-    mock_docker_client.images.get.side_effect = ImageNotFound("test-image")
-    session = SandboxDockerSession(image="test-image")
-    session.open()
-    mock_docker_client.images.pull.assert_called_once_with("test-image")
-    assert session.image is not None
-    assert session.container is not None
+def test_remove_container(mock_docker_client):
+    session = SandboxDockerSession(session_id="test-session-id")
+    session.remove_container()
+    mock_docker_client.containers.get.assert_called_with(session.session_id)
+    mock_docker_client.containers.get.return_value.remove.assert_called_once_with(force=True)
 
 
-def test_open_with_invalid_image_type_raises_error():
-    with pytest.raises(ValueError, match="Invalid image type"):
-        session = SandboxDockerSession(image=MagicMock())
-        session.open()
+def test_remove_container_with_container_not_found(mock_docker_client):
+    session = SandboxDockerSession(session_id="test-session-id")
+    mock_docker_client.containers.get.side_effect = NotFound(session.session_id)
+    session.remove_container()
+    mock_docker_client.containers.get.assert_called_with(session.session_id)
+    mock_docker_client.containers.get.return_value.remove.assert_not_called()
 
 
-def test_open_with_dockerfile(mock_docker_client):
-    session = SandboxDockerSession(dockerfile="/home/user/Dockerfile")
-    session.open()
-    mock_docker_client.images.build.assert_called_once_with(
-        path="/home/user", dockerfile="Dockerfile", tag="sandbox-user"
-    )
-
-
-def test_open_with_both_image_and_dockerfile_raises_error():
-    with pytest.raises(ValueError, match="Only one of image or dockerfile should be provided"):
-        SandboxDockerSession(image="test-image", dockerfile="/home/user/Dockerfile")
-
-
-def test_open_without_image_or_dockerfile_raises_error():
-    with pytest.raises(ValueError, match="Either image or dockerfile should be provided"):
-        SandboxDockerSession()
-
-
-def test_close_removes_container():
-    container = MagicMock()
-    session = SandboxDockerSession(image="test-image")
-    session.container = container
-    session.close()
-    container.remove.assert_called_once_with(force=True)
-
-
-def test_execute_command():
-    with patch.object(SandboxDockerSession, "run_path", new_callable=PropertyMock, return_value="/"):
-        session = SandboxDockerSession(image="test-image")
-        session.container = MagicMock()
-        session.container.status = "running"
-        session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"output")
-        result = session.execute_command("echo hello")
-        assert result.exit_code == 0
-        assert result.output == "output"
-
-
-def test_copy_to_runtime_creates_directory():
-    with (
-        patch.object(SandboxDockerSession, "run_path", new_callable=PropertyMock, return_value="/path/to/dest"),
-        patch.object(SandboxDockerSession, "_image_user", new_callable=PropertyMock, return_value="root"),
-    ):
-        session = SandboxDockerSession(image="test-image")
-        session.container = MagicMock()
-        session.container.status = "running"
-        session.container.exec_run.side_effect = [
-            ExecResult(exit_code=1, output=b""),
-            ExecResult(exit_code=0, output=b""),
-            ExecResult(exit_code=0, output=b""),
-        ]
-        with patch("io.BytesIO", return_value=MagicMock()) as mock_data:
-            session.copy_to_container(mock_data)
-            session.container.exec_run.assert_any_call("mkdir -p /path/to/dest")
-            session.container.exec_run.assert_any_call("chown -R root:root /path/to/dest", privileged=True, user="root")
+def test_copy_to_runtime_creates_directory(mock_docker_client):
+    session = SandboxDockerSession()
+    session.image_attrs = ImageAttrs(user="root", working_dir="/path/to/dest")
+    session.container = MagicMock()
+    session.container.exec_run.side_effect = [
+        ExecResult(exit_code=0, output=b""),
+        ExecResult(exit_code=0, output=b""),
+        ExecResult(exit_code=0, output=b""),
+    ]
+    with patch("io.BytesIO", return_value=MagicMock()) as mock_data:
+        session.copy_to_container(mock_data)
+        session.container.exec_run.assert_any_call(["rm", "-rf", "--", "/path/to/dest"])
+        session.container.exec_run.assert_any_call(["mkdir", "-p", "--", "/path/to/dest"])
+        session.container.exec_run.assert_any_call(
+            ["chown", "-R", "root:root", "--", "/path/to/dest"], privileged=True, user="root"
+        )
 
 
 def test_copy_from_runtime_raises_error_if_file_not_found():
-    session = SandboxDockerSession(image="test-image")
+    session = SandboxDockerSession()
+    session.image_attrs = ImageAttrs(user="root", working_dir="/path/to/dest")
     session.container = MagicMock()
-    session.container.status = "running"
     session.container.get_archive.return_value = ([], {"size": 0})
     with pytest.raises(FileNotFoundError):
         session.copy_from_container("/path/to/src")
+    session.container.get_archive.assert_called_once_with("/path/to/src")
 
 
-@patch("daiv_sandbox.sessions.from_env")
-def test_ping_successful(mock_from_env):
-    mock_client = MagicMock()
-    mock_client.ping.return_value = True
-    mock_from_env.return_value = mock_client
-
-    assert SandboxDockerSession.ping() is True
-    mock_client.ping.assert_called_once()
-
-
-@patch("daiv_sandbox.sessions.from_env")
-def test_ping_unsuccessful(mock_from_env):
-    mock_client = MagicMock()
-    mock_client.ping.return_value = False
-    mock_from_env.return_value = mock_client
-
-    assert SandboxDockerSession.ping() is False
-    mock_client.ping.assert_called_once()
+def test_execute_command(mock_docker_client):
+    session = SandboxDockerSession(session_id="test-session-id")
+    session.image_attrs = ImageAttrs(user="root", working_dir="/")
+    session.container = MagicMock()
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"output")
+    result = session.execute_command("echo hello")
+    assert result.exit_code == 0
+    assert result.output == "output"
+    session.container.exec_run.assert_called_once_with(["/bin/sh", "-lc", "echo hello"], workdir="/")
 
 
-def test_handler_raises_timeout_error():
-    """Test that the handler function raises TimeoutError when called"""
-    with pytest.raises(TimeoutError, match="Execution timed out"):
-        handler(signal.SIGALRM, None)
+@patch("daiv_sandbox.sessions.ImageAttrs.from_inspection")
+def test__inspect_image(mock_from_inspection, mock_docker_client):
+    session = SandboxDockerSession(session_id="test-session-id")
+    session._inspect_image("test-image:latest")
 
-
-def test_handler_is_registered_for_sigalrm():
-    """Test that the handler is properly registered for SIGALRM"""
-    current_handler = signal.getsignal(signal.SIGALRM)
-    assert current_handler == handler, "Handler should be registered for SIGALRM"
-
-
-def test_image_inspection_raises_when_not_open():
-    session = SandboxDockerSession(image="test-image")
-    with pytest.raises(RuntimeError, match="Session is not open"):
-        _ = session._image_inspection
-
-
-def test_image_inspection():
-    with patch.object(SandboxDockerSession, "run_path", new_callable=PropertyMock, return_value="/"):
-        session = SandboxDockerSession(image="test-image")
-        session.container = MagicMock()
-        session.image = MagicMock(tags=["test-image:latest"])
-
-        mock_inspection = {"Config": {"User": "testuser", "WorkingDir": "/app"}}
-        session.client = MagicMock()
-        session.client.api.inspect_image.return_value = mock_inspection
-
-        assert session._image_inspection == mock_inspection
-        session.client.api.inspect_image.assert_called_once_with("test-image:latest")
-
-
-def test_image_user_root_when_empty():
-    with patch.object(SandboxDockerSession, "_image_inspection", new_callable=PropertyMock) as mock_inspection:
-        mock_inspection.return_value = {"Config": {"User": ""}}
-        session = SandboxDockerSession(image="test-image")
-        assert session._image_user == "root"
-
-
-def test_image_user_from_config():
-    with patch.object(SandboxDockerSession, "_image_inspection", new_callable=PropertyMock) as mock_inspection:
-        mock_inspection.return_value = {"Config": {"User": "testuser"}}
-        session = SandboxDockerSession(image="test-image")
-        assert session._image_user == "testuser"
-
-
-def test_image_working_dir_raises_when_empty():
-    with patch.object(SandboxDockerSession, "_image_inspection", new_callable=PropertyMock) as mock_inspection:
-        mock_inspection.return_value = {"Config": {"WorkingDir": ""}, "RepoTags": ["test-image:latest"]}
-        session = SandboxDockerSession(image="test-image")
-        with pytest.raises(ValueError, match="Can't determine the working dir"):
-            _ = session._image_working_dir
-
-
-def test_image_working_dir_from_config():
-    with patch.object(SandboxDockerSession, "_image_inspection", new_callable=PropertyMock) as mock_inspection:
-        mock_inspection.return_value = {"Config": {"WorkingDir": "/app"}}
-        session = SandboxDockerSession(image="test-image")
-        assert session._image_working_dir == "/app"
-
-
-def test_run_path_for_root_user():
-    with patch.object(SandboxDockerSession, "_image_user", new_callable=PropertyMock) as mock_user:
-        mock_user.return_value = "root"
-        session = SandboxDockerSession(image="test-image", session_id="test-run")
-        assert session._run_path == "/runs/test-run"
-
-
-def test_run_path_for_non_root_user():
-    with (
-        patch.object(SandboxDockerSession, "_image_user", new_callable=PropertyMock) as mock_user,
-        patch.object(SandboxDockerSession, "_image_working_dir", new_callable=PropertyMock) as mock_working_dir,
-    ):
-        mock_user.return_value = "testuser"
-        mock_working_dir.return_value = "/app"
-        session = SandboxDockerSession(image="test-image", session_id="test-run")
-        assert session._run_path == "/app/runs/test-run"
+    mock_docker_client.api.inspect_image.assert_called_once_with("test-image:latest")
+    mock_from_inspection.assert_called_once_with(mock_docker_client.api.inspect_image.return_value)

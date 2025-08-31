@@ -19,6 +19,7 @@ from daiv_sandbox.schemas import (
     StartSessionRequest,
     StartSessionResponse,
 )
+from daiv_sandbox.scripts import CMD_EPHEMERAL_REPO, CMD_GIT_DIFF_BINARY
 from daiv_sandbox.sessions import SandboxDockerSession
 
 HEADER_API_KEY_NAME = "X-API-Key"
@@ -28,23 +29,6 @@ DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL = "daiv.sandbox.patch_extractor_se
 
 TYPE_PATCH_EXTRACTOR = "patch_extractor"
 TYPE_CMD_EXECUTOR = "cmd_executor"
-
-# Command to create an ephemeral repo and makes two throwaway commits.
-# Git will then respect the repo’s .gitignore automatically, and the diff won’t include them.
-CMD_EPHEMERAL_REPO = """set -euo pipefail
-A=/a/{workdir}
-B=/b/{workdir}
-W=/tmp/work; rm -rf "$W"; mkdir -p "$W"; cd "$W"
-git config --global --add safe.directory /tmp/work
-git init -q
-git config user.name sandbox
-git config user.email sandbox@example.local
-cp -a "$A"/. .
-git add -A && git commit -q -m baseline
-find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {{}} +
-cp -a "$B"/. .
-git add -A && git commit -q --allow-empty -m after
-"""
 
 
 # Configure Sentry
@@ -170,10 +154,10 @@ async def run_on_session(
         patch_extractor.copy_to_container(cmd_executor.copy_from_container(request.workdir), dest="/b")
 
         if patch_extractor.execute_command(CMD_EPHEMERAL_REPO.format(workdir=request.workdir)).exit_code != 0:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to extract patch")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to extract patch.")
 
         patch = patch_extractor.execute_command(
-            "git -c core.quotepath=false diff --binary HEAD~1 HEAD || true",
+            CMD_GIT_DIFF_BINARY,
             workdir="/tmp/work",  # noqa: S108
         ).output
 
