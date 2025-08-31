@@ -1,21 +1,18 @@
-import datetime
+from __future__ import annotations
+
 import io
 import logging
-import shlex
 import signal
-import tarfile
+import tempfile
 from abc import ABC, abstractmethod
-from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Literal
-from uuid import uuid4
+from typing import TYPE_CHECKING, BinaryIO
 
 from docker import DockerClient, from_env
-from docker.errors import ImageNotFound
-from docker.models.images import Image
+from docker.errors import ImageNotFound, NotFound
 
 from daiv_sandbox.config import settings
-from daiv_sandbox.schemas import RunResult
+from daiv_sandbox.schemas import ImageAttrs, RunResult
 
 if TYPE_CHECKING:
     from docker.models.containers import Container
@@ -31,275 +28,264 @@ signal.signal(signal.SIGALRM, handler)
 
 
 class Session(ABC):
+    @classmethod
     @abstractmethod
-    def open(self):
-        raise NotImplementedError
+    def ping(cls, client: DockerClient | None = None) -> bool:
+        """
+        Ping the Docker client.
+        """
 
+    @classmethod
     @abstractmethod
-    def close(self):
-        raise NotImplementedError
-
-    @abstractmethod
-    def copy_from_runtime(self, src: str) -> BinaryIO:
-        raise NotImplementedError
-
-    @abstractmethod
-    def copy_to_runtime(self, data: BinaryIO):
-        raise NotImplementedError
+    def start(cls, client: DockerClient | None = None):
+        """
+        Start a new session.
+        """
 
     @abstractmethod
-    def execute_command(self, command: str, workdir: str, extract_changed_files: bool = False) -> RunResult:
-        raise NotImplementedError
+    def copy_from_container(self, host_dir: str) -> BinaryIO:
+        """
+        Copy a file or directory from the container to the host.
+        """
 
-    def __enter__(self):
-        try:
-            signal.alarm(settings.MAX_EXECUTION_TIME)
+    @abstractmethod
+    def copy_to_container(self, data: BinaryIO, dest: str | None = None):
+        """
+        Copy a file or directory to the container.
+        """
 
-            self.open()
-            return self
-        except TimeoutError as e:
-            self.__exit__()
-            raise RuntimeError("Execution timed out") from e
-        except Exception as e:
-            self.__exit__()
-            raise e
-
-    def __exit__(self, *args, **kwargs):
-        signal.alarm(0)
-        self.close()
+    @abstractmethod
+    def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
+        """
+        Execute a command in the container.
+        """
 
 
 class SandboxDockerSession(Session):
-    def __init__(
-        self,
-        client: DockerClient | None = None,
-        image: str | None = None,
-        dockerfile: str | None = None,
-        keep_template: bool = False,
-        runtime: Literal["runc", "runsc"] = "runc",
-        run_id: str | None = None,
-    ):
+    """
+    A session is a Docker container that is used to execute commands.
+    """
+
+    def __init__(self, session_id: str | None = None, client: DockerClient | None = None):
         """
         Create a new sandbox session using Docker.
 
         Args:
             client: Docker client, if not provided, a new client will be created based on local Docker context
-            image: Docker image to use
-            dockerfile: Path to the Dockerfile, if image is not provided
-            keep_template: if True, the image and container will not be removed after the session ends
-            runtime: the container runtime to use, either "runc" or "runsc"
-            run_id: the run ID to use for the container
         """
-        if image and dockerfile:
-            raise ValueError("Only one of image or dockerfile should be provided")
-
-        elif not image and not dockerfile:
-            raise ValueError("Either image or dockerfile should be provided")
-
-        if not client:
-            logger.info("Using local Docker context since client is not provided.")
-
+        self.session_id: str | None = session_id
         self.client: DockerClient = client or from_env()
-        self.image: Image | str | None = image
-        self.dockerfile = Path(dockerfile) if dockerfile else None
-        self.container: Container | None = None
-        self.keep_template = keep_template
-        self.is_create_template: bool = False
-        self.runtime = runtime
-        self.run_id = run_id or str(uuid4())
+        self.container: Container | None = self._get_container(session_id) if session_id else None
+        self.image_attrs: ImageAttrs | None = (
+            self._inspect_image(self.container.image.tags[-1]) if self.container else None
+        )
 
-    @staticmethod
-    def ping() -> bool:
+    @classmethod
+    def ping(cls, *, client: DockerClient | None = None) -> bool:
+        """
+        Ping the Docker client.
+
+        Args:
+            client (DockerClient | None): Docker client, if not provided, a new client will be created based on
+                local Docker context.
+
+        Returns:
+            bool: True if the client is pingable, False otherwise.
+        """
+        return cls(client)._ping()
+
+    @classmethod
+    def start(
+        cls, image: str | None = None, dockerfile: str | None = None, *, client: DockerClient | None = None, **kwargs
+    ) -> SandboxDockerSession:
+        """
+        Start a new session by building or pulling the image and creating a new container.
+
+        Args:
+            image (str | None): Docker image to use, if not provided, the image will be built from the Dockerfile.
+            dockerfile (str | None): Dockerfile content to build the image from.
+            client (DockerClient | None): Docker client, if not provided, a new client will be created based on
+                local Docker context.
+
+        Returns:
+            SandboxDockerSession: The session object.
+        """
+        assert dockerfile or image, "Either image or dockerfile should be provided"
+
+        instance = cls(client=client)
+
+        if image:
+            instance._pull_image(image)
+
+        elif dockerfile:
+            with tempfile.NamedTemporaryFile() as f:
+                f.write(dockerfile.encode())
+                f.flush()
+                image = instance._build_image(Path(f.name))
+
+        instance._start_container(image, **kwargs)
+        return instance
+
+    def _ping(self) -> bool:
         """
         Ping the Docker client.
         """
-        client = from_env()
-        return client.ping()
+        return self.client.ping()
 
-    def open(self):
+    def _pull_image(self, image: str):
+        """
+        Pull the image from the registry.
+
+        Args:
+            image (str): The tag of the image to pull.
+        """
+        try:
+            found_image = self.client.images.get(image)
+            logger.info("Found already existing image '%s'", found_image.tags[-1])
+        except ImageNotFound:
+            logger.info("Pulling image '%s'", image)
+            self.client.images.pull(image)
+
+    def _build_image(self, dockerfile: Path) -> str:
+        """
+        Build the image from the Dockerfile.
+
+        Args:
+            dockerfile (Path): The path to the Dockerfile to build.
+
+        Returns:
+            str: The tag of the built image.
+        """
+        logger.info("Building docker image from '%s'", dockerfile.as_posix())
+        image, _logs = self.client.images.build(
+            path=dockerfile.parent.as_posix(), dockerfile=dockerfile.name, tag=f"sandbox-{dockerfile.name}"
+        )
+
+        return image.tags[-1]
+
+    def _start_container(self, image: str, **kwargs):
         """
         Create a new container from the image.
+
+        Args:
+            image (str): The tag of the image to use.
         """
-        if self.dockerfile:
-            logger.info("Building docker image from %s", self.dockerfile)
-
-            path = self.dockerfile.parent
-            self.image, _ = self.client.images.build(
-                path=str(path), dockerfile=self.dockerfile.name, tag=f"sandbox-{path.name}"
-            )
-            self.is_create_template = True
-
-        elif isinstance(self.image, str):
-            try:
-                self.image = self.client.images.get(self.image)
-                logger.info("Found already existing image %s", self.image.tags[-1])
-            except ImageNotFound:
-                logger.info("Pulling image %s", self.image)
-                self.image = self.client.images.pull(self.image)
-                self.is_create_template = True
-        else:
-            raise ValueError("Invalid image type")
-
-        self.container = self.client.containers.run(
-            self.image,
-            command='sh -c "tail -f /dev/null"',  # Keep container running indefinitely
+        container = self.client.containers.run(
+            image,
+            entrypoint="/bin/sh",
+            command=["-lc", "sleep infinity"],
             detach=True,
             tty=True,
-            runtime=self.runtime,
-            hostname="sandbox",
-            name=f"sandbox-{self.run_id}",
+            runtime=settings.RUNTIME,
+            remove=True,
+            **kwargs,
         )
-        logger.info("Container %s created", self.container.short_id)
 
-    @property
-    def run_path(self) -> str:
-        """
-        Get the path to the run directory.
-        """
-        if self._image_user == "root":
-            return f"/runs/{self.run_id}"
+        self.session_id = container.id
+        self.container = container
 
-        return (Path(self._image_working_dir) / "runs" / self.run_id).as_posix()
+        logger.info("Container '%s' created (status: %s)", container.short_id, container.status)
 
-    @property
-    def _image_user(self) -> str:
-        # If it's empty, Docker defaults to root
-        return self._image_inspection["Config"]["User"] or "root"
-
-    @property
-    def _image_working_dir(self) -> str:
-        if not self._image_inspection["Config"]["WorkingDir"]:
-            raise ValueError("Can't determine the working dir of image %s", self._image_inspection["RepoTags"][0])
-
-        return self._image_inspection["Config"]["WorkingDir"]
-
-    @cached_property
-    def _image_inspection(self) -> dict:
-        if not self.container or not self.image:
-            raise RuntimeError("Session is not open. Please call open() method before copying files.")
-
-        return self.client.api.inspect_image(self.image.tags[-1])
-
-    def close(self):
+    def remove_container(self):
         """
         Remove the container.
+
+        Args:
+            session_id (str): The ID of the container to remove.
         """
-        if self.container:
-            self.container.remove(force=True)
-            self.container = None
-
-        if self.is_create_template and not self.keep_template:
-            containers: list[Container] = self.client.containers.list(all=True)
-            image: Image = self.image if isinstance(self.image, Image) else self.client.images.get(self.image)
-
-            if any(container.image.id == image.id for container in containers):
-                logger.warning("Image %s is in use by other containers. Skipping removal.", image.tags[-1])
-            else:
-                image.remove(force=True)
-
-    def _ensure_container_running(self):
-        """
-        Check if the container exists and is running. If not, attempt to restart it.
-        """
-        if not self.container:
-            raise RuntimeError("Session is not open. Please call open() method before executing commands.")
-
         try:
-            # Refresh container status
-            self.container.reload()
-
-            # Check if container is running
-            if self.container.status != "running":
-                logger.warning(
-                    "Container %s is not running (status: %s). Attempting to restart...",
-                    self.container.short_id,
-                    self.container.status,
-                )
-                self.container.restart()
-                self.container.reload()
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to ensure container {self.container.short_id} is running: {str(e)}") from e
+            self.client.containers.get(self.session_id).remove(force=True)
+        except NotFound:
+            logger.warning("Container '%s' not found", self.session_id)
         else:
-            if self.container.status != "running":
-                raise RuntimeError(
-                    f"Failed to restart container {self.container.short_id}. Current status: {self.container.status}"
-                )
+            logger.info("Container '%s' removed", self.session_id)
 
-            logger.info("Container %s successfully restarted", self.container.short_id)
-
-    def copy_from_runtime(self, src: str) -> BinaryIO:
+    def copy_from_container(self, host_dir: str) -> BinaryIO:
         """
         Copy a file or directory from the container to the host.
+
+        Args:
+            session_id (str): The ID of the container to copy the archive from.
+            host_dir (str): The path to the file or directory to copy from the container.
+
+        Returns:
+            BinaryIO: The copied archive.
         """
-        self._ensure_container_running()
+        logger.info("Copying archive from %s:%s...", self.container.short_id, host_dir)
 
-        logger.info("Copying archive from %s:%s...", self.container.short_id, src)
+        bits, stat = self.container.get_archive((Path(self.image_attrs.working_dir) / host_dir).as_posix())
 
-        bits, stat = self.container.get_archive(src)
         if stat["size"] == 0:
-            raise FileNotFoundError(f"File {src} not found in the container {self.container.short_id}")
+            raise FileNotFoundError(f"File {host_dir} not found in the container {self.container.short_id}")
 
-        tarstream = io.BytesIO()
-        for chunk in bits:
-            tarstream.write(chunk)
-        tarstream.seek(0)
+        return io.BytesIO(b"".join(bits))
 
-        extracted_archive = io.BytesIO()
-        with tarfile.open(fileobj=tarstream, mode="r:*") as tar:
-            extracted_archive.write(tar.extractfile(stat["name"]).read())
-        extracted_archive.seek(0)
-
-        return extracted_archive
-
-    def copy_to_runtime(self, data: BinaryIO):
+    def copy_to_container(self, tardata: BinaryIO, dest: str | None = None):
         """
-        Copy a file or directory to the container.
+        Copy a file or directory to a specific path in the container.
+
+        Args:
+            session_id (str): The ID of the container to copy the archive to.
+            tardata (BinaryIO): The tar archive to be copied to the container.
+            dest (str | None): The destination path to copy the archive to. Defaults to the working directory of the
+                image.
         """
-        self._ensure_container_running()
+        dest = dest or self.image_attrs.working_dir
 
-        if self.container.exec_run(f"test -d {self.run_path}")[0] != 0:
-            logger.info("Creating directory %s:%s...", self.container.short_id, self.run_path)
-            result = self.container.exec_run(f"mkdir -p {self.run_path}")
-            if result.exit_code != 0:
-                raise RuntimeError(
-                    f"Failed to create directory {self.container.short_id}:{self.run_path} "
-                    f"(exit code {result.exit_code}) -> {result.output.decode()}"
-                )
+        logger.info("Creating directory %s:%s...", self.container.short_id, dest)
 
-        logger.info("Copying archive to %s:%s...", self.container.short_id, self.run_path)
-
-        if self.container.put_archive(self.run_path, data.getvalue()):
-            # we need to normalizer folder permissions
-            logger.debug("Normalizing folder permissions for %s:%s", self.container.short_id, self.run_path)
-            self.container.exec_run(
-                f"chown -R {self._image_user}:{self._image_user} {self.run_path}", privileged=True, user="root"
+        rm_result = self.container.exec_run(["rm", "-rf", "--", dest])
+        if rm_result.exit_code != 0:
+            raise RuntimeError(
+                f"Failed to remove directory {self.container.short_id}:{dest} "
+                f"(exit code {rm_result.exit_code}) -> {rm_result.output}"
             )
-            logger.debug("Successfully copied archive to %s:%s", self.container.short_id, self.run_path)
-        else:
-            raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{self.run_path}")
 
-    def execute_command(
-        self, command: str, workdir: str | None = None, extract_changed_files: bool = False
-    ) -> RunResult:
+        mkdir_result = self.container.exec_run(["mkdir", "-p", "--", dest])
+        if mkdir_result.exit_code != 0:
+            raise RuntimeError(
+                f"Failed to create directory {self.container.short_id}:{dest} "
+                f"(exit code {mkdir_result.exit_code}) -> {mkdir_result.output}"
+            )
+
+        logger.info("Copying archive to %s:%s...", self.container.short_id, dest)
+
+        if self.container.put_archive(dest, tardata.getvalue()):
+            user = f"{self.image_attrs.user}:{self.image_attrs.user}"
+
+            logger.debug("Normalizing folder permissions '%s' for %s:%s", user, self.container.short_id, dest)
+
+            # We need to normalize folder permissions.
+            self.container.exec_run(["chown", "-R", user, "--", dest], privileged=True, user="root")
+
+            logger.debug("Successfully copied archive to %s:%s", self.container.short_id, dest)
+        else:
+            raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{dest}")
+
+    def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
         """
         Execute a command in the container.
+
+        Args:
+            session_id (str): The ID of the container to execute the command in.
+            command (str): The command to execute.
+            workdir (str | None): The working directory of the command.
+
+        Returns:
+            RunResult: The result of the command.
         """
-        self._ensure_container_running()
+        command_workdir = (
+            (Path(self.image_attrs.working_dir) / workdir).as_posix() if workdir else self.image_attrs.working_dir
+        )
 
-        command_workdir = (Path(self.run_path) / workdir).as_posix() if workdir else self.run_path
+        logger.info("Executing command in %s:%s -> %s ", self.container.short_id, command_workdir, command)
 
-        logger.info("Executing command '%s' in %s:%s...", command, self.container.short_id, command_workdir)
-
-        before_run_date = datetime.datetime.now()
-
-        result = self.container.exec_run(f"/bin/sh -c {shlex.quote(command)}", workdir=command_workdir)
+        result = self.container.exec_run(["/bin/sh", "-lc", command], workdir=command_workdir)
 
         if result.exit_code != 0:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    "Command '%s' in %s:%s exited with code %s: %s",
-                    command,
+                    "Command in %s:%s exited with code %s: %s",
                     self.container.short_id,
                     command_workdir,
                     result.exit_code,
@@ -307,82 +293,70 @@ class SandboxDockerSession(Session):
                 )
             else:
                 logger.warning(
-                    "Command '%s' in %s:%s exited with code %s",
-                    command,
-                    self.container.short_id,
-                    command_workdir,
-                    result.exit_code,
+                    "Command in %s:%s exited with code %s", self.container.short_id, command_workdir, result.exit_code
                 )
 
         return RunResult(
-            command=command,
-            output=result.output.decode(),
-            exit_code=result.exit_code,
-            workdir=command_workdir,
-            changed_files=self._extract_changed_file_names(command_workdir, before_run_date)
-            if extract_changed_files
-            else [],
+            command=command, output=result.output.decode(), exit_code=result.exit_code, workdir=command_workdir
         )
 
-    def _extract_changed_file_names(self, workdir: str, modified_after: datetime.datetime) -> list[str]:
+    def _get_container(self, session_id: str) -> Container | None:
         """
-        Extract the list of changed files in the container.
+        Get the container by ID. If the container is not running, attempt to restart it.
+
+        Args:
+            session_id (str): The ID of the container to ensure is running.
+
+        Returns:
+            Container | None: The container object if it exists and is running, None otherwise.
         """
-        if not self.container:
-            logger.info("Session already closed. Skipping extraction of changed files.")
-            return []
+        try:
+            container = self.client.containers.get(session_id)
+        except NotFound:
+            return None
 
-        self._ensure_container_running()
+        try:
+            container.reload()
 
-        logger.info("Extracting list of changed files from %s:%s...", self.container.short_id, workdir)
+            if container.status != "running":
+                logger.warning(
+                    "Container '%s' is not running (status: %s). Attempting to restart...",
+                    container.short_id,
+                    container.status,
+                )
+                container.restart()
+                container.reload()
 
-        # Get the list of changed files in the specified workdir and modified after the specified date.
-        result = self.container.exec_run(
-            f'find {workdir} -type f ! -path "*/.*" '
-            f'-newermt "{modified_after:%Y-%m-%d %H:%M:%S}.{modified_after.microsecond // 1000:03d}"'
-        )
+        except Exception:
+            logger.exception("Failed to ensure container %s is running", container.short_id)
+            return None
+        else:
+            if container.status != "running":
+                logger.error("Failed to restart container %s. Current status: %s", container.short_id, container.status)
+                return None
 
-        if result.exit_code != 0:
-            raise RuntimeError(
-                f"Failed to get the list of changed files from {self.container.short_id}:{workdir} "
-                f"(exit code {result.exit_code}) -> {result.output.decode()}"
-            )
+        return container
 
-        changed_files = result.output.decode().splitlines()
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("Extracted changed files: %s", changed_files)
-
-        if not changed_files:
-            logger.info("No changed files found in %s:%s", self.container.short_id, workdir)
-            return []
-
-        return [file.replace(f"{workdir}/", "") for file in changed_files]
-
-    def create_tar_gz_archive(self, workdir: str, include_files: list[str]) -> BinaryIO:
+    def _inspect_image(self, image: str) -> ImageAttrs:
         """
-        Create a tar.gz archive with the specified files.
+        Inspect the image to get the user and working directory.
+
+        Args:
+            image (str): The tag of the image to inspect.
+
+        Returns:
+            ImageInspection: The inspection of the image.
         """
-        self._ensure_container_running()
+        return ImageAttrs.from_inspection(self.client.api.inspect_image(image))
 
-        logger.info(
-            "Creating tar.gz file with %s files in %s:%s...", len(include_files), self.container.short_id, workdir
-        )
+    def get_label(self, label: str) -> str | None:
+        """
+        Get a label from the container.
 
-        tar_path = f"{workdir}/changed_files.tar.gz"
-        result = self.container.exec_run(f"tar -czf {tar_path} -C {workdir} {' '.join(include_files)}")
+        Args:
+            label (str): The label to get.
 
-        if result.exit_code != 0:
-            logger.debug(
-                "Failed to create tar.gz file with changed files in %s:%s (exit code %s) -> %s",
-                self.container.short_id,
-                workdir,
-                result.exit_code,
-                result.output.decode(),
-            )
-            raise RuntimeError(
-                f"Failed to create tar.gz file with changed files in {self.container.short_id}:{workdir} "
-                f"(exit code {result.exit_code}) -> {result.output.decode()}"
-            )
-
-        return self.copy_from_runtime(tar_path)
+        Returns:
+            str | None: The value of the label, or None if the label is not set.
+        """
+        return self.container.attrs["Config"].get("Labels", {}).get(label)

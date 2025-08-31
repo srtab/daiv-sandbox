@@ -7,18 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.2.0] - 2025-08-31
+
 ### Added
 
+- Added `extract_patch` parameter to allow extracting a patch with the changes made by the executed commands.
 - Added `fail_fast` parameter to allow stopping execution immediately if any command fails.
+- Added build and push the Docker image to GitHub Container Registry on push to main branch.
 
 ### Changed
 
+- Changed run commands endpoint to use session like endpoints. Now it's possible to run multiple commands through multiple requests using the same session. **Breaking change.**
+- The response of the run commands endpoint now contains the patch of the changes made by the executed commands, instead of the full archive with the changed files. **Breaking change.**
+- Updated documentation in `README.md` to reflect the new changes.
 - Ignored `directory "/run/secrets" does not exist` warning.
+- Updated dependencies.
 
 ### Fixed
 
 - Fixed logging configuration to avoid logging health check requests to the console.
-- Fixed `dependencies` parameter on abstract method `run_code` in `LanguageManager` class.
+
+### Removed
+
+- Removed support to run arbitrary code. **Breaking change.**
 
 ## [0.1.1] - 2025-05-13
 
@@ -227,7 +238,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/srtab/daiv-sandbox/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.10...v0.1.0
 [0.1.0-rc.10]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.9...v0.1.0-rc.10

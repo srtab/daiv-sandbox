@@ -6,7 +6,9 @@
 
 ## What is `daiv-sandbox`?
 
-`daiv-sandbox` is a FastAPI application designed to securely execute arbitrary commands and untrusted code within a controlled environment. Each execution is isolated in a transient Docker container, which is automatically created and destroyed with every request, ensuring a clean and secure execution space. It is designed to be used as a code/commands executor for [DAIV](https://github.com/srtab/daiv).
+`daiv-sandbox` is a FastAPI application designed to securely execute arbitrary commands within a controlled environment. Each execution is isolated in a transient Docker container ensuring a clean and secure execution space. It is designed to be used as a bash commands executor for [DAIV](https://github.com/srtab/daiv).
+
+This is very useful to increase the capabilities of an AI agent with bash commands execution capabilities. For instance, you can use it to apply formatting changes to a repository codebase like running `black`, `isort`, `ruff`, `prettier`, or update dependencies, lock files, etc...
 
 To enhance security, `daiv-sandbox` leverages [`gVisor`](https://github.com/google/gvisor) as its container runtime. This provides an additional layer of protection by restricting the running code's ability to interact with the host system, thereby minimizing the risk of sandbox escape.
 
@@ -45,41 +47,30 @@ $ docker run --rm -d -p 8000:8000 -e DAIV_SANDBOX_API_KEY=my-secret-api-key -e D
 
 All settings are configurable via environment variables. The available settings are:
 
-| Environment Variable                   | Description                                                 | Options/Default                                                             |
-| -------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------- |
-| **DAIV_SANDBOX_API_KEY**               | The API key required to access the sandbox API.             |                                                                             |
-| **DAIV_SANDBOX_ENVIRONMENT**           | The deployment environment.                                 | Options: `local`, `production`<br>Default: "production"                     |
-| **DAIV_SANDBOX_SENTRY_DSN**            | The DSN for Sentry error tracking.                          | Optional                                                                    |
-| **DAIV_SANDBOX_SENTRY_ENABLE_TRACING** | Whether to enable tracing for Sentry error tracking.        | Default: False                                                              |
-| **DAIV_SANDBOX_MAX_EXECUTION_TIME**    | The maximum allowed execution time for commands in seconds. | Default: 600                                                                |
-| **DAIV_SANDBOX_RUNTIME**               | The container runtime to use.                               | Options: `runc`, `runsc`<br>Default: "runc"                                 |
-| **DAIV_SANDBOX_KEEP_TEMPLATE**         | Whether to keep the execution template after finishing.     | Default: False                                                              |
-| **DAIV_SANDBOX_HOST**                  | The host to bind the service to.                            | Default: "0.0.0.0"                                                          |
-| **DAIV_SANDBOX_PORT**                  | The port to bind the service to.                            | Default: 8000                                                               |
-| **DAIV_SANDBOX_LOG_LEVEL**             | The log level to use.                                       | Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`<br>Default: "INFO" |
+| Environment Variable                   | Description                                          | Options/Default                                                             |
+| -------------------------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------- |
+| **DAIV_SANDBOX_API_KEY**               | The API key required to access the sandbox API.      |                                                                             |
+| **DAIV_SANDBOX_ENVIRONMENT**           | The deployment environment.                          | Options: `local`, `production`<br>Default: "production"                     |
+| **DAIV_SANDBOX_SENTRY_DSN**            | The DSN for Sentry error tracking.                   | Optional                                                                    |
+| **DAIV_SANDBOX_SENTRY_ENABLE_TRACING** | Whether to enable tracing for Sentry error tracking. | Default: False                                                              |
+| **DAIV_SANDBOX_RUNTIME**               | The container runtime to use.                        | Options: `runc`, `runsc`<br>Default: "runc"                                 |
+| **DAIV_SANDBOX_HOST**                  | The host to bind the service to.                     | Default: "0.0.0.0"                                                          |
+| **DAIV_SANDBOX_PORT**                  | The port to bind the service to.                     | Default: 8000                                                               |
+| **DAIV_SANDBOX_LOG_LEVEL**             | The log level to use.                                | Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`<br>Default: "INFO" |
 
 ## Usage
 
-### Running Commands
+`daiv-sandbox` provides a REST API to interact with. Here is a quick overview of the available endpoints:
 
-`daiv-sandbox` provides a REST API that can be used to execute arbitrary commands on a provided archive, for instance, a `tar.gz` archive containing a repository codebase. The archive is extracted to a temporary directory and the commands are executed in the root of the extracted directory. The output of the commands is returned in the response along with a list of changed files by the last command.
+- `POST /session/`: Start a sandbox session.
+- `POST /session/{session_id}/`: Run commands on the sandbox session.
+- `DELETE /session/{session_id}/`: Close the sandbox session.
 
-By default, all commands are executed sequentially regardless of their exit codes. However, you can enable fail-fast behavior by setting the `fail_fast` parameter to `true`, which will stop execution immediately if any command fails (returns a non-zero exit code).
+### Starting a Sandbox Session
 
-This is very useful to increase the capabilities of an AI agent with code editing capabilities. For instance, you can use it to apply formatting changes to a repository codebase like running `black`, `isort`, `ruff`, `prettier`, etc...
+To start a sandbox session, you need to call the `POST /session/` endpoint. If a Docker image is provided, it will be pulled from the registry. If a Dockerfile is provided, it will be built from the Dockerfile.
 
-The following table describes the parameters for the `run/commands` endpoint:
-
-| Parameter    | Description                                         | Required | Valid Values                         |
-| ------------ | --------------------------------------------------- | -------- | ------------------------------------ |
-| `run_id`     | The unique identifier for the run.                  | Yes      | Any UUID4                            |
-| `base_image` | The base image to use for the container.            | Yes      | Any valid Docker image               |
-| `archive`    | The archive to extract and execute the commands on. | Yes      | Base64 encoded `tar.gz` archive      |
-| `commands`   | The commands to execute.                            | Yes      | List of strings                      |
-| `fail_fast`  | Stop execution if any command fails.                | No       | `true` or `false` (default: `false`) |
-
-> [!WARNING]
-> The `base_image` need to be a ditro image. Distroless images will not work as there is no shell available in the container to maintain the image running indefinitely.
+After image is pulled or built, the container will be created and started, along with an helper container that will be used to extract the patch of the changed files.
 
 Here is an example using `curl`:
 
@@ -87,9 +78,74 @@ Here is an example using `curl`:
 $ curl -X POST \
   -H "Content-Type: application/json" \
   -H "X-API-KEY: notsosecret" \
-  -d "{\"run_id\": \"550e8400-e29b-41d4-a716-446655440000\", \"base_image\": \"python:3.12\", \"archive\": \"$(base64 -w 0 django-webhooks-master.tar.gz)\", \"commands\": [\"ls -la\"], \"fail_fast\": true}" \
-  http://localhost:8888/api/v1/run/commands/
+  -d "{\"base_image\": \"python:3.12\"}" \
+  http://localhost:8000/api/v1/session/
+```
 
+The response will be a JSON object with the following structure containing the session ID:
+
+```json
+{
+  "session_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+The following table describes the parameters for the `session/` endpoint:
+
+| Parameter    | Description                              | Required | Valid Values           |
+| ------------ | ---------------------------------------- | -------- | ---------------------- |
+| `base_image` | The base image to use for the container. | No       | Any valid Docker image |
+| `dockerfile` | The Dockerfile to use for the container. | No       | Any valid Dockerfile   |
+
+> [!NOTE]
+> You need to provide either `base_image` or `dockerfile`. If both are provided, the `base_image` will be used.
+
+> [!WARNING]
+> The `base_image` need to be a distro image. Distroless images will not work as there is no shell available in the container to maintain the image running indefinitely.
+
+Here is an example using `python`:
+
+```python
+import httpx
+
+response = httpx.post(
+    "http://localhost:8000/api/v1/session/",
+    headers={"X-API-KEY": "notsosecret"},
+    json={"base_image": "python:3.12"},
+)
+
+response.raise_for_status()
+resp = response.json()
+
+print(resp["session_id"])
+```
+
+### Running Commands
+
+To run commands on a sandbox session, you need to call the `POST /session/{session_id}/` endpoint using the session ID returned when starting the session.
+
+This endpoint can be used to execute arbitrary commands on a provided archive, for instance, a `tar.gz` archive containing a repository codebase. The archive is extracted to a temporary directory and the commands are executed in the root of the extracted directory. The output of each command is returned in the response along with a patch of the changed files if the `extract_patch` parameter is set to `true` and there were changes made by the commands.
+
+By default, all commands are executed sequentially regardless of their exit codes. However, you can enable fail-fast behavior by setting the `fail_fast` parameter to `true`, which will stop execution immediately if any command fails (returns a non-zero exit code).
+
+The following table describes the parameters for the `POST /session/{session_id}/` endpoint:
+
+| Parameter       | Description                                                     | Required | Valid Values                         |
+| --------------- | --------------------------------------------------------------- | -------- | ------------------------------------ |
+| `archive`       | The archive to extract and execute the commands on.             | Yes      | Base64 encoded `tar.gz` archive      |
+| `commands`      | The commands to execute.                                        | Yes      | List of strings                      |
+| `fail_fast`     | Stop execution if any command fails.                            | No       | `true` or `false` (default: `false`) |
+| `extract_patch` | Extract a patch with the changes made by the executed commands. | No       | `true` or `false` (default: `false`) |
+| `workdir`       | The working directory to use for the commands.                  | No       | Any valid directory                  |
+
+Here is an example using `curl`:
+
+```sh
+$ curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-API-KEY: notsosecret" \
+  -d "{\"archive\": \"$(base64 -w 0 django-webhooks-master.tar.gz)\", \"commands\": [\"ls -la\"], \"fail_fast\": true}" \
+  http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/
 ```
 
 The response will be a JSON object with the following structure:
@@ -103,7 +159,7 @@ The response will be a JSON object with the following structure:
       "exit_code": 0
     }
   ],
-  "archive": null // If no file changes were made, the archive is not returned
+  "patch": null // If no file changes were made, the patch is not returned
 }
 ```
 
@@ -112,71 +168,54 @@ Here is an example using `python`:
 ```python
 import httpx
 import tarfile
+import base64
+import io
 
+# Create tar archive first
+tarstream = io.BytesIO()
+with tarfile.open(fileobj=tarstream, mode="w:gz") as tar:
+    # Add files to tar...
+    pass
 
-with tarfile.open(fileobj=tarstream, mode="r:*") as tar:
-    response = httpx.post(
-        "http://localhost:8888/api/v1/run/commands/",
-        headers={"X-API-KEY": "notsosecret"},
-        json={
-            "run_id": "550e8400-e29b-41d4-a716-446655440000",
-            "base_image": "python:3.12",
-            "archive": base64.b64encode(tarstream.getvalue()).decode(),
-            "commands": ["ls -la"],
-            "fail_fast": True,
-        },
-    )
-    response.raise_for_status()
-    resp = response.json()
-```
-
-### Running Code
-
-`daiv-sandbox` also provides a REST API that can be used to execute arbitrary code. The code is executed in a temporary directory and the output of the code is returned in the response.
-
-The following table describes the parameters for the `run/code` endpoint:
-
-| Parameter      | Description                                   | Required | Valid Values    |
-| -------------- | --------------------------------------------- | -------- | --------------- |
-| `run_id`       | The unique identifier for the run.            | Yes      | Any UUID4       |
-| `language`     | The language to use for the code execution.   | Yes      | `python`        |
-| `dependencies` | The dependencies to install in the container. | No       | List of strings |
-| `code`         | The code to execute.                          | Yes      | String          |
-
-> [!NOTE]
-> Currently, only `python` language is supported. But it's planned to support more languages in the future. Reach out to us or open a PR if you need a specific language.
-
-Here is an example using `curl`:
-
-```sh
-$ curl -X POST \
-  -H "Content-Type: application/json" \
-  -H "X-API-KEY: notsosecret" \
-  -d "{\"run_id\": \"550e8400-e29b-41d4-a716-446655440000\", \"language\": \"python\", \"dependencies\": [\"requests\"], \"code\": \"print('Hello, World!')\"}" \
-  http://localhost:8888/api/v1/run/code/
-```
-
-The response will be a JSON object with the following structure:
-
-```json
-{
-  "output": "Hello, World!"
-}
-```
-
-Here is an example using `python`:
-
-```python
-import httpx
-
+tarstream.seek(0)
 response = httpx.post(
-    "http://localhost:8888/api/v1/run/code/",
+    "http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/",
     headers={"X-API-KEY": "notsosecret"},
-    json={"run_id": "550e8400-e29b-41d4-a716-446655440000", "language": "python", "dependencies": ["requests"], "code": "print('Hello, World!')"},
+    json={
+        "archive": base64.b64encode(tarstream.getvalue()).decode(),
+        "commands": ["ls -la"],
+        "fail_fast": True,
+    },
 )
+
 response.raise_for_status()
 resp = response.json()
+
+print(resp["results"][0]["output"])
+print(resp["patch"])
 ```
+
+> [!TIP]
+> To apply the patch to the original repository/directory, you can use the `git apply` command. Don't need to be a git repository, it can be any directory.
+>
+> ```sh
+> $ git apply --whitespace=nowarn --reject < patch.diff
+> ```
+
+### Closing a Sandbox Session
+
+To close a sandbox session, you need to call the `DELETE /session/{session_id}/` endpoint using the session ID returned when starting the session.
+
+```sh
+$ curl -X DELETE \
+  -H "X-API-KEY: notsosecret" \
+  http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/
+```
+
+The response will be an empty body with a status code of 204.
+
+> [!TIP]
+> Why closing a sandbox session is important? Because it will remove the container from the host machine, freeing up resources.
 
 ## Contributing
 
