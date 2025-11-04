@@ -1,10 +1,8 @@
 import warnings
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
+from pydantic import HttpUrl, SecretStr  # noqa: TC002
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-if TYPE_CHECKING:
-    from pydantic import HttpUrl, SecretStr
 
 warnings.filterwarnings(
     "ignore", message=r'directory "/run/secrets" does not exist', module="pydantic_settings.sources.providers.secrets"
