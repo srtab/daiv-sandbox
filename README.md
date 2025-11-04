@@ -92,10 +92,11 @@ The response will be a JSON object with the following structure containing the s
 
 The following table describes the parameters for the `session/` endpoint:
 
-| Parameter    | Description                              | Required | Valid Values           |
-| ------------ | ---------------------------------------- | -------- | ---------------------- |
-| `base_image` | The base image to use for the container. | No       | Any valid Docker image |
-| `dockerfile` | The Dockerfile to use for the container. | No       | Any valid Dockerfile   |
+| Parameter       | Description                                                     | Required | Valid Values                         |
+| --------------- | --------------------------------------------------------------- | -------- | ------------------------------------ |
+| `base_image`    | The base image to use for the container.                        | No       | Any valid Docker image               |
+| `dockerfile`    | The Dockerfile to use for the container.                        | No       | Any valid Dockerfile                 |
+| `extract_patch` | Extract a patch with the changes made by the executed commands. | No       | `true` or `false` (default: `false`) |
 
 > [!NOTE]
 > You need to provide either `base_image` or `dockerfile`. If both are provided, the `base_image` will be used.
@@ -124,19 +125,18 @@ print(resp["session_id"])
 
 To run commands on a sandbox session, you need to call the `POST /session/{session_id}/` endpoint using the session ID returned when starting the session.
 
-This endpoint can be used to execute arbitrary commands on a provided archive, for instance, a `tar.gz` archive containing a repository codebase. The archive is extracted to a temporary directory and the commands are executed in the root of the extracted directory. The output of each command is returned in the response along with a patch of the changed files if the `extract_patch` parameter is set to `true` and there were changes made by the commands.
+This endpoint can be used to execute arbitrary commands on a provided archive, for instance, a `tar.gz` archive containing a repository codebase. The archive is extracted to a temporary directory and the commands are executed in the root of the extracted directory. The output of each command is returned in the response along with a patch of the changed files if the `extract_patch` parameter is set to `true` in the request to start the session and there were changes made by the commands.
 
 By default, all commands are executed sequentially regardless of their exit codes. However, you can enable fail-fast behavior by setting the `fail_fast` parameter to `true`, which will stop execution immediately if any command fails (returns a non-zero exit code).
 
 The following table describes the parameters for the `POST /session/{session_id}/` endpoint:
 
-| Parameter       | Description                                                     | Required | Valid Values                         |
-| --------------- | --------------------------------------------------------------- | -------- | ------------------------------------ |
-| `archive`       | The archive to extract and execute the commands on.             | Yes      | Base64 encoded `tar.gz` archive      |
-| `commands`      | The commands to execute.                                        | Yes      | List of strings                      |
-| `fail_fast`     | Stop execution if any command fails.                            | No       | `true` or `false` (default: `false`) |
-| `extract_patch` | Extract a patch with the changes made by the executed commands. | No       | `true` or `false` (default: `false`) |
-| `workdir`       | The working directory to use for the commands.                  | No       | Any valid directory                  |
+| Parameter   | Description                                         | Required | Valid Values                         |
+| ----------- | --------------------------------------------------- | -------- | ------------------------------------ |
+| `archive`   | The archive to extract and execute the commands on. | Yes      | Base64 encoded `tar.gz` archive      |
+| `commands`  | The commands to execute.                            | Yes      | List of strings                      |
+| `fail_fast` | Stop execution if any command fails.                | No       | `true` or `false` (default: `false`) |
+| `workdir`   | The working directory to use for the commands.      | No       | Any valid directory                  |
 
 Here is an example using `curl`:
 

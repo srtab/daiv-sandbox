@@ -1,7 +1,7 @@
 import warnings
 from typing import Literal
 
-from pydantic import HttpUrl, SecretStr
+from pydantic import HttpUrl, SecretStr  # noqa: TC002
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 warnings.filterwarnings(
@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     RUNTIME: Literal["runc", "runsc"] = "runc"
 
     # Git
-    GIT_IMAGE: str = "alpine/git"
+    GIT_IMAGE: str = "alpine/git:2.49.1"
 
 
 settings = Settings()  # type: ignore

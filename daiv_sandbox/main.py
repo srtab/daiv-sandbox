@@ -1,6 +1,6 @@
 import base64
 import io
-from pathlib import Path
+import logging
 from typing import Annotated, Literal
 
 import sentry_sdk
@@ -19,8 +19,9 @@ from daiv_sandbox.schemas import (
     StartSessionRequest,
     StartSessionResponse,
 )
-from daiv_sandbox.scripts import CMD_EPHEMERAL_REPO, CMD_GIT_DIFF_BINARY
 from daiv_sandbox.sessions import SandboxDockerSession
+
+logger = logging.getLogger(__name__)
 
 HEADER_API_KEY_NAME = "X-API-Key"
 
@@ -29,6 +30,9 @@ DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL = "daiv.sandbox.patch_extractor_se
 
 TYPE_PATCH_EXTRACTOR = "patch_extractor"
 TYPE_CMD_EXECUTOR = "cmd_executor"
+
+CMD_GIT_DIFF_BINARY = """git config --global --add safe.directory {workdir}
+git -c core.quotepath=false diff --binary HEAD"""
 
 
 # Configure Sentry
@@ -101,16 +105,16 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
 
     This session ID ensures a consistent execution environment for the commands, including files and directories.
     """
-    patch_extractor = SandboxDockerSession.start(
-        image=settings.GIT_IMAGE, labels={DAIV_SANDBOX_TYPE_LABEL: TYPE_PATCH_EXTRACTOR}, network_mode="none"
-    )
+    cmd_labels = {DAIV_SANDBOX_TYPE_LABEL: TYPE_CMD_EXECUTOR}
+
+    if request.extract_patch:
+        patch_extractor = SandboxDockerSession.start(
+            image=settings.GIT_IMAGE, labels={DAIV_SANDBOX_TYPE_LABEL: TYPE_PATCH_EXTRACTOR}, network_mode="none"
+        )
+        cmd_labels[DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL] = patch_extractor.session_id
+
     cmd_executor = SandboxDockerSession.start(
-        image=request.base_image,
-        dockerfile=request.dockerfile,
-        labels={
-            DAIV_SANDBOX_TYPE_LABEL: TYPE_CMD_EXECUTOR,
-            DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL: patch_extractor.session_id,
-        },
+        image=request.base_image, dockerfile=request.dockerfile, labels=cmd_labels
     )
     return StartSessionResponse(session_id=cmd_executor.session_id)
 
@@ -122,7 +126,9 @@ async def run_on_session(
     api_key: str = Depends(get_api_key),
 ) -> RunResponse:
     """
-    Run a set of commands on a session and return the results, including the archive with changed files.
+    Run a set of commands on a session and return the results, including the patch of the changed files if
+    the `extract_patch` parameter is set to `true` in the request to start the session and there were changes
+    made by the commands.
     """
     cmd_executor = SandboxDockerSession(session_id=session_id)
 
@@ -145,41 +151,41 @@ async def run_on_session(
         if request.fail_fast and result.exit_code != 0:
             break
 
-    if request.archive and request.extract_patch:
-        patch_extractor = SandboxDockerSession(
-            session_id=cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
+    if request.archive and (
+        extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
+    ):
+        patch_extractor = SandboxDockerSession(session_id=extract_patch_session_id)
+
+        patch_extractor.copy_to_container(cmd_executor.copy_from_container(request.workdir), dest="/workdir")
+        patch_result = patch_extractor.execute_command(
+            CMD_GIT_DIFF_BINARY.format(workdir=f"/workdir/{request.workdir}"), workdir=f"/workdir/{request.workdir}"
         )
 
-        patch_extractor.copy_to_container(io.BytesIO(request.archive), dest="/a")
-        patch_extractor.copy_to_container(cmd_executor.copy_from_container(request.workdir), dest="/b")
+        if patch_result.exit_code != 0:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to extract patch. Confirm that the archive is a git repository.",
+            )
 
-        if patch_extractor.execute_command(CMD_EPHEMERAL_REPO.format(workdir=request.workdir)).exit_code != 0:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to extract patch.")
-
-        patch = patch_extractor.execute_command(
-            CMD_GIT_DIFF_BINARY,
-            workdir="/tmp/work",  # noqa: S108
-        ).output
-
-        base64_patch = base64.b64encode(patch.encode()).decode()
+        base64_patch = base64.b64encode(patch_result.output.encode()).decode()
 
     return RunResponse(results=results, patch=base64_patch)
 
 
 @app.delete("/session/{session_id}/", responses=common_responses, name="Close a session")
 async def close_session(
-    session_id: Annotated[str, Path(title="The ID of the session to close")], api_key: str = Depends(get_api_key)
+    session_id: Annotated[str, FastAPIPath(title="The ID of the session to close")], api_key: str = Depends(get_api_key)
 ) -> Response:
     """
     Close a session by removing the Docker container.
     """
     cmd_executor = SandboxDockerSession(session_id=session_id)
-    patch_extractor = SandboxDockerSession(
-        session_id=cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
-    )
+
+    if patch_extractor_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
+        patch_extractor = SandboxDockerSession(session_id=patch_extractor_session_id)
+        patch_extractor.remove_container()
 
     cmd_executor.remove_container()
-    patch_extractor.remove_container()
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

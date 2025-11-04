@@ -12,6 +12,9 @@ class StartSessionRequest(BaseModel):
         default=None, description="Docker image to be used as the base image for the sandbox."
     )
     dockerfile: str | None = Field(default=None, description="Dockerfile content to be used to build the image.")
+    extract_patch: bool = Field(
+        default=False, description="Whether to extract a patch with the changes made by the executed commands."
+    )
 
     @classmethod
     @field_validator("base_image", "dockerfile")
@@ -36,9 +39,6 @@ class RunRequest(BaseModel):
     )
     archive: Base64Bytes | None = Field(
         default=None, description="Base64-encoded archive with files to be copied to the sandbox."
-    )
-    extract_patch: bool = Field(
-        default=False, description="Extract a patch with the changes made by the executed commands."
     )
     fail_fast: bool = Field(
         default=False,
@@ -70,7 +70,7 @@ class ImageAttrs(BaseModel):
     working_dir: str = Field(description="Working directory of the image.")
 
     @classmethod
-    def from_inspection(cls, inspection: dict) -> "ImageAttrs":
+    def from_inspection(cls, inspection: dict) -> ImageAttrs:
         user = inspection["Config"]["User"]
         working_dir = inspection["Config"]["WorkingDir"]
 

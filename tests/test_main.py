@@ -17,6 +17,8 @@ def mock_session():
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session:
         mock_session = mock_session(session_id=str(uuid.uuid4()))
         mock_session._get_container.return_value = Mock(status="running")
+        # By default, no patch extraction (no label set)
+        mock_session.get_label.return_value = None
         yield mock_session
 
 

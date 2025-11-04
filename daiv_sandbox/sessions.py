@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import logging
-import signal
 import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -18,13 +17,6 @@ if TYPE_CHECKING:
     from docker.models.containers import Container
 
 logger = logging.getLogger("daiv_sandbox")
-
-
-def handler(signum, frame):
-    raise TimeoutError("Execution timed out")
-
-
-signal.signal(signal.SIGALRM, handler)
 
 
 class Session(ABC):
@@ -211,12 +203,16 @@ class SandboxDockerSession(Session):
         Returns:
             BinaryIO: The copied archive.
         """
-        logger.info("Copying archive from %s:%s...", self.container.short_id, host_dir)
+        from_dir = (
+            host_dir if Path(host_dir).is_absolute() else (Path(self.image_attrs.working_dir) / host_dir).as_posix()
+        )
 
-        bits, stat = self.container.get_archive((Path(self.image_attrs.working_dir) / host_dir).as_posix())
+        logger.info("Copying archive from %s:%s...", self.container.short_id, from_dir)
+
+        bits, stat = self.container.get_archive(from_dir)
 
         if stat["size"] == 0:
-            raise FileNotFoundError(f"File {host_dir} not found in the container {self.container.short_id}")
+            raise FileNotFoundError(f"File {from_dir} not found in the container {self.container.short_id}")
 
         return io.BytesIO(b"".join(bits))
 
@@ -253,12 +249,8 @@ class SandboxDockerSession(Session):
         if self.container.put_archive(dest, tardata.getvalue()):
             user = f"{self.image_attrs.user}:{self.image_attrs.user}"
 
-            logger.debug("Normalizing folder permissions '%s' for %s:%s", user, self.container.short_id, dest)
-
-            # We need to normalize folder permissions.
+            # Normalize folder permissions.
             self.container.exec_run(["chown", "-R", user, "--", dest], privileged=True, user="root")
-
-            logger.debug("Successfully copied archive to %s:%s", self.container.short_id, dest)
         else:
             raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{dest}")
 
@@ -274,9 +266,13 @@ class SandboxDockerSession(Session):
         Returns:
             RunResult: The result of the command.
         """
-        command_workdir = (
-            (Path(self.image_attrs.working_dir) / workdir).as_posix() if workdir else self.image_attrs.working_dir
-        )
+        command_workdir = self.image_attrs.working_dir
+
+        if workdir:
+            if Path(workdir).is_absolute():
+                command_workdir = workdir
+            else:
+                command_workdir = (Path(self.image_attrs.working_dir) / workdir).as_posix()
 
         logger.info("Executing command in %s:%s -> %s ", self.container.short_id, command_workdir, command)
 
