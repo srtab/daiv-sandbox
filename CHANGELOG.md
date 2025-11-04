@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migrated project from Python 3.12 to Python 3.14. **Breaking change.**
 - Updated dependencies.
 
+### Fixed
+
+- Fixed `.daiv.yml` schema to the newer version of `daiv`.
+
 ## [0.2.0] - 2025-08-31
 
 ### Added
