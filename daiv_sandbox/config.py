@@ -1,8 +1,10 @@
 import warnings
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from pydantic import HttpUrl, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+if TYPE_CHECKING:
+    from pydantic import HttpUrl, SecretStr
 
 warnings.filterwarnings(
     "ignore", message=r'directory "/run/secrets" does not exist', module="pydantic_settings.sources.providers.secrets"
@@ -34,7 +36,7 @@ class Settings(BaseSettings):
     RUNTIME: Literal["runc", "runsc"] = "runc"
 
     # Git
-    GIT_IMAGE: str = "alpine/git"
+    GIT_IMAGE: str = "alpine/git:2.49.1"
 
 
 settings = Settings()  # type: ignore
