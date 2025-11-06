@@ -151,7 +151,7 @@ def test_execute_command(mock_docker_client):
     result = session.execute_command("echo hello")
     assert result.exit_code == 0
     assert result.output == "output"
-    session.container.exec_run.assert_called_once_with("echo hello", workdir="/")
+    session.container.exec_run.assert_called_once_with(["/bin/sh", "-c", "echo hello"], workdir="/")
 
 
 @patch("daiv_sandbox.sessions.ImageAttrs.from_inspection")
