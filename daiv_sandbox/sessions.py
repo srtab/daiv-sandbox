@@ -165,7 +165,7 @@ class SandboxDockerSession(Session):
         container = self.client.containers.run(
             image,
             entrypoint="/bin/sh",
-            command=["-lc", "sleep infinity"],
+            command=["-lc", "sleep 600"],  # 10 minutes
             detach=True,
             tty=True,
             runtime=settings.RUNTIME,
@@ -226,33 +226,36 @@ class SandboxDockerSession(Session):
             dest (str | None): The destination path to copy the archive to. Defaults to the working directory of the
                 image.
         """
-        dest = dest or self.image_attrs.working_dir
+        to_dir = self.image_attrs.working_dir
 
-        logger.info("Creating directory %s:%s...", self.container.short_id, dest)
+        if dest:
+            to_dir = dest if Path(dest).is_absolute() else (Path(to_dir) / dest).as_posix()
 
-        rm_result = self.container.exec_run(["rm", "-rf", "--", dest])
+        logger.info("Creating directory %s:%s...", self.container.short_id, to_dir)
+
+        rm_result = self.container.exec_run(["rm", "-rf", "--", f"{to_dir}/*"])
         if rm_result.exit_code != 0:
             raise RuntimeError(
-                f"Failed to remove directory {self.container.short_id}:{dest} "
+                f"Failed to remove directory {self.container.short_id}:{to_dir} "
                 f"(exit code {rm_result.exit_code}) -> {rm_result.output}"
             )
 
-        mkdir_result = self.container.exec_run(["mkdir", "-p", "--", dest])
+        mkdir_result = self.container.exec_run(["mkdir", "-p", "--", to_dir])
         if mkdir_result.exit_code != 0:
             raise RuntimeError(
-                f"Failed to create directory {self.container.short_id}:{dest} "
+                f"Failed to create directory {self.container.short_id}:{to_dir} "
                 f"(exit code {mkdir_result.exit_code}) -> {mkdir_result.output}"
             )
 
-        logger.info("Copying archive to %s:%s...", self.container.short_id, dest)
+        logger.info("Copying archive to %s:%s...", self.container.short_id, to_dir)
 
-        if self.container.put_archive(dest, tardata.getvalue()):
+        if self.container.put_archive(to_dir, tardata.getvalue()):
             user = f"{self.image_attrs.user}:{self.image_attrs.user}"
 
             # Normalize folder permissions.
-            self.container.exec_run(["chown", "-R", user, "--", dest], privileged=True, user="root")
+            self.container.exec_run(["chown", "-R", user, "--", to_dir], privileged=True, user="root")
         else:
-            raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{dest}")
+            raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{to_dir}")
 
     def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
         """
@@ -276,7 +279,7 @@ class SandboxDockerSession(Session):
 
         logger.info("Executing command in %s:%s -> %s ", self.container.short_id, command_workdir, command)
 
-        result = self.container.exec_run(["/bin/sh", "-lc", command], workdir=command_workdir)
+        result = self.container.exec_run(command, workdir=command_workdir)
 
         if result.exit_code != 0:
             if logger.isEnabledFor(logging.DEBUG):
