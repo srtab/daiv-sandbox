@@ -89,7 +89,7 @@ def test__start_container(mock_docker_client):
     mock_docker_client.containers.run.assert_called_once_with(
         "test-image",
         entrypoint="/bin/sh",
-        command=["-lc", "sleep infinity"],
+        command=["-lc", "sleep 600"],
         detach=True,
         tty=True,
         runtime=settings.RUNTIME,
@@ -126,7 +126,7 @@ def test_copy_to_runtime_creates_directory(mock_docker_client):
     ]
     with patch("io.BytesIO", return_value=MagicMock()) as mock_data:
         session.copy_to_container(mock_data)
-        session.container.exec_run.assert_any_call(["rm", "-rf", "--", "/path/to/dest"])
+        session.container.exec_run.assert_any_call(["rm", "-rf", "--", "/path/to/dest/*"])
         session.container.exec_run.assert_any_call(["mkdir", "-p", "--", "/path/to/dest"])
         session.container.exec_run.assert_any_call(
             ["chown", "-R", "root:root", "--", "/path/to/dest"], privileged=True, user="root"
@@ -151,7 +151,7 @@ def test_execute_command(mock_docker_client):
     result = session.execute_command("echo hello")
     assert result.exit_code == 0
     assert result.output == "output"
-    session.container.exec_run.assert_called_once_with(["/bin/sh", "-lc", "echo hello"], workdir="/")
+    session.container.exec_run.assert_called_once_with("echo hello", workdir="/")
 
 
 @patch("daiv_sandbox.sessions.ImageAttrs.from_inspection")
