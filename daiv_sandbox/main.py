@@ -31,8 +31,8 @@ DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL = "daiv.sandbox.patch_extractor_se
 TYPE_PATCH_EXTRACTOR = "patch_extractor"
 TYPE_CMD_EXECUTOR = "cmd_executor"
 
-CMD_GIT_DIFF_BINARY = """git config --global --add safe.directory {workdir}
-git -c core.quotepath=false diff --binary HEAD"""
+CMD_GIT_CONFIG_SAFE_DIRECTORY = "git config --global --add safe.directory {workdir}"
+CMD_GIT_DIFF_BINARY = "git -c core.quotepath=false diff --binary HEAD"
 
 
 # Configure Sentry
@@ -154,12 +154,14 @@ async def run_on_session(
     if request.archive and (
         extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
     ):
-        patch_extractor = SandboxDockerSession(session_id=extract_patch_session_id)
+        patch_workdir = f"/workdir/{request.workdir}"
 
+        patch_extractor = SandboxDockerSession(session_id=extract_patch_session_id)
         patch_extractor.copy_to_container(cmd_executor.copy_from_container(request.workdir), dest="/workdir")
-        patch_result = patch_extractor.execute_command(
-            CMD_GIT_DIFF_BINARY.format(workdir=f"/workdir/{request.workdir}"), workdir=f"/workdir/{request.workdir}"
+        patch_extractor.execute_command(
+            CMD_GIT_CONFIG_SAFE_DIRECTORY.format(workdir=patch_workdir), workdir=patch_workdir
         )
+        patch_result = patch_extractor.execute_command(CMD_GIT_DIFF_BINARY, workdir=patch_workdir)
 
         if patch_result.exit_code != 0:
             raise HTTPException(
