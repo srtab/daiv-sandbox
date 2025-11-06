@@ -279,7 +279,7 @@ class SandboxDockerSession(Session):
 
         logger.info("Executing command in %s:%s -> %s ", self.container.short_id, command_workdir, command)
 
-        result = self.container.exec_run(command, workdir=command_workdir)
+        result = self.container.exec_run(["/bin/sh", "-c", command], workdir=command_workdir)
 
         if result.exit_code != 0:
             if logger.isEnabledFor(logging.DEBUG):
