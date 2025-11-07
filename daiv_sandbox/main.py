@@ -19,6 +19,7 @@ from daiv_sandbox.schemas import (
     StartSessionRequest,
     StartSessionResponse,
 )
+from daiv_sandbox.scripts import CMD_GIT_DIFF_EXTRACTOR_SCRIPT
 from daiv_sandbox.sessions import SandboxDockerSession
 
 logger = logging.getLogger(__name__)
@@ -31,8 +32,7 @@ DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL = "daiv.sandbox.patch_extractor_se
 TYPE_PATCH_EXTRACTOR = "patch_extractor"
 TYPE_CMD_EXECUTOR = "cmd_executor"
 
-CMD_GIT_CONFIG_SAFE_DIRECTORY = "git config --global --add safe.directory {workdir}"
-CMD_GIT_DIFF_BINARY = "git -c core.quotepath=false diff --binary HEAD"
+NO_CHANGES_MESSAGE = "nothing to commit, working tree clean"
 
 
 # Configure Sentry
@@ -154,22 +154,33 @@ async def run_on_session(
     if request.archive and (
         extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
     ):
-        patch_workdir = f"/workdir/{request.workdir}"
-
         patch_extractor = SandboxDockerSession(session_id=extract_patch_session_id)
-        patch_extractor.copy_to_container(cmd_executor.copy_from_container(request.workdir), dest="/workdir")
-        patch_extractor.execute_command(
-            CMD_GIT_CONFIG_SAFE_DIRECTORY.format(workdir=patch_workdir), workdir=patch_workdir
-        )
-        patch_result = patch_extractor.execute_command(CMD_GIT_DIFF_BINARY, workdir=patch_workdir)
 
-        if patch_result.exit_code != 0:
+        # Clean up old directories and create new ones.
+        patch_extractor.execute_command("rm -rf /workdir/*")
+        patch_extractor.execute_command("mkdir -p /workdir/old /workdir/new")
+        patch_extractor.execute_command("git config --global --add safe.directory /workdir")
+
+        patch_extractor.copy_to_container(io.BytesIO(request.archive), dest="/workdir/old/")
+        patch_extractor.copy_to_container(cmd_executor.copy_from_container(request.workdir), dest="/workdir/new/")
+
+        patch_result = patch_extractor.execute_command(
+            CMD_GIT_DIFF_EXTRACTOR_SCRIPT.format(repo_workdir=request.workdir), workdir="/workdir"
+        )
+
+        if patch_result.exit_code != 0 and NO_CHANGES_MESSAGE not in patch_result.output:
+            logger.error("Failed to extract patch: [%s] %s", patch_result.exit_code, patch_result.output)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to extract patch. Confirm that the archive is a git repository.",
+                detail=(
+                    "Failed to extract patch with the changes made by the commands. Check the logs for more details."
+                ),
             )
 
-        base64_patch = base64.b64encode(patch_result.output.encode()).decode()
+        if NO_CHANGES_MESSAGE in patch_result.output:
+            base64_patch = None
+        else:
+            base64_patch = base64.b64encode(patch_result.output.encode()).decode()
 
     return RunResponse(results=results, patch=base64_patch)
 
