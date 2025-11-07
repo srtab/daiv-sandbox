@@ -233,18 +233,18 @@ class SandboxDockerSession(Session):
 
         logger.info("Creating directory %s:%s...", self.container.short_id, to_dir)
 
-        rm_result = self.container.exec_run(["rm", "-rf", "--", f"{to_dir}/*"])
+        rm_result = self.container.exec_run(["rm", "-rf", "--", f"{to_dir}/*"], privileged=True, user="root")
         if rm_result.exit_code != 0:
             raise RuntimeError(
-                f"Failed to remove directory {self.container.short_id}:{to_dir} "
-                f"(exit code {rm_result.exit_code}) -> {rm_result.output}"
+                f"Failed to remove directory {self.container.short_id}:{to_dir}/*: "
+                f"(exit_code: {rm_result.exit_code}) -> {rm_result.output}"
             )
 
-        mkdir_result = self.container.exec_run(["mkdir", "-p", "--", to_dir])
+        mkdir_result = self.container.exec_run(["mkdir", "-p", "--", to_dir], privileged=True, user="root")
         if mkdir_result.exit_code != 0:
             raise RuntimeError(
-                f"Failed to create directory {self.container.short_id}:{to_dir} "
-                f"(exit code {mkdir_result.exit_code}) -> {mkdir_result.output}"
+                f"Failed to create directory {self.container.short_id}:{to_dir}: "
+                f"(exit_code: {mkdir_result.exit_code}) -> {mkdir_result.output}"
             )
 
         logger.info("Copying archive to %s:%s...", self.container.short_id, to_dir)

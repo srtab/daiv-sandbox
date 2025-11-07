@@ -126,8 +126,8 @@ def test_copy_to_runtime_creates_directory(mock_docker_client):
     ]
     with patch("io.BytesIO", return_value=MagicMock()) as mock_data:
         session.copy_to_container(mock_data)
-        session.container.exec_run.assert_any_call(["rm", "-rf", "--", "/path/to/dest/*"])
-        session.container.exec_run.assert_any_call(["mkdir", "-p", "--", "/path/to/dest"])
+        session.container.exec_run.assert_any_call(["rm", "-rf", "--", "/path/to/dest/*"], privileged=True, user="root")
+        session.container.exec_run.assert_any_call(["mkdir", "-p", "--", "/path/to/dest"], privileged=True, user="root")
         session.container.exec_run.assert_any_call(
             ["chown", "-R", "root:root", "--", "/path/to/dest"], privileged=True, user="root"
         )
