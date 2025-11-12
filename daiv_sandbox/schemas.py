@@ -20,7 +20,7 @@ class StartSessionRequest(BaseModel):
     @field_validator("base_image", "dockerfile")
     def validate_base_image_or_dockerfile(cls, v, values):
         if not v and not values.get("dockerfile"):
-            raise ValueError("Either base_image or dockerfile must be provided. Both cannot be None.")
+            raise ValueError("Either `base_image` or `dockerfile` must be provided. Both cannot be None.")
         return v
 
 

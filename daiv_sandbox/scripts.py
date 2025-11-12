@@ -25,5 +25,5 @@ git -C "$META" --work-tree="$NEW" add -A
 git -C "$META" --work-tree="$NEW" commit -qm "post"
 
 # Emit only this turn's delta (binary-safe, rename-aware)
-git -C "$META" -c diff.renames=true format-patch --stdout --binary "$BASE_COMMIT"..HEAD
+git -C "$META" -c diff.renames=true diff -M --binary "$BASE_COMMIT"..HEAD
 """
