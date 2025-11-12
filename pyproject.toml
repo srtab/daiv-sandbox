@@ -31,7 +31,7 @@ urls.source = "https://github.com/srtab/daiv-sandbox"
 [dependency-groups]
 dev = [
   "mypy==1.18.2",
-  "pre-commit==4.3",
+  "pre-commit==4.4.0",
   "pyopenssl==25.3",
   "pyproject-fmt==2.11.1",
   "pytest-cov==7.0.0",
