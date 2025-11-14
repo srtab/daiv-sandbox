@@ -28,6 +28,7 @@ HEADER_API_KEY_NAME = "X-API-Key"
 
 DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
 DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL = "daiv.sandbox.patch_extractor_session_id"
+DAIV_SANDBOX_PERSIST_WORKDIR_LABEL = "daiv.sandbox.persist_workdir"
 
 TYPE_PATCH_EXTRACTOR = "patch_extractor"
 TYPE_CMD_EXECUTOR = "cmd_executor"
@@ -113,6 +114,9 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         )
         cmd_labels[DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL] = patch_extractor.session_id
 
+    if request.persist_workdir:
+        cmd_labels[DAIV_SANDBOX_PERSIST_WORKDIR_LABEL] = True
+
     cmd_executor = SandboxDockerSession.start(
         image=request.base_image, dockerfile=request.dockerfile, labels=cmd_labels
     )
@@ -140,8 +144,10 @@ async def run_on_session(
     # Results of the commands.
     results: list[RunResult] = []
 
+    persist_workdir = cmd_executor.get_label(DAIV_SANDBOX_PERSIST_WORKDIR_LABEL)
+
     if request.archive:
-        cmd_executor.copy_to_container(io.BytesIO(request.archive))
+        cmd_executor.copy_to_container(io.BytesIO(request.archive), clear_before_copy=not persist_workdir)
 
     for command in request.commands:
         result = cmd_executor.execute_command(command, workdir=request.workdir)

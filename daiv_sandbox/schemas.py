@@ -12,6 +12,7 @@ class StartSessionRequest(BaseModel):
         default=None, description="Docker image to be used as the base image for the sandbox."
     )
     dockerfile: str | None = Field(default=None, description="Dockerfile content to be used to build the image.")
+    persist_workdir: bool = Field(default=False, description="Whether to persist the workdir between commands.")
     extract_patch: bool = Field(
         default=False, description="Whether to extract a patch with the changes made by the executed commands."
     )
