@@ -216,7 +216,7 @@ class SandboxDockerSession(Session):
 
         return io.BytesIO(b"".join(bits))
 
-    def copy_to_container(self, tardata: BinaryIO, dest: str | None = None):
+    def copy_to_container(self, tardata: BinaryIO, dest: str | None = None, clear_before_copy: bool = True):
         """
         Copy a file or directory to a specific path in the container.
 
@@ -225,6 +225,7 @@ class SandboxDockerSession(Session):
             tardata (BinaryIO): The tar archive to be copied to the container.
             dest (str | None): The destination path to copy the archive to. Defaults to the working directory of the
                 image.
+            clear_before_copy (bool): Whether to clear the destination directory before copying the archive.
         """
         to_dir = self.image_attrs.working_dir
 
@@ -233,12 +234,13 @@ class SandboxDockerSession(Session):
 
         logger.info("Creating directory %s:%s...", self.container.short_id, to_dir)
 
-        rm_result = self.container.exec_run(["rm", "-rf", "--", f"{to_dir}/*"], privileged=True, user="root")
-        if rm_result.exit_code != 0:
-            raise RuntimeError(
-                f"Failed to remove directory {self.container.short_id}:{to_dir}/*: "
-                f"(exit_code: {rm_result.exit_code}) -> {rm_result.output}"
-            )
+        if clear_before_copy:
+            rm_result = self.container.exec_run(["rm", "-rf", "--", f"{to_dir}/*"], privileged=True, user="root")
+            if rm_result.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to remove directory {self.container.short_id}:{to_dir}/*: "
+                    f"(exit_code: {rm_result.exit_code}) -> {rm_result.output}"
+                )
 
         mkdir_result = self.container.exec_run(["mkdir", "-p", "--", to_dir], privileged=True, user="root")
         if mkdir_result.exit_code != 0:
