@@ -115,7 +115,7 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         cmd_labels[DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL] = patch_extractor.session_id
 
     if request.persist_workdir:
-        cmd_labels[DAIV_SANDBOX_PERSIST_WORKDIR_LABEL] = True
+        cmd_labels[DAIV_SANDBOX_PERSIST_WORKDIR_LABEL] = "1"
 
     cmd_executor = SandboxDockerSession.start(
         image=request.base_image, dockerfile=request.dockerfile, labels=cmd_labels
@@ -144,7 +144,7 @@ async def run_on_session(
     # Results of the commands.
     results: list[RunResult] = []
 
-    persist_workdir = cmd_executor.get_label(DAIV_SANDBOX_PERSIST_WORKDIR_LABEL)
+    persist_workdir = cmd_executor.get_label(DAIV_SANDBOX_PERSIST_WORKDIR_LABEL) == "1"
 
     if request.archive:
         cmd_executor.copy_to_container(io.BytesIO(request.archive), clear_before_copy=not persist_workdir)
