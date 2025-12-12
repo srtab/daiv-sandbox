@@ -7,12 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.3.0] - 2025-12-12
+
+### Added
+
+- Added `AGENTS.md` file to the project.
+- Added `SENTRY_ENABLE_LOGS`, `SENTRY_TRACES_SAMPLE_RATE`, `SENTRY_PROFILES_SAMPLE_RATE`, and `SENTRY_SEND_DEFAULT_PII` settings to configure Sentry.
+
 ### Changed
 
-- Moved `extract_patch` to start session request to avoid starting a patch extractor side-car container if not needed. **Breaking change.**
-- `extract_patch` parameter now forces the archive to be a git repository. **Breaking change.**
-- Migrated project from Python 3.12 to Python 3.14. **Breaking change.**
+- Moved `extract_patch` to start session request to avoid starting a patch extractor side-car container if not needed. **Breaking change**
+- `extract_patch` parameter now forces the archive to be a git repository. **Breaking change**
+- Migrated project from Python 3.12 to Python 3.14. **Breaking change**
 - Updated dependencies.
+- Replaced `SENTRY_ENABLE_TRACING` setting with `SENTRY_TRACES_SAMPLE_RATE` and `SENTRY_PROFILES_SAMPLE_RATE`. **Breaking change**
 
 ### Fixed
 
@@ -249,7 +257,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/srtab/daiv-sandbox/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/srtab/daiv-sandbox/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0-rc.10...v0.1.0

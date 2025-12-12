@@ -1,7 +1,7 @@
 [project]
 name = "daiv-sandbox"
-version = "0.2.0"
-description = "Runtime sandbox to empower DAIV agents to run arbitrary code/commands."
+version = "0.3.0"
+description = "Runtime sandbox to empower DAIV agents to run arbitrary commands."
 readme = "README.md"
 license = { file = "LICENSE" }
 maintainers = [
@@ -16,12 +16,12 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-  "docker==7.1",
-  "fastapi[standard]==0.122.0",
-  "ipython==9.7.0",
+  "docker==7.1.0",
+  "fastapi[standard]==0.124.4",
+  "ipython==9.8.0",
   "pydantic==2.12.5",
   "pydantic-settings==2.12.0",
-  "sentry-sdk==2.46.0",
+  "sentry-sdk==2.47.0",
 ]
 
 urls.changelog = "https://github.com/srtab/daiv-sandbox/blob/main/CHANGELOG.md"
@@ -30,15 +30,15 @@ urls.source = "https://github.com/srtab/daiv-sandbox"
 
 [dependency-groups]
 dev = [
-  "mypy==1.18.2",
+  "mypy==1.19.0",
   "pre-commit==4.5.0",
-  "pyopenssl==25.3",
+  "pyopenssl==25.3.0",
   "pyproject-fmt==2.11.1",
   "pytest-cov==7.0.0",
   "pytest-env==1.2.0",
   "pytest-mock==3.15.1",
-  "pytest-xdist==3.8",
-  "ruff==0.14.6",
+  "pytest-xdist==3.8.0",
+  "ruff==0.14.9",
 ]
 
 [tool.ruff]

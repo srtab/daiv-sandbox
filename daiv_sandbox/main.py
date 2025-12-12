@@ -42,8 +42,10 @@ if settings.SENTRY_DSN and settings.ENVIRONMENT != "local":
     sentry_sdk.init(
         dsn=str(settings.SENTRY_DSN),
         environment=settings.ENVIRONMENT,
-        enable_tracing=bool(settings.SENTRY_ENABLE_TRACING),
-        profiles_sample_rate=1.0 if settings.SENTRY_ENABLE_TRACING else 0.0,
+        enable_logs=settings.SENTRY_ENABLE_LOGS,
+        traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
+        profiles_sample_rate=settings.SENTRY_PROFILES_SAMPLE_RATE,
+        send_default_pii=settings.SENTRY_SEND_DEFAULT_PII,
         release=__version__,
     )
 

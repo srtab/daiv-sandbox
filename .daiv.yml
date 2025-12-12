@@ -2,12 +2,6 @@ pull_request:
   branch_name_convention: "Use 'feat/', 'fix/', or 'chore/' prefixes."
 
 sandbox:
-  # Use the base image with uv installed
-  base_image: "ghcr.io/astral-sh/uv:python3.14-bookworm-slim"
-
-  # Fix linting and format the code with ruff and pyproject-fmt
+  base_image: "ghcr.io/astral-sh/uv:python3.14-bookworm"
   format_code:
-    - "uv sync --only-group=dev"
-    - "uv run --only-group=dev ruff check . --fix"
-    - "uv run --only-group=dev ruff format ."
-    - "uv run --only-group=dev pyproject-fmt pyproject.toml"
+    - "make lint-fix"
