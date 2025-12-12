@@ -34,13 +34,13 @@ DAIV Sandbox uses [ruff](https://github.com/astral-sh/ruff) for linting and form
 Our code formatting configuration includes:
 
 - Line length: 120 characters
-- Target Python version: 3.12
+- Target Python version: 3.14
 - isort configuration for import sorting
 
 Before submitting a pull request, ensure your code passes all linting checks:
 
 ```bash
-make lint
+make lint-fix
 ```
 
 ### Testing

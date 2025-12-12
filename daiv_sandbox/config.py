@@ -28,7 +28,10 @@ class Settings(BaseSettings):
 
     # Sentry
     SENTRY_DSN: HttpUrl | None = None
-    SENTRY_ENABLE_TRACING: bool | int = False
+    SENTRY_ENABLE_LOGS: bool = False
+    SENTRY_TRACES_SAMPLE_RATE: float = 0.0
+    SENTRY_PROFILES_SAMPLE_RATE: float = 0.0
+    SENTRY_SEND_DEFAULT_PII: bool = False
 
     # Execution
     RUNTIME: Literal["runc", "runsc"] = "runc"
