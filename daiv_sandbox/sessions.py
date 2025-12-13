@@ -11,12 +11,15 @@ from docker import DockerClient, from_env
 from docker.errors import ImageNotFound, NotFound
 
 from daiv_sandbox.config import settings
-from daiv_sandbox.schemas import ImageAttrs, RunResult
+from daiv_sandbox.schemas import RunResult
 
 if TYPE_CHECKING:
     from docker.models.containers import Container
 
 logger = logging.getLogger("daiv_sandbox")
+
+# Canonical sandbox root directory inside all containers
+SANDBOX_ROOT = "/archives"
 
 
 class Session(ABC):
@@ -68,9 +71,6 @@ class SandboxDockerSession(Session):
         self.session_id: str | None = session_id
         self.client: DockerClient = client or from_env()
         self.container: Container | None = self._get_container(session_id) if session_id else None
-        self.image_attrs: ImageAttrs | None = (
-            self._inspect_image(self.container.image.tags[-1]) if self.container else None
-        )
 
     @classmethod
     def ping(cls, *, client: DockerClient | None = None) -> bool:
@@ -178,6 +178,14 @@ class SandboxDockerSession(Session):
 
         logger.info("Container '%s' created (status: %s)", container.short_id, container.status)
 
+        # Ensure the sandbox root directory exists
+        mkdir_result = container.exec_run(["mkdir", "-p", "--", SANDBOX_ROOT], user="root")
+        if mkdir_result.exit_code != 0:
+            raise RuntimeError(
+                f"Failed to create sandbox root directory {container.short_id}:{SANDBOX_ROOT}: "
+                f"(exit_code: {mkdir_result.exit_code}) -> {mkdir_result.output}"
+            )
+
     def remove_container(self):
         """
         Remove the container.
@@ -203,9 +211,8 @@ class SandboxDockerSession(Session):
         Returns:
             BinaryIO: The copied archive.
         """
-        from_dir = (
-            host_dir if Path(host_dir).is_absolute() else (Path(self.image_attrs.working_dir) / host_dir).as_posix()
-        )
+        # Resolve path: absolute paths stay absolute, relative paths resolve under SANDBOX_ROOT
+        from_dir = host_dir if Path(host_dir).is_absolute() else (Path(SANDBOX_ROOT) / host_dir).as_posix()
 
         logger.info("Copying archive from %s:%s...", self.container.short_id, from_dir)
 
@@ -223,26 +230,25 @@ class SandboxDockerSession(Session):
         Args:
             session_id (str): The ID of the container to copy the archive to.
             tardata (BinaryIO): The tar archive to be copied to the container.
-            dest (str | None): The destination path to copy the archive to. Defaults to the working directory of the
-                image.
+            dest (str | None): The destination path to copy the archive to. Defaults to SANDBOX_ROOT.
             clear_before_copy (bool): Whether to clear the destination directory before copying the archive.
         """
-        to_dir = self.image_attrs.working_dir
-
+        # Resolve destination: default to SANDBOX_ROOT, absolute stays absolute, relative resolves under SANDBOX_ROOT
+        to_dir = SANDBOX_ROOT
         if dest:
-            to_dir = dest if Path(dest).is_absolute() else (Path(to_dir) / dest).as_posix()
+            to_dir = dest if Path(dest).is_absolute() else (Path(SANDBOX_ROOT) / dest).as_posix()
 
-        logger.info("Creating directory %s:%s...", self.container.short_id, to_dir)
+        logger.info("Preparing directory %s:%s...", self.container.short_id, to_dir)
 
         if clear_before_copy:
-            rm_result = self.container.exec_run(["rm", "-rf", "--", f"{to_dir}/*"], privileged=True, user="root")
+            rm_result = self.container.exec_run(["rm", "-rf", "--", f"{to_dir}/*"], user="root")
             if rm_result.exit_code != 0:
                 raise RuntimeError(
                     f"Failed to remove directory {self.container.short_id}:{to_dir}/*: "
                     f"(exit_code: {rm_result.exit_code}) -> {rm_result.output}"
                 )
 
-        mkdir_result = self.container.exec_run(["mkdir", "-p", "--", to_dir], privileged=True, user="root")
+        mkdir_result = self.container.exec_run(["mkdir", "-p", "--", to_dir], user="root")
         if mkdir_result.exit_code != 0:
             raise RuntimeError(
                 f"Failed to create directory {self.container.short_id}:{to_dir}: "
@@ -252,10 +258,14 @@ class SandboxDockerSession(Session):
         logger.info("Copying archive to %s:%s...", self.container.short_id, to_dir)
 
         if self.container.put_archive(to_dir, tardata.getvalue()):
-            user = f"{self.image_attrs.user}:{self.image_attrs.user}"
-
-            # Normalize folder permissions.
-            self.container.exec_run(["chown", "-R", user, "--", to_dir], privileged=True, user="root")
+            # Normalize permissions: readable/executable by all, writable by owner
+            # This allows non-root users to read/execute while maintaining write access
+            chmod_result = self.container.exec_run(["chmod", "-R", "a+rX,u+w", "--", to_dir], user="root")
+            if chmod_result.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to normalize permissions for {self.container.short_id}:{to_dir}: "
+                    f"(exit_code: {chmod_result.exit_code}) -> {chmod_result.output}"
+                )
         else:
             raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{to_dir}")
 
@@ -266,18 +276,15 @@ class SandboxDockerSession(Session):
         Args:
             session_id (str): The ID of the container to execute the command in.
             command (str): The command to execute.
-            workdir (str | None): The working directory of the command.
+            workdir (str | None): The working directory of the command. Defaults to SANDBOX_ROOT.
 
         Returns:
             RunResult: The result of the command.
         """
-        command_workdir = self.image_attrs.working_dir
-
+        # Resolve workdir: default to SANDBOX_ROOT, absolute stays absolute, relative resolves under SANDBOX_ROOT
+        command_workdir = SANDBOX_ROOT
         if workdir:
-            if Path(workdir).is_absolute():
-                command_workdir = workdir
-            else:
-                command_workdir = (Path(self.image_attrs.working_dir) / workdir).as_posix()
+            command_workdir = workdir if Path(workdir).is_absolute() else (Path(SANDBOX_ROOT) / workdir).as_posix()
 
         logger.info("Executing command in %s:%s -> %s ", self.container.short_id, command_workdir, command)
 
@@ -337,18 +344,6 @@ class SandboxDockerSession(Session):
                 return None
 
         return container
-
-    def _inspect_image(self, image: str) -> ImageAttrs:
-        """
-        Inspect the image to get the user and working directory.
-
-        Args:
-            image (str): The tag of the image to inspect.
-
-        Returns:
-            ImageInspection: The inspection of the image.
-        """
-        return ImageAttrs.from_inspection(self.client.api.inspect_image(image))
 
     def get_label(self, label: str) -> str | None:
         """

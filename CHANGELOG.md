@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- Standardized sandbox filesystem root to `/archives` for all containers, removing dependency on base image WORKDIR.
+- Removed image inspection logic (`_inspect_image` method and `ImageAttrs` usage in sessions).
+- Updated permission normalization to use `chmod` instead of `chown`, improving compatibility with non-root users.
+- Fixed patch extraction logic to correctly handle `None` workdir by treating it as "." relative to archive root.
+
 ## [0.3.0] - 2025-12-12
 
 ### Added
