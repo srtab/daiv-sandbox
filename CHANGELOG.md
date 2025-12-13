@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.3.1] - 2025-12-13
+
 ### Changed
 
 - Standardized sandbox filesystem root to `/archives` for all containers, removing dependency on base image WORKDIR.
@@ -264,7 +266,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/srtab/daiv-sandbox/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/srtab/daiv-sandbox/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/srtab/daiv-sandbox/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/srtab/daiv-sandbox/compare/v0.1.0...v0.1.1
