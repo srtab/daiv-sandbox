@@ -169,11 +169,16 @@ async def run_on_session(
         patch_extractor.execute_command("mkdir -p /workdir/old /workdir/new")
         patch_extractor.execute_command("git config --global --add safe.directory /workdir")
 
+        # Copy original archive and modified files to patch extractor
         patch_extractor.copy_to_container(io.BytesIO(request.archive), dest="/workdir/old/")
-        patch_extractor.copy_to_container(cmd_executor.copy_from_container(request.workdir), dest="/workdir/new/")
+        # When workdir is None, copy from SANDBOX_ROOT; when relative, copy from SANDBOX_ROOT/workdir
+        copy_path = request.workdir if request.workdir else "."
+        patch_extractor.copy_to_container(cmd_executor.copy_from_container(copy_path), dest="/workdir/new/")
 
+        # Format script with proper repo_workdir (use "." when None for consistency with archive structure)
+        repo_workdir = request.workdir if request.workdir else "."
         patch_result = patch_extractor.execute_command(
-            CMD_GIT_DIFF_EXTRACTOR_SCRIPT.format(repo_workdir=request.workdir), workdir="/workdir"
+            CMD_GIT_DIFF_EXTRACTOR_SCRIPT.format(repo_workdir=repo_workdir), workdir="/workdir"
         )
 
         if patch_result.exit_code != 0 and NO_CHANGES_MESSAGE not in patch_result.output:

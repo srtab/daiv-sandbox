@@ -64,18 +64,3 @@ class RunResponse(BaseModel):
 
 class ErrorMessage(BaseModel):
     detail: str = Field(description="Error message.")
-
-
-class ImageAttrs(BaseModel):
-    user: str = Field(description="User of the image.")
-    working_dir: str = Field(description="Working directory of the image.")
-
-    @classmethod
-    def from_inspection(cls, inspection: dict) -> ImageAttrs:
-        user = inspection["Config"]["User"]
-        working_dir = inspection["Config"]["WorkingDir"]
-
-        if user == "root" or working_dir == "" and user == "":
-            working_dir = "/archives"
-
-        return cls(user=user, working_dir=working_dir)
