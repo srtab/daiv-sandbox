@@ -17,7 +17,7 @@ classifiers = [
 ]
 dependencies = [
   "docker==7.1.0",
-  "fastapi[standard]==0.124.4",
+  "fastapi[standard]==0.125.0",
   "ipython==9.8.0",
   "pydantic==2.12.5",
   "pydantic-settings==2.12.0",
