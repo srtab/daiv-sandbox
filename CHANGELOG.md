@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `memory_bytes` parameter to start session request to allow specifying the memory limit for the session.
 - Added `cpus` parameter to start session request to allow specifying the CPU limit for the session.
 - Added `network_enabled` parameter to start session request to allow specifying whether to enable network for the session.
+- Added integration tests to the project.
 
 ### Changed
 

@@ -259,30 +259,11 @@ def test_version(client):
 def test_start_session_with_extract_patch_creates_volume(client):
     """Test that starting a session with extract_patch=true creates a volume and mounts it correctly."""
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
-        # Mock the session instances
-        mock_docker_client = Mock()
-        mock_volume = Mock()
-        mock_volume.name = "test-volume"
-        mock_docker_client.volumes.create.return_value = mock_volume
-
         mock_patch_extractor = Mock()
         mock_patch_extractor.session_id = "patch-extractor-id"
-        mock_patch_extractor.client = mock_docker_client
 
         mock_cmd_executor = Mock()
         mock_cmd_executor.session_id = "cmd-executor-id"
-
-        # Create a session instance with the mocked client
-        def create_session_side_effect(*args, **kwargs):
-            instance = Mock()
-            instance.client = mock_docker_client
-            return instance
-
-        mock_session_class.side_effect = [
-            create_session_side_effect(),  # First call to create volume
-            mock_patch_extractor,  # Second call for patch extractor
-            mock_cmd_executor,  # Third call for cmd executor
-        ]
         mock_session_class.start.side_effect = [mock_patch_extractor, mock_cmd_executor]
 
         # Make the request
@@ -294,10 +275,10 @@ def test_start_session_with_extract_patch_creates_volume(client):
         assert response.json() == {"session_id": "cmd-executor-id"}
 
         # Verify volume was created
-        mock_docker_client.volumes.create.assert_called_once()
-        call_kwargs = mock_docker_client.volumes.create.call_args[1]
+        mock_session_class.create_named_volume.assert_called_once()
+        call_kwargs = mock_session_class.create_named_volume.call_args[1]
         assert "daiv-sandbox-workdir-" in call_kwargs["name"]
-        assert call_kwargs["labels"] == {"daiv.sandbox.managed": "1", "daiv.sandbox.type": "workdir"}
+        assert call_kwargs["labels"] == {"daiv.sandbox.managed": "1"}
 
         # Verify both containers were started with correct volume mounts
         assert mock_session_class.start.call_count == 2
