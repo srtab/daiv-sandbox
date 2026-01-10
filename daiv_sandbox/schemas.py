@@ -12,10 +12,16 @@ class StartSessionRequest(BaseModel):
         default=None, description="Docker image to be used as the base image for the sandbox."
     )
     dockerfile: str | None = Field(default=None, description="Dockerfile content to be used to build the image.")
-    persist_workdir: bool = Field(default=False, description="Whether to persist the workdir between commands.")
+    ephemeral: bool = Field(
+        default=False,
+        description="Whether to start the session as ephemeral, not persisting the workspace between commands.",
+    )
     extract_patch: bool = Field(
         default=False, description="Whether to extract a patch with the changes made by the executed commands."
     )
+    network_enabled: bool = Field(default=False, description="Whether to enable network for the sandbox.")
+    memory_bytes: int | None = Field(default=None, description="Memory in bytes to be used for the sandbox.")
+    cpus: float | None = Field(default=None, description="CPUs to be used for the sandbox.")
 
     @classmethod
     @field_validator("base_image", "dockerfile")
@@ -31,13 +37,6 @@ class StartSessionResponse(BaseModel):
 
 class RunRequest(BaseModel):
     commands: list[str] = Field(description="List of bash commands to be executed in the sandbox.")
-    workdir: str | None = Field(
-        default=None,
-        description=(
-            "Working directory to be used for the commands. "
-            "Defaults to the root directory where the archive is extracted."
-        ),
-    )
     archive: Base64Bytes | None = Field(
         default=None, description="Base64-encoded archive with files to be copied to the sandbox."
     )
