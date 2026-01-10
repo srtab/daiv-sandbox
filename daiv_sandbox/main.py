@@ -28,7 +28,9 @@ HEADER_API_KEY_NAME = "X-API-Key"
 
 DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
 DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL = "daiv.sandbox.patch_extractor_session_id"
-DAIV_SANDBOX_PERSIST_WORKDIR_LABEL = "daiv.sandbox.persist_workdir"
+DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL = "daiv.sandbox.ephemeral_session"
+DAIV_SANDBOX_WORKDIR_VOLUME_LABEL = "daiv.sandbox.workdir_volume"
+DAIV_SANDBOX_MANAGED_LABEL = "daiv.sandbox.managed"
 
 TYPE_PATCH_EXTRACTOR = "patch_extractor"
 TYPE_CMD_EXECUTOR = "cmd_executor"
@@ -108,19 +110,47 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
 
     This session ID ensures a consistent execution environment for the commands, including files and directories.
     """
-    cmd_labels = {DAIV_SANDBOX_TYPE_LABEL: TYPE_CMD_EXECUTOR}
+    import uuid
+
+    from daiv_sandbox.sessions import SANDBOX_ROOT
+
+    cmd_executor_labels = {DAIV_SANDBOX_TYPE_LABEL: TYPE_CMD_EXECUTOR}
+    workdir_volume_name: str | None = None
 
     if request.extract_patch:
-        patch_extractor = SandboxDockerSession.start(
-            image=settings.GIT_IMAGE, labels={DAIV_SANDBOX_TYPE_LABEL: TYPE_PATCH_EXTRACTOR}, network_mode="none"
-        )
-        cmd_labels[DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL] = patch_extractor.session_id
+        # Create a shared Docker volume for the workspace
+        workdir_volume_name = f"daiv-sandbox-workdir-{uuid.uuid4()}"
+        SandboxDockerSession.create_named_volume(name=workdir_volume_name, labels={DAIV_SANDBOX_MANAGED_LABEL: "1"})
 
-    if request.persist_workdir:
-        cmd_labels[DAIV_SANDBOX_PERSIST_WORKDIR_LABEL] = "1"
+        patch_extractor = SandboxDockerSession.start(
+            image=settings.GIT_IMAGE,
+            labels={DAIV_SANDBOX_TYPE_LABEL: TYPE_PATCH_EXTRACTOR},
+            network_mode="none",
+            volumes={workdir_volume_name: {"bind": "/workdir/new", "mode": "ro"}},
+        )
+
+        cmd_executor_labels[DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL] = patch_extractor.session_id
+        cmd_executor_labels[DAIV_SANDBOX_WORKDIR_VOLUME_LABEL] = workdir_volume_name
+
+    if request.ephemeral:
+        cmd_executor_labels[DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL] = "1"
+
+    cmd_executor_kwargs = {}
+
+    if workdir_volume_name:
+        cmd_executor_kwargs["volumes"] = {workdir_volume_name: {"bind": SANDBOX_ROOT, "mode": "rw"}}
+
+    if not request.network_enabled:
+        cmd_executor_kwargs["network_mode"] = "none"
+
+    if request.memory_bytes:
+        cmd_executor_kwargs["mem_limit"] = request.memory_bytes
+
+    if request.cpus:
+        cmd_executor_kwargs["cpus"] = request.cpus
 
     cmd_executor = SandboxDockerSession.start(
-        image=request.base_image, dockerfile=request.dockerfile, labels=cmd_labels
+        image=request.base_image, dockerfile=request.dockerfile, labels=cmd_executor_labels, **cmd_executor_kwargs
     )
     return StartSessionResponse(session_id=cmd_executor.session_id)
 
@@ -146,13 +176,13 @@ async def run_on_session(
     # Results of the commands.
     results: list[RunResult] = []
 
-    persist_workdir = cmd_executor.get_label(DAIV_SANDBOX_PERSIST_WORKDIR_LABEL) == "1"
+    ephemeral_session = cmd_executor.get_label(DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL) == "1"
 
     if request.archive:
-        cmd_executor.copy_to_container(io.BytesIO(request.archive), clear_before_copy=not persist_workdir)
+        cmd_executor.copy_to_container(io.BytesIO(request.archive), clear_before_copy=ephemeral_session)
 
     for command in request.commands:
-        result = cmd_executor.execute_command(command, workdir=request.workdir)
+        result = cmd_executor.execute_command(command)
         results.append(result)
 
         # Stop execution if fail_fast is enabled and command failed
@@ -164,22 +194,16 @@ async def run_on_session(
     ):
         patch_extractor = SandboxDockerSession(session_id=extract_patch_session_id)
 
-        # Clean up old directories and create new ones.
-        patch_extractor.execute_command("rm -rf /workdir/*")
-        patch_extractor.execute_command("mkdir -p /workdir/old /workdir/new")
+        # Clean up old directories and metadata, but keep /workdir/new (it's a mounted volume).
+        patch_extractor.execute_command("rm -rf /workdir/old /workdir/meta")
+        patch_extractor.execute_command("mkdir -p /workdir/old")
         patch_extractor.execute_command("git config --global --add safe.directory /workdir")
 
-        # Copy original archive and modified files to patch extractor
+        # Copy original archive to patch extractor for baseline comparison.
         patch_extractor.copy_to_container(io.BytesIO(request.archive), dest="/workdir/old/")
-        # When workdir is None, copy from SANDBOX_ROOT; when relative, copy from SANDBOX_ROOT/workdir
-        copy_path = request.workdir if request.workdir else "."
-        patch_extractor.copy_to_container(cmd_executor.copy_from_container(copy_path), dest="/workdir/new/")
 
-        # Format script with proper repo_workdir (use "." when None for consistency with archive structure)
-        repo_workdir = request.workdir if request.workdir else "."
-        patch_result = patch_extractor.execute_command(
-            CMD_GIT_DIFF_EXTRACTOR_SCRIPT.format(repo_workdir=repo_workdir), workdir="/workdir"
-        )
+        # Always diff from the extracted root for consistency with the archive layout.
+        patch_result = patch_extractor.execute_command(CMD_GIT_DIFF_EXTRACTOR_SCRIPT, workdir="/workdir")
 
         if patch_result.exit_code != 0 and NO_CHANGES_MESSAGE not in patch_result.output:
             logger.error("Failed to extract patch: [%s] %s", patch_result.exit_code, patch_result.output)
@@ -190,7 +214,7 @@ async def run_on_session(
                 ),
             )
 
-        if NO_CHANGES_MESSAGE in patch_result.output:
+        if NO_CHANGES_MESSAGE in patch_result.output or patch_result.output.strip() == "":
             base64_patch = None
         else:
             base64_patch = base64.b64encode(patch_result.output.encode()).decode()
@@ -203,8 +227,10 @@ async def close_session(
     session_id: Annotated[str, FastAPIPath(title="The ID of the session to close")], api_key: str = Depends(get_api_key)
 ) -> Response:
     """
-    Close a session by removing the Docker container.
+    Close a session by removing the Docker container and associated resources.
     """
+    from docker.errors import NotFound as VolumeNotFound
+
     cmd_executor = SandboxDockerSession(session_id=session_id)
 
     if patch_extractor_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
@@ -212,6 +238,18 @@ async def close_session(
         patch_extractor.remove_container()
 
     cmd_executor.remove_container()
+
+    # Remove shared workdir volume after all containers are removed.
+    if workdir_volume_name := cmd_executor.get_label(DAIV_SANDBOX_WORKDIR_VOLUME_LABEL):
+        try:
+            volume = cmd_executor.client.volumes.get(workdir_volume_name)
+            volume.remove(force=False)
+            logger.info("Removed shared volume '%s'", workdir_volume_name)
+        except VolumeNotFound:
+            logger.warning("Volume '%s' not found (already removed)", workdir_volume_name)
+        except Exception as e:
+            # Volume might still be in use or other error - log but don't fail the request
+            logger.warning("Failed to remove volume '%s': %s", workdir_volume_name, e)
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

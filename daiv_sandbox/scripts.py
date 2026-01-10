@@ -1,18 +1,26 @@
 CMD_GIT_DIFF_EXTRACTOR_SCRIPT = """\
 set -euo pipefail
 
-OLD="/workdir/old/{repo_workdir}"
-NEW="/workdir/new/{repo_workdir}"
+OLD="/workdir/old/."
+NEW="/workdir/new/."
 META="/workdir/meta"
+EXCLUDES="$META/.git-excludes"
 
-# Clean up old directories and create new ones.
-rm -rf "$META" "$OLD/.git" "$NEW/.git"
+# Clean up old directories and metadata (but not NEW, which is read-only mounted).
+rm -rf "$META" "$OLD/.git"
 mkdir -p "$META"
+
+# Create excludes file to ignore .git directories without modifying the source trees
+cat > "$EXCLUDES" << 'EOF'
+.git
+.git/
+EOF
 
 # Capture OLD and NEW as two commits in a tiny temp repo
 git -C "$META" init -q
 git -C "$META" config user.name daiv-sandbox
 git -C "$META" config user.email daiv-sandbox@local
+git -C "$META" config core.excludesFile "$EXCLUDES"
 
 # commit baseline (OLD)
 git -C "$META" --work-tree="$OLD" add -A

@@ -15,11 +15,12 @@ from daiv_sandbox.schemas import RunResult
 
 if TYPE_CHECKING:
     from docker.models.containers import Container
+    from docker.models.volumes import Volume
 
 logger = logging.getLogger("daiv_sandbox")
 
 # Canonical sandbox root directory inside all containers
-SANDBOX_ROOT = "/archives"
+SANDBOX_ROOT = "/repo"
 
 
 class Session(ABC):
@@ -118,6 +119,25 @@ class SandboxDockerSession(Session):
         instance._start_container(image, **kwargs)
         return instance
 
+    @classmethod
+    def create_named_volume(
+        cls, name: str, labels: dict[str, str] | None = None, client: DockerClient | None = None
+    ) -> Volume:
+        """
+        Create a named volume with the given name and labels.
+
+        Args:
+            name (str): The name of the volume to create.
+            labels (dict[str, str] | None): The labels to add to the volume.
+            client (DockerClient | None): Docker client, if not provided, a new client will be created based on
+                local Docker context.
+
+        Returns:
+            Volume: The created volume.
+        """
+        instance = cls(client=client)
+        return instance.client.volumes.create(name=name, labels=labels or {})
+
     def _ping(self) -> bool:
         """
         Ping the Docker client.
@@ -165,7 +185,7 @@ class SandboxDockerSession(Session):
         container = self.client.containers.run(
             image,
             entrypoint="/bin/sh",
-            command=["-lc", "sleep 600"],  # 10 minutes
+            command=["-lc", "sleep 3600"],  # 1 hour
             detach=True,
             tty=True,
             runtime=settings.RUNTIME,
@@ -211,10 +231,14 @@ class SandboxDockerSession(Session):
         Returns:
             BinaryIO: The copied archive.
         """
-        # Resolve path: absolute paths stay absolute, relative paths resolve under SANDBOX_ROOT
-        from_dir = host_dir if Path(host_dir).is_absolute() else (Path(SANDBOX_ROOT) / host_dir).as_posix()
-
-        logger.info("Copying archive from %s:%s...", self.container.short_id, from_dir)
+        if Path(host_dir).is_absolute():
+            from_dir = host_dir
+        elif host_dir in {"", "."}:
+            # Special case: when copying the sandbox root itself ("."), request SANDBOX_ROOT + "/." so the archive
+            # contains the *contents* rather than a top-level "sandbox-root/" directory.
+            from_dir = f"{SANDBOX_ROOT}/."
+        else:
+            from_dir = (Path(SANDBOX_ROOT) / host_dir).as_posix()
 
         bits, stat = self.container.get_archive(from_dir)
 
@@ -238,8 +262,6 @@ class SandboxDockerSession(Session):
         if dest:
             to_dir = dest if Path(dest).is_absolute() else (Path(SANDBOX_ROOT) / dest).as_posix()
 
-        logger.info("Preparing directory %s:%s...", self.container.short_id, to_dir)
-
         if clear_before_copy:
             rm_result = self.container.exec_run(["rm", "-rf", "--", f"{to_dir}/*"], user="root")
             if rm_result.exit_code != 0:
@@ -254,8 +276,6 @@ class SandboxDockerSession(Session):
                 f"Failed to create directory {self.container.short_id}:{to_dir}: "
                 f"(exit_code: {mkdir_result.exit_code}) -> {mkdir_result.output}"
             )
-
-        logger.info("Copying archive to %s:%s...", self.container.short_id, to_dir)
 
         if self.container.put_archive(to_dir, tardata.getvalue()):
             # Normalize permissions: readable/executable by all, writable by owner
@@ -286,23 +306,22 @@ class SandboxDockerSession(Session):
         if workdir:
             command_workdir = workdir if Path(workdir).is_absolute() else (Path(SANDBOX_ROOT) / workdir).as_posix()
 
-        logger.info("Executing command in %s:%s -> %s ", self.container.short_id, command_workdir, command)
+        logger.info("Executing command in %s:%s -> '%s'", self.container.short_id, command_workdir, command)
 
         result = self.container.exec_run(["/bin/sh", "-c", command], workdir=command_workdir)
 
-        if result.exit_code != 0:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "Command in %s:%s exited with code %s: %s",
-                    self.container.short_id,
-                    command_workdir,
-                    result.exit_code,
-                    result.output.decode(),
-                )
-            else:
-                logger.warning(
-                    "Command in %s:%s exited with code %s", self.container.short_id, command_workdir, result.exit_code
-                )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Command in %s:%s exited with code %s: %s",
+                self.container.short_id,
+                command_workdir,
+                result.exit_code,
+                result.output.decode(),
+            )
+        elif result.exit_code != 0:
+            logger.warning(
+                "Command in %s:%s exited with code %s", self.container.short_id, command_workdir, result.exit_code
+            )
 
         return RunResult(
             command=command, output=result.output.decode(), exit_code=result.exit_code, workdir=command_workdir

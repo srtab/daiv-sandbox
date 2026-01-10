@@ -90,7 +90,7 @@ def test__start_container(mock_docker_client):
     mock_docker_client.containers.run.assert_called_once_with(
         "test-image",
         entrypoint="/bin/sh",
-        command=["-lc", "sleep 600"],
+        command=["-lc", "sleep 3600"],
         detach=True,
         tty=True,
         runtime=settings.RUNTIME,
