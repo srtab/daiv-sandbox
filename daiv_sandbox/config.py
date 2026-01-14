@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     RUN_GID: int = 1000
 
     # Git
-    GIT_IMAGE: str = "alpine/git:2.49.1"
+    GIT_IMAGE: str = "alpine/git:2.52.0"
 
 
 settings = Settings()  # type: ignore
