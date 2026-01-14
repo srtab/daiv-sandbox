@@ -47,16 +47,23 @@ $ docker run --rm -d -p 8000:8000 -e DAIV_SANDBOX_API_KEY=my-secret-api-key -e D
 
 All settings are configurable via environment variables. The available settings are:
 
-| Environment Variable                | Description                                     | Options/Default                                                             |
-| ----------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------- |
-| **DAIV_SANDBOX_API_KEY**            | The API key required to access the sandbox API. |                                                                             |
-| **DAIV_SANDBOX_ENVIRONMENT**        | The deployment environment.                     | Options: `local`, `production`<br>Default: "production"                     |
-| **DAIV_SANDBOX_SENTRY_DSN**         | The DSN for Sentry error tracking.              | Optional                                                                    |
-| **DAIV_SANDBOX_SENTRY_ENABLE_LOGS** | Whether to enable Sentry log forwarding.        | Default: False                                                              |
-| **DAIV_SANDBOX_RUNTIME**            | The container runtime to use.                   | Options: `runc`, `runsc`<br>Default: "runc"                                 |
-| **DAIV_SANDBOX_HOST**               | The host to bind the service to.                | Default: "0.0.0.0"                                                          |
-| **DAIV_SANDBOX_PORT**               | The port to bind the service to.                | Default: 8000                                                               |
-| **DAIV_SANDBOX_LOG_LEVEL**          | The log level to use.                           | Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`<br>Default: "INFO" |
+| Environment Variable                         | Description                                     | Options/Default                                                             |
+| -------------------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------- |
+| **DAIV_SANDBOX_API_KEY**                     | The API key required to access the sandbox API. |                                                                             |
+| **DAIV_SANDBOX_API_V1_STR**                  | Base path for API routes.                       | Default: "/api/v1"                                                          |
+| **DAIV_SANDBOX_ENVIRONMENT**                 | The deployment environment.                     | Options: `local`, `production`<br>Default: "production"                     |
+| **DAIV_SANDBOX_SENTRY_DSN**                  | The DSN for Sentry error tracking.              | Optional                                                                    |
+| **DAIV_SANDBOX_SENTRY_ENABLE_LOGS**          | Whether to enable Sentry log forwarding.        | Default: False                                                              |
+| **DAIV_SANDBOX_SENTRY_TRACES_SAMPLE_RATE**   | Sentry traces sampling rate.                    | Default: 0.0                                                                |
+| **DAIV_SANDBOX_SENTRY_PROFILES_SAMPLE_RATE** | Sentry profiles sampling rate.                  | Default: 0.0                                                                |
+| **DAIV_SANDBOX_SENTRY_SEND_DEFAULT_PII**     | Send default PII to Sentry.                     | Default: False                                                              |
+| **DAIV_SANDBOX_RUNTIME**                     | The container runtime to use.                   | Options: `runc`, `runsc`<br>Default: "runc"                                 |
+| **DAIV_SANDBOX_RUN_UID**                     | UID for sandbox command execution.              | Default: 1000                                                               |
+| **DAIV_SANDBOX_RUN_GID**                     | GID for sandbox command execution.              | Default: 1000                                                               |
+| **DAIV_SANDBOX_GIT_IMAGE**                   | Image used to extract patches.                  | Default: "alpine/git:2.52.0"                                                |
+| **DAIV_SANDBOX_HOST**                        | The host to bind the service to.                | Default: "0.0.0.0"                                                          |
+| **DAIV_SANDBOX_PORT**                        | The port to bind the service to.                | Default: 8000                                                               |
+| **DAIV_SANDBOX_LOG_LEVEL**                   | The log level to use.                           | Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`<br>Default: "INFO" |
 
 ## Usage
 
@@ -65,6 +72,8 @@ All settings are configurable via environment variables. The available settings 
 - `POST /session/`: Start a sandbox session.
 - `POST /session/{session_id}/`: Run commands on the sandbox session.
 - `DELETE /session/{session_id}/`: Close the sandbox session.
+- `GET /-/health/`: Healthcheck endpoint.
+- `GET /-/version/`: Current application version.
 
 ### Starting a Sandbox Session
 
@@ -77,7 +86,7 @@ Here is an example using `curl`:
 ```sh
 $ curl -X POST \
   -H "Content-Type: application/json" \
-  -H "X-API-KEY: notsosecret" \
+  -H "X-API-Key: notsosecret" \
   -d "{\"base_image\": \"python:3.12\"}" \
   http://localhost:8000/api/v1/session/
 ```
@@ -92,10 +101,14 @@ The response will be a JSON object with the following structure containing the s
 
 The following table describes the parameters for the `session/` endpoint:
 
-| Parameter       | Description                                                     | Required | Valid Values                         |
-| --------------- | --------------------------------------------------------------- | -------- | ------------------------------------ |
-| `base_image`    | The base image to use for the container.                        | Yes      | Any valid Docker image               |
-| `extract_patch` | Extract a patch with the changes made by the executed commands. | No       | `true` or `false` (default: `false`) |
+| Parameter         | Description                                                     | Required | Valid Values                         |
+| ----------------- | --------------------------------------------------------------- | -------- | ------------------------------------ |
+| `base_image`      | The base image to use for the container.                        | Yes      | Any valid Docker image               |
+| `ephemeral`       | Do not persist workspace between command runs.                  | No       | `true` or `false` (default: `false`) |
+| `extract_patch`   | Extract a patch with the changes made by the executed commands. | No       | `true` or `false` (default: `false`) |
+| `network_enabled` | Enable network access inside the container.                     | No       | `true` or `false` (default: `false`) |
+| `memory_bytes`    | Memory limit for the container (bytes).                         | No       | Integer (bytes)                      |
+| `cpus`            | CPU quota for the container.                                    | No       | Float (e.g. `0.5`, `1.0`)            |
 
 > [!NOTE]
 > For security reasons, building images from arbitrary Dockerfiles is not supported by this service. Provide a `base_image`.
@@ -110,7 +123,7 @@ import httpx
 
 response = httpx.post(
     "http://localhost:8000/api/v1/session/",
-    headers={"X-API-KEY": "notsosecret"},
+    headers={"X-API-Key": "notsosecret"},
     json={"base_image": "python:3.12"},
 )
 
@@ -128,21 +141,24 @@ This endpoint can be used to execute arbitrary commands on a provided archive, f
 
 By default, all commands are executed sequentially regardless of their exit codes. However, you can enable fail-fast behavior by setting the `fail_fast` parameter to `true`, which will stop execution immediately if any command fails (returns a non-zero exit code).
 
+If `archive` is omitted, commands run against the existing container filesystem from the previous calls in the same session.
+
+When `extract_patch` is enabled on session creation, the `patch` field in the response is a base64-encoded unified diff.
+
 The following table describes the parameters for the `POST /session/{session_id}/` endpoint:
 
 | Parameter   | Description                                         | Required | Valid Values                         |
 | ----------- | --------------------------------------------------- | -------- | ------------------------------------ |
-| `archive`   | The archive to extract and execute the commands on. | Yes      | Base64 encoded `tar.gz` archive      |
 | `commands`  | The commands to execute.                            | Yes      | List of strings                      |
+| `archive`   | The archive to extract and execute the commands on. | No       | Base64 encoded `tar.gz` archive      |
 | `fail_fast` | Stop execution if any command fails.                | No       | `true` or `false` (default: `false`) |
-| `workdir`   | The working directory to use for the commands.      | No       | Any valid directory                  |
 
 Here is an example using `curl`:
 
 ```sh
 $ curl -X POST \
   -H "Content-Type: application/json" \
-  -H "X-API-KEY: notsosecret" \
+  -H "X-API-Key: notsosecret" \
   -d "{\"archive\": \"$(base64 -w 0 django-webhooks-master.tar.gz)\", \"commands\": [\"ls -la\"], \"fail_fast\": true}" \
   http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/
 ```
@@ -158,7 +174,7 @@ The response will be a JSON object with the following structure:
       "exit_code": 0
     }
   ],
-  "patch": null // If no file changes were made, the patch is not returned
+  "patch": null // Base64-encoded diff; null when no changes were detected
 }
 ```
 
@@ -179,7 +195,7 @@ with tarfile.open(fileobj=tarstream, mode="w:gz") as tar:
 tarstream.seek(0)
 response = httpx.post(
     "http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/",
-    headers={"X-API-KEY": "notsosecret"},
+    headers={"X-API-Key": "notsosecret"},
     json={
         "archive": base64.b64encode(tarstream.getvalue()).decode(),
         "commands": ["ls -la"],
@@ -191,7 +207,8 @@ response.raise_for_status()
 resp = response.json()
 
 print(resp["results"][0]["output"])
-print(resp["patch"])
+if resp["patch"]:
+    print(base64.b64decode(resp["patch"]).decode())
 ```
 
 > [!TIP]
@@ -207,7 +224,7 @@ To close a sandbox session, you need to call the `DELETE /session/{session_id}/`
 
 ```sh
 $ curl -X DELETE \
-  -H "X-API-KEY: notsosecret" \
+  -H "X-API-Key: notsosecret" \
   http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/
 ```
 
