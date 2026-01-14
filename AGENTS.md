@@ -123,7 +123,6 @@ When presenting a plan, include the following:
 ## Maintenance Notes
 
 - Update this file when:
-
   - `Makefile` targets change
   - the repo structure changes (new key packages/dirs)
   - tooling changes (ruff/mypy/pytest)

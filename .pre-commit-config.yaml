@@ -1,6 +1,5 @@
 repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v6.0.0
+  - repo: builtin
     hooks:
       - id: check-added-large-files
       - id: check-merge-conflict
@@ -8,7 +7,7 @@ repos:
         args: ["--branch", "main"]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.12.11
+    rev: v0.14.11
     hooks:
       - id: ruff
         name: Run the ruff linter
@@ -32,6 +31,6 @@ repos:
           )$"
 
   - repo: https://github.com/tox-dev/pyproject-fmt
-    rev: "v2.6.0"
+    rev: v2.11.1
     hooks:
       - id: pyproject-fmt

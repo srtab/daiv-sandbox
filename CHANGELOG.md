@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sandbox commands now run as a non-root user by default.
 - Hardened archive extraction to reject unsafe archive contents and prevent extraction outside sandbox directories.
 - Changed `persist_workdir` parameter to `ephemeral` in start session request. **Breaking change**
+- Migrated pre-commit hook runner to `prek`.
 
 ### Removed
 
