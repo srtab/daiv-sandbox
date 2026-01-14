@@ -31,6 +31,14 @@ DAIV Sandbox uses [ruff](https://github.com/astral-sh/ruff) for linting and form
 - **Linting and formatting**: `make lint`
 - **Fix linting and formatting issues**: `make lint-fix`
 
+We use [prek](https://prek.j178.dev/quickstart/#already-using-pre-commit) as a drop-in replacement
+for `pre-commit` to run the hooks defined in `.pre-commit-config.yaml`:
+
+```bash
+uv run --only-group=dev prek run --all-files
+uv run --only-group=dev prek install -f
+```
+
 Our code formatting configuration includes:
 
 - Line length: 120 characters
@@ -54,7 +62,6 @@ DAIV Sandbox uses pytest for testing:
    ```
 
 2. **Writing tests**:
-
    - Tests should be placed in the `tests/` directory.
    - Test file names should start with `test_` and follow the same directory structure as the source code.
    - Test classes should follow the pattern `Test*` or `*Test`.
