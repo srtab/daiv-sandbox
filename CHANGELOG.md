@@ -12,16 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `memory_bytes` parameter to start session request to allow specifying the memory limit for the session.
 - Added `cpus` parameter to start session request to allow specifying the CPU limit for the session.
 - Added `network_enabled` parameter to start session request to allow specifying whether to enable network for the session.
+- Added `RUN_UID` and `RUN_GID` settings to control which user the sandbox runs commands as.
 - Added integration tests to the project.
 
 ### Changed
 
 - Improved patch extraction performance by using shared Docker volumes instead of copying full workspace trees between containers.
 - Changed run container command `sleep` time to 1 hour to avoid containers being removed too early.
+- Sandbox commands now run as a non-root user by default.
+- Hardened archive extraction to reject unsafe archive contents and prevent extraction outside sandbox directories.
 - Changed `persist_workdir` parameter to `ephemeral` in start session request. **Breaking change**
 
 ### Removed
 
+- Removed support for starting sessions from Dockerfile content; sessions must use `base_image`. **Breaking change**
 - Removed `workdir` parameter from start session request. **Breaking change**
 
 ## [0.3.1] - 2025-12-13

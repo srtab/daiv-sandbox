@@ -267,9 +267,7 @@ def test_start_session_with_extract_patch_creates_volume(client):
         mock_session_class.start.side_effect = [mock_patch_extractor, mock_cmd_executor]
 
         # Make the request
-        response = client.post(
-            "/session/", json={"base_image": "python:3.11", "extract_patch": True, "persist_workdir": False}
-        )
+        response = client.post("/session/", json={"base_image": "python:3.11", "extract_patch": True})
 
         assert response.status_code == 200
         assert response.json() == {"session_id": "cmd-executor-id"}

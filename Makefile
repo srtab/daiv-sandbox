@@ -13,7 +13,7 @@ help:
 	@echo "  make run            - Run the application"
 
 test:
-	uv run --all-extras pytest tests
+	uv run --all-extras pytest -s tests
 
 lint: lint-check lint-format
 

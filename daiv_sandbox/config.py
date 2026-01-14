@@ -35,6 +35,8 @@ class Settings(BaseSettings):
 
     # Execution
     RUNTIME: Literal["runc", "runsc"] = "runc"
+    RUN_UID: int = 1000
+    RUN_GID: int = 1000
 
     # Git
     GIT_IMAGE: str = "alpine/git:2.49.1"
