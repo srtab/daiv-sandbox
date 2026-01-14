@@ -47,16 +47,16 @@ $ docker run --rm -d -p 8000:8000 -e DAIV_SANDBOX_API_KEY=my-secret-api-key -e D
 
 All settings are configurable via environment variables. The available settings are:
 
-| Environment Variable                   | Description                                          | Options/Default                                                             |
-| -------------------------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------- |
-| **DAIV_SANDBOX_API_KEY**               | The API key required to access the sandbox API.      |                                                                             |
-| **DAIV_SANDBOX_ENVIRONMENT**           | The deployment environment.                          | Options: `local`, `production`<br>Default: "production"                     |
-| **DAIV_SANDBOX_SENTRY_DSN**            | The DSN for Sentry error tracking.                   | Optional                                                                    |
-| **DAIV_SANDBOX_SENTRY_ENABLE_TRACING** | Whether to enable tracing for Sentry error tracking. | Default: False                                                              |
-| **DAIV_SANDBOX_RUNTIME**               | The container runtime to use.                        | Options: `runc`, `runsc`<br>Default: "runc"                                 |
-| **DAIV_SANDBOX_HOST**                  | The host to bind the service to.                     | Default: "0.0.0.0"                                                          |
-| **DAIV_SANDBOX_PORT**                  | The port to bind the service to.                     | Default: 8000                                                               |
-| **DAIV_SANDBOX_LOG_LEVEL**             | The log level to use.                                | Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`<br>Default: "INFO" |
+| Environment Variable                | Description                                     | Options/Default                                                             |
+| ----------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------- |
+| **DAIV_SANDBOX_API_KEY**            | The API key required to access the sandbox API. |                                                                             |
+| **DAIV_SANDBOX_ENVIRONMENT**        | The deployment environment.                     | Options: `local`, `production`<br>Default: "production"                     |
+| **DAIV_SANDBOX_SENTRY_DSN**         | The DSN for Sentry error tracking.              | Optional                                                                    |
+| **DAIV_SANDBOX_SENTRY_ENABLE_LOGS** | Whether to enable Sentry log forwarding.        | Default: False                                                              |
+| **DAIV_SANDBOX_RUNTIME**            | The container runtime to use.                   | Options: `runc`, `runsc`<br>Default: "runc"                                 |
+| **DAIV_SANDBOX_HOST**               | The host to bind the service to.                | Default: "0.0.0.0"                                                          |
+| **DAIV_SANDBOX_PORT**               | The port to bind the service to.                | Default: 8000                                                               |
+| **DAIV_SANDBOX_LOG_LEVEL**          | The log level to use.                           | Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`<br>Default: "INFO" |
 
 ## Usage
 
@@ -68,7 +68,7 @@ All settings are configurable via environment variables. The available settings 
 
 ### Starting a Sandbox Session
 
-To start a sandbox session, you need to call the `POST /session/` endpoint. If a Docker image is provided, it will be pulled from the registry. If a Dockerfile is provided, it will be built from the Dockerfile.
+To start a sandbox session, you need to call the `POST /session/` endpoint. A Docker image is pulled from the registry and used to create the sandbox container.
 
 After image is pulled or built, the container will be created and started, along with an helper container that will be used to extract the patch of the changed files.
 
@@ -94,12 +94,11 @@ The following table describes the parameters for the `session/` endpoint:
 
 | Parameter       | Description                                                     | Required | Valid Values                         |
 | --------------- | --------------------------------------------------------------- | -------- | ------------------------------------ |
-| `base_image`    | The base image to use for the container.                        | No       | Any valid Docker image               |
-| `dockerfile`    | The Dockerfile to use for the container.                        | No       | Any valid Dockerfile                 |
+| `base_image`    | The base image to use for the container.                        | Yes      | Any valid Docker image               |
 | `extract_patch` | Extract a patch with the changes made by the executed commands. | No       | `true` or `false` (default: `false`) |
 
 > [!NOTE]
-> You need to provide either `base_image` or `dockerfile`. If both are provided, the `base_image` will be used.
+> For security reasons, building images from arbitrary Dockerfiles is not supported by this service. Provide a `base_image`.
 
 > [!WARNING]
 > The `base_image` need to be a distro image. Distroless images will not work as there is no shell available in the container to maintain the image running indefinitely.

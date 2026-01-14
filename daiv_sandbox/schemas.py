@@ -1,17 +1,8 @@
-import uuid
-
-from pydantic import Base64Bytes, BaseModel, Field, field_validator
-
-
-def generate_session_id() -> str:
-    return str(uuid.uuid4())
+from pydantic import Base64Bytes, BaseModel, Field
 
 
 class StartSessionRequest(BaseModel):
-    base_image: str | None = Field(
-        default=None, description="Docker image to be used as the base image for the sandbox."
-    )
-    dockerfile: str | None = Field(default=None, description="Dockerfile content to be used to build the image.")
+    base_image: str = Field(description="Docker image to be used as the base image for the sandbox.")
     ephemeral: bool = Field(
         default=False,
         description="Whether to start the session as ephemeral, not persisting the workspace between commands.",
@@ -22,13 +13,6 @@ class StartSessionRequest(BaseModel):
     network_enabled: bool = Field(default=False, description="Whether to enable network for the sandbox.")
     memory_bytes: int | None = Field(default=None, description="Memory in bytes to be used for the sandbox.")
     cpus: float | None = Field(default=None, description="CPUs to be used for the sandbox.")
-
-    @classmethod
-    @field_validator("base_image", "dockerfile")
-    def validate_base_image_or_dockerfile(cls, v, values):
-        if not v and not values.get("dockerfile"):
-            raise ValueError("Either `base_image` or `dockerfile` must be provided. Both cannot be None.")
-        return v
 
 
 class StartSessionResponse(BaseModel):

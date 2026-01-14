@@ -1,5 +1,4 @@
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from docker.errors import ImageNotFound, NotFound
@@ -7,7 +6,7 @@ from docker.models.containers import ExecResult
 from docker.models.images import Image
 
 from daiv_sandbox.config import settings
-from daiv_sandbox.sessions import SANDBOX_ROOT, SandboxDockerSession
+from daiv_sandbox.sessions import SANDBOX_ROOT, WORKDIR_ROOT, SandboxDockerSession
 
 
 @pytest.fixture
@@ -47,18 +46,6 @@ def test_start_with_image(mock_docker_client, mock_image):
         mock_start_container.assert_called_once_with("test-image")
 
 
-@patch("daiv_sandbox.sessions.tempfile.NamedTemporaryFile")
-def test_start_with_dockerfile(mock_named_temporary_file, mock_docker_client):
-    mock_named_temporary_file.return_value.__enter__.return_value.name = "test-dockerfile"
-    with (
-        patch.object(SandboxDockerSession, "_build_image") as mock_build_image,
-        patch.object(SandboxDockerSession, "_start_container") as mock_start_container,
-    ):
-        SandboxDockerSession.start(dockerfile="/home/user/Dockerfile")
-        mock_build_image.assert_called_once_with(Path("test-dockerfile"))
-        mock_start_container.assert_called_once_with(mock_build_image.return_value)
-
-
 def test__pull_image_with_image_not_found(mock_docker_client):
     mock_docker_client.images.get.side_effect = ImageNotFound("test-image")
     session = SandboxDockerSession()
@@ -70,16 +57,6 @@ def test__pull_image_with_image_found(mock_docker_client):
     session = SandboxDockerSession()
     session._pull_image("test-image")
     mock_docker_client.images.get.assert_called_once_with("test-image")
-
-
-def test__build_image(mock_docker_client):
-    session = SandboxDockerSession()
-    dockerfile = MagicMock(name="test-dockerfile")
-    result = session._build_image(dockerfile)
-    mock_docker_client.images.build.assert_called_once_with(
-        path=dockerfile.parent.as_posix(), dockerfile=dockerfile.name, tag=f"sandbox-{dockerfile.name}"
-    )
-    assert result == mock_docker_client.images.build.return_value[0].tags[-1]
 
 
 def test__start_container(mock_docker_client):
@@ -95,12 +72,16 @@ def test__start_container(mock_docker_client):
         tty=True,
         runtime=settings.RUNTIME,
         remove=True,
+        user=f"{settings.RUN_UID}:{settings.RUN_GID}",
     )
     assert session.container is not None
     assert session.container.id == mock_docker_client.containers.run.return_value.id
     assert session.session_id == mock_docker_client.containers.run.return_value.id
-    # Should create SANDBOX_ROOT directory
-    mock_container.exec_run.assert_called_once_with(["mkdir", "-p", "--", SANDBOX_ROOT], user="root")
+    # Should create sandbox directories and chown them
+    mock_container.exec_run.assert_any_call(["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT], user="root")
+    mock_container.exec_run.assert_any_call(
+        ["chown", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", SANDBOX_ROOT, WORKDIR_ROOT], user="root"
+    )
 
 
 def test_remove_container(mock_docker_client):
@@ -119,19 +100,30 @@ def test_remove_container_with_container_not_found(mock_docker_client):
 
 
 def test_copy_to_runtime_creates_directory(mock_docker_client):
+    import io
+    import tarfile
+
     session = SandboxDockerSession()
     session.container = MagicMock()
     session.container.exec_run.side_effect = [
         ExecResult(exit_code=0, output=b""),  # rm
         ExecResult(exit_code=0, output=b""),  # mkdir
         ExecResult(exit_code=0, output=b""),  # chmod
+        ExecResult(exit_code=0, output=b""),  # chown
     ]
-    with patch("io.BytesIO", return_value=MagicMock()) as mock_data:
-        session.copy_to_container(mock_data)
-        # Should use SANDBOX_ROOT by default
-        session.container.exec_run.assert_any_call(["rm", "-rf", "--", f"{SANDBOX_ROOT}/*"], user="root")
-        session.container.exec_run.assert_any_call(["mkdir", "-p", "--", SANDBOX_ROOT], user="root")
-        session.container.exec_run.assert_any_call(["chmod", "-R", "a+rX,u+w", "--", SANDBOX_ROOT], user="root")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        ti = tarfile.TarInfo("a.txt")
+        ti.size = 0
+        tf.addfile(ti, io.BytesIO(b""))
+    session.copy_to_container(buf)
+    # Should use SANDBOX_ROOT by default
+    session.container.exec_run.assert_any_call(["/bin/sh", "-c", ANY], user="root")
+    session.container.exec_run.assert_any_call(["mkdir", "-p", "--", SANDBOX_ROOT], user="root")
+    session.container.exec_run.assert_any_call(["chmod", "-R", "a+rX,u+w", "--", SANDBOX_ROOT], user="root")
+    session.container.exec_run.assert_any_call(
+        ["chown", "-R", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", SANDBOX_ROOT], user="root"
+    )
 
 
 def test_copy_from_runtime_raises_error_if_file_not_found():
@@ -152,24 +144,37 @@ def test_execute_command(mock_docker_client):
     assert result.exit_code == 0
     assert result.output == "output"
     # Should use SANDBOX_ROOT by default
-    session.container.exec_run.assert_called_once_with(["/bin/sh", "-c", "echo hello"], workdir=SANDBOX_ROOT)
+    session.container.exec_run.assert_called_once_with(
+        ["/bin/sh", "-c", "echo hello"], workdir=SANDBOX_ROOT, user=f"{settings.RUN_UID}:{settings.RUN_GID}"
+    )
 
 
 def test_copy_to_container_with_relative_dest(mock_docker_client):
     """Test that relative dest paths are resolved under SANDBOX_ROOT"""
+    import io
+    import tarfile
+
     session = SandboxDockerSession()
     session.container = MagicMock()
     session.container.exec_run.side_effect = [
         ExecResult(exit_code=0, output=b""),  # rm
         ExecResult(exit_code=0, output=b""),  # mkdir
         ExecResult(exit_code=0, output=b""),  # chmod
+        ExecResult(exit_code=0, output=b""),  # chown
     ]
-    with patch("io.BytesIO", return_value=MagicMock()) as mock_data:
-        session.copy_to_container(mock_data, dest="subdir")
-        expected_path = f"{SANDBOX_ROOT}/subdir"
-        session.container.exec_run.assert_any_call(["rm", "-rf", "--", f"{expected_path}/*"], user="root")
-        session.container.exec_run.assert_any_call(["mkdir", "-p", "--", expected_path], user="root")
-        session.container.exec_run.assert_any_call(["chmod", "-R", "a+rX,u+w", "--", expected_path], user="root")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        ti = tarfile.TarInfo("a.txt")
+        ti.size = 0
+        tf.addfile(ti, io.BytesIO(b""))
+    session.copy_to_container(buf, dest="subdir")
+    expected_path = f"{SANDBOX_ROOT}/subdir"
+    session.container.exec_run.assert_any_call(["/bin/sh", "-c", ANY], user="root")
+    session.container.exec_run.assert_any_call(["mkdir", "-p", "--", expected_path], user="root")
+    session.container.exec_run.assert_any_call(["chmod", "-R", "a+rX,u+w", "--", expected_path], user="root")
+    session.container.exec_run.assert_any_call(
+        ["chown", "-R", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", expected_path], user="root"
+    )
 
 
 def test_copy_from_container_with_relative_path(mock_docker_client):
@@ -190,7 +195,9 @@ def test_execute_command_with_relative_workdir(mock_docker_client):
     result = session.execute_command("echo hello", workdir="subdir")
     assert result.exit_code == 0
     expected_workdir = f"{SANDBOX_ROOT}/subdir"
-    session.container.exec_run.assert_called_once_with(["/bin/sh", "-c", "echo hello"], workdir=expected_workdir)
+    session.container.exec_run.assert_called_once_with(
+        ["/bin/sh", "-c", "echo hello"], workdir=expected_workdir, user=f"{settings.RUN_UID}:{settings.RUN_GID}"
+    )
 
 
 def test_execute_command_with_absolute_workdir(mock_docker_client):
@@ -200,4 +207,6 @@ def test_execute_command_with_absolute_workdir(mock_docker_client):
     session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"output")
     result = session.execute_command("echo hello", workdir="/custom/path")
     assert result.exit_code == 0
-    session.container.exec_run.assert_called_once_with(["/bin/sh", "-c", "echo hello"], workdir="/custom/path")
+    session.container.exec_run.assert_called_once_with(
+        ["/bin/sh", "-c", "echo hello"], workdir="/custom/path", user=f"{settings.RUN_UID}:{settings.RUN_GID}"
+    )

@@ -105,7 +105,7 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     """
     Start a session and return the session ID.
 
-    A Docker container is created with the base image or the Dockerfile provided.
+    A Docker container is created with the base image provided.
     The session ID is used to identify the created container in subsequent requests.
 
     This session ID ensures a consistent execution environment for the commands, including files and directories.
@@ -150,7 +150,7 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         cmd_executor_kwargs["cpus"] = request.cpus
 
     cmd_executor = SandboxDockerSession.start(
-        image=request.base_image, dockerfile=request.dockerfile, labels=cmd_executor_labels, **cmd_executor_kwargs
+        image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
     )
     return StartSessionResponse(session_id=cmd_executor.session_id)
 
@@ -197,7 +197,6 @@ async def run_on_session(
         # Clean up old directories and metadata, but keep /workdir/new (it's a mounted volume).
         patch_extractor.execute_command("rm -rf /workdir/old /workdir/meta")
         patch_extractor.execute_command("mkdir -p /workdir/old")
-        patch_extractor.execute_command("git config --global --add safe.directory /workdir")
 
         # Copy original archive to patch extractor for baseline comparison.
         patch_extractor.copy_to_container(io.BytesIO(request.archive), dest="/workdir/old/")
