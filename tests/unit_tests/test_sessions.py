@@ -6,7 +6,15 @@ from docker.models.containers import ExecResult
 from docker.models.images import Image
 
 from daiv_sandbox.config import settings
-from daiv_sandbox.sessions import SANDBOX_ROOT, WORKDIR_ROOT, SandboxDockerSession
+from daiv_sandbox.sessions import SANDBOX_HOME, SANDBOX_ROOT, WORKDIR_ROOT, SandboxDockerSession
+
+EXPECTED_EXEC_ENV = {
+    "HOME": SANDBOX_HOME,
+    "XDG_CACHE_HOME": f"{SANDBOX_HOME}/.cache",
+    "XDG_CONFIG_HOME": f"{SANDBOX_HOME}/.config",
+    "XDG_STATE_HOME": f"{SANDBOX_HOME}/.local/state",
+    "XDG_DATA_HOME": f"{SANDBOX_HOME}/.local/share",
+}
 
 
 @pytest.fixture
@@ -78,9 +86,11 @@ def test__start_container(mock_docker_client):
     assert session.container.id == mock_docker_client.containers.run.return_value.id
     assert session.session_id == mock_docker_client.containers.run.return_value.id
     # Should create sandbox directories and chown them
-    mock_container.exec_run.assert_any_call(["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT], user="root")
     mock_container.exec_run.assert_any_call(
-        ["chown", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", SANDBOX_ROOT, WORKDIR_ROOT], user="root"
+        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root"
+    )
+    mock_container.exec_run.assert_any_call(
+        ["chown", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root"
     )
 
 
@@ -145,7 +155,10 @@ def test_execute_command(mock_docker_client):
     assert result.output == "output"
     # Should use SANDBOX_ROOT by default
     session.container.exec_run.assert_called_once_with(
-        ["/bin/sh", "-c", "echo hello"], workdir=SANDBOX_ROOT, user=f"{settings.RUN_UID}:{settings.RUN_GID}"
+        ["/bin/sh", "-c", "echo hello"],
+        workdir=SANDBOX_ROOT,
+        user=f"{settings.RUN_UID}:{settings.RUN_GID}",
+        environment=EXPECTED_EXEC_ENV,
     )
 
 
@@ -196,7 +209,10 @@ def test_execute_command_with_relative_workdir(mock_docker_client):
     assert result.exit_code == 0
     expected_workdir = f"{SANDBOX_ROOT}/subdir"
     session.container.exec_run.assert_called_once_with(
-        ["/bin/sh", "-c", "echo hello"], workdir=expected_workdir, user=f"{settings.RUN_UID}:{settings.RUN_GID}"
+        ["/bin/sh", "-c", "echo hello"],
+        workdir=expected_workdir,
+        user=f"{settings.RUN_UID}:{settings.RUN_GID}",
+        environment=EXPECTED_EXEC_ENV,
     )
 
 
@@ -208,5 +224,13 @@ def test_execute_command_with_absolute_workdir(mock_docker_client):
     result = session.execute_command("echo hello", workdir="/custom/path")
     assert result.exit_code == 0
     session.container.exec_run.assert_called_once_with(
-        ["/bin/sh", "-c", "echo hello"], workdir="/custom/path", user=f"{settings.RUN_UID}:{settings.RUN_GID}"
+        ["/bin/sh", "-c", "echo hello"],
+        workdir="/custom/path",
+        user=f"{settings.RUN_UID}:{settings.RUN_GID}",
+        environment=EXPECTED_EXEC_ENV,
     )
+
+
+def test_get_exec_environment():
+    session = SandboxDockerSession()
+    assert session._get_exec_environment() == EXPECTED_EXEC_ENV

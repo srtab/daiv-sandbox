@@ -18,11 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Improved patch extraction performance by using shared Docker volumes instead of copying full workspace trees between containers.
-- Changed run container command `sleep` time to 1 hour to avoid containers being removed too early.
+- Changed run container command `sleep` time to 1 hour to avoid containers being removed too early for long running agents.
 - Sandbox commands now run as a non-root user by default.
 - Hardened archive extraction to reject unsafe archive contents and prevent extraction outside sandbox directories.
 - Changed `persist_workdir` parameter to `ephemeral` in start session request. **Breaking change**
 - Migrated pre-commit hook runner to `prek`.
+- Updated documentation to reflect the new changes.
 
 ### Removed
 
