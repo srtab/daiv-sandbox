@@ -22,6 +22,7 @@ logger = logging.getLogger("daiv_sandbox")
 # Canonical sandbox root directory inside all containers
 SANDBOX_ROOT = "/repo"
 WORKDIR_ROOT = "/workdir"
+SANDBOX_HOME = "/home/daiv-sandbox"
 
 
 def _sh_quote(value: str) -> str:
@@ -277,14 +278,16 @@ class SandboxDockerSession(Session):
         logger.info("Container '%s' created (status: %s)", container.short_id, container.status)
 
         # Ensure the sandbox directories exist and are writable by the sandbox user.
-        mkdir_result = container.exec_run(["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT], user="root")
+        mkdir_result = container.exec_run(["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root")
         if mkdir_result.exit_code != 0:
             raise RuntimeError(
                 f"Failed to create sandbox directories in {container.short_id}: "
                 f"(exit_code: {mkdir_result.exit_code}) -> {mkdir_result.output}"
             )
 
-        chown_result = container.exec_run(["chown", self._get_user(), "--", SANDBOX_ROOT, WORKDIR_ROOT], user="root")
+        chown_result = container.exec_run(
+            ["chown", self._get_user(), "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root"
+        )
         if chown_result.exit_code != 0:
             raise RuntimeError(
                 f"Failed to chown sandbox directories in {container.short_id}: "
@@ -425,7 +428,12 @@ class SandboxDockerSession(Session):
 
         logger.info("Executing command in %s:%s -> '%s'", self.container.short_id, command_workdir, command)
 
-        result = self.container.exec_run(["/bin/sh", "-c", command], workdir=command_workdir, user=self._get_user())
+        result = self.container.exec_run(
+            ["/bin/sh", "-c", command],
+            workdir=command_workdir,
+            user=self._get_user(),
+            environment=self._get_exec_environment(),
+        )
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -449,6 +457,21 @@ class SandboxDockerSession(Session):
         Get the user to execute sandbox commands as.
         """
         return f"{settings.RUN_UID}:{settings.RUN_GID}"
+
+    def _get_exec_environment(self) -> dict[str, str]:
+        """
+        Provide a writable HOME/XDG environment for sandboxed commands.
+
+        This avoids failures when HOME is unset, set to '/', or non-writable.
+        """
+        home = SANDBOX_HOME
+        return {
+            "HOME": home,
+            "XDG_CACHE_HOME": f"{home}/.cache",
+            "XDG_CONFIG_HOME": f"{home}/.config",
+            "XDG_STATE_HOME": f"{home}/.local/state",
+            "XDG_DATA_HOME": f"{home}/.local/share",
+        }
 
     def _get_container(self, session_id: str) -> Container | None:
         """
