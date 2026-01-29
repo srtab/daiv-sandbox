@@ -107,6 +107,7 @@ The following table describes the parameters for the `session/` endpoint:
 | `ephemeral`       | Do not persist workspace between command runs.                  | No       | `true` or `false` (default: `false`) |
 | `extract_patch`   | Extract a patch with the changes made by the executed commands. | No       | `true` or `false` (default: `false`) |
 | `network_enabled` | Enable network access inside the container.                     | No       | `true` or `false` (default: `false`) |
+| `environment`     | Environment variables to set at container start.                | No       | Object of string pairs               |
 | `memory_bytes`    | Memory limit for the container (bytes).                         | No       | Integer (bytes)                      |
 | `cpus`            | CPU quota for the container.                                    | No       | Float (e.g. `0.5`, `1.0`)            |
 

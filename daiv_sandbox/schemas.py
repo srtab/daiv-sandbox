@@ -11,6 +11,9 @@ class StartSessionRequest(BaseModel):
         default=False, description="Whether to extract a patch with the changes made by the executed commands."
     )
     network_enabled: bool = Field(default=False, description="Whether to enable network for the sandbox.")
+    environment: dict[str, str] | None = Field(
+        default=None, description="Environment variables to set in the container at startup."
+    )
     memory_bytes: int | None = Field(default=None, description="Memory in bytes to be used for the sandbox.")
     cpus: float | None = Field(default=None, description="CPUs to be used for the sandbox.")
 
