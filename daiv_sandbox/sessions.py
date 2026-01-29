@@ -275,7 +275,7 @@ class SandboxDockerSession(Session):
         self.session_id = container.id
         self.container = container
 
-        logger.info("Container '%s' created (status: %s)", container.short_id, container.status)
+        logger.info("Container '%s' started (status: %s)", container.short_id, container.status)
 
         # Ensure the sandbox directories exist and are writable by the sandbox user.
         mkdir_result = container.exec_run(["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root")

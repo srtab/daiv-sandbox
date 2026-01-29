@@ -143,6 +143,9 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     if not request.network_enabled:
         cmd_executor_kwargs["network_mode"] = "none"
 
+    if request.environment:
+        cmd_executor_kwargs["environment"] = request.environment
+
     if request.memory_bytes:
         cmd_executor_kwargs["mem_limit"] = request.memory_bytes
 
