@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Upgraded Python from 3.14.0 to 3.14.2.
 - Improved patch extraction performance by using shared Docker volumes instead of copying full workspace trees between containers.
 - Changed run container command `sleep` time to 1 hour to avoid containers being removed too early for long running agents.
 - Sandbox commands now run as a non-root user by default.
