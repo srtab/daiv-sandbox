@@ -23,7 +23,6 @@ dependencies = [
   "pydantic-settings==2.12.0",
   "sentry-sdk==2.52.0",
 ]
-
 urls.changelog = "https://github.com/srtab/daiv-sandbox/blob/main/CHANGELOG.md"
 urls.issues = "https://github.com/srtab/daiv-sandbox/issues"
 urls.source = "https://github.com/srtab/daiv-sandbox"
@@ -33,7 +32,7 @@ dev = [
   "mypy==1.19.1",
   "prek>=0.2.28",
   "pyopenssl==25.3.0",
-  "pyproject-fmt==2.12.1",
+  "pyproject-fmt==2.16.0",
   "pytest-cov==7.0.0",
   "pytest-env==1.3.2",
   "pytest-mock==3.15.1",
@@ -100,8 +99,8 @@ lint.isort.split-on-trailing-comma = false
 [tool.pyproject-fmt]
 keep_full_version = true
 
-[tool.pytest.ini_options]
-addopts = "--cov --cov-config=.coveragerc"
+[tool.pytest]
+ini_options.addopts = "--cov --cov-config=.coveragerc"
 
 [tool.pytest_env]
 DAIV_SANDBOX_API_KEY = "notsosecret"
