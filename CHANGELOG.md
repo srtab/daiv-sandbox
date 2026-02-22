@@ -7,11 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.4.0] - 2026-02-22
+
 ### Added
 
 - Added `memory_bytes` parameter to start session request to allow specifying the memory limit for the session.
 - Added `cpus` parameter to start session request to allow specifying the CPU limit for the session.
 - Added `network_enabled` parameter to start session request to allow specifying whether to enable network for the session.
+- Added `environment` parameter to start session request to allow passing environment variables to the container at startup.
 - Added `RUN_UID` and `RUN_GID` settings to control which user the sandbox runs commands as.
 - Added integration tests to the project.
 
@@ -25,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Changed `persist_workdir` parameter to `ephemeral` in start session request. **Breaking change**
 - Migrated pre-commit hook runner to `prek`.
 - Updated documentation to reflect the new changes.
+- Sandbox filesystem root changed from `/archives` to `/repo`.
+
+### Fixed
+
+- Fixed home directory permissions to allow tools like `uv` to write to user cache and config directories.
 
 ### Removed
 
@@ -290,7 +298,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/srtab/daiv-sandbox/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/srtab/daiv-sandbox/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/srtab/daiv-sandbox/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/srtab/daiv-sandbox/compare/v0.1.1...v0.2.0
