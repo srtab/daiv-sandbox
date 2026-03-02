@@ -6,7 +6,7 @@ from docker.models.containers import ExecResult
 from docker.models.images import Image
 
 from daiv_sandbox.config import settings
-from daiv_sandbox.sessions import SANDBOX_HOME, SANDBOX_ROOT, WORKDIR_ROOT, SandboxDockerSession
+from daiv_sandbox.sessions import PIPEFAIL_WRAPPER, SANDBOX_HOME, SANDBOX_ROOT, WORKDIR_ROOT, SandboxDockerSession
 
 EXPECTED_EXEC_ENV = {
     "HOME": SANDBOX_HOME,
@@ -136,7 +136,7 @@ def test_copy_to_runtime_creates_directory(mock_docker_client):
     )
 
 
-def test_copy_from_runtime_raises_error_if_file_not_found():
+def test_copy_from_runtime_raises_error_if_file_not_found(mock_docker_client):
     session = SandboxDockerSession()
     session.container = MagicMock()
     session.container.get_archive.return_value = ([], {"size": 0})
@@ -155,7 +155,24 @@ def test_execute_command(mock_docker_client):
     assert result.output == "output"
     # Should use SANDBOX_ROOT by default
     session.container.exec_run.assert_called_once_with(
-        ["/bin/sh", "-c", "echo hello"],
+        ["/bin/sh", "-c", PIPEFAIL_WRAPPER, "--", "echo hello"],
+        workdir=SANDBOX_ROOT,
+        user=f"{settings.RUN_UID}:{settings.RUN_GID}",
+        environment=EXPECTED_EXEC_ENV,
+    )
+
+
+def test_execute_command_pipefail_propagates_exit_code(mock_docker_client):
+    """A pipeline where the first command fails should return a non-zero exit code."""
+    session = SandboxDockerSession(session_id="test-session-id")
+    session.container = MagicMock()
+    # Simulate the shell returning exit code 1 because pipefail is active and
+    # the first stage of the pipeline failed (e.g. `false | true`).
+    session.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
+    result = session.execute_command("false | true")
+    assert result.exit_code == 1
+    session.container.exec_run.assert_called_once_with(
+        ["/bin/sh", "-c", PIPEFAIL_WRAPPER, "--", "false | true"],
         workdir=SANDBOX_ROOT,
         user=f"{settings.RUN_UID}:{settings.RUN_GID}",
         environment=EXPECTED_EXEC_ENV,
@@ -209,7 +226,7 @@ def test_execute_command_with_relative_workdir(mock_docker_client):
     assert result.exit_code == 0
     expected_workdir = f"{SANDBOX_ROOT}/subdir"
     session.container.exec_run.assert_called_once_with(
-        ["/bin/sh", "-c", "echo hello"],
+        ["/bin/sh", "-c", PIPEFAIL_WRAPPER, "--", "echo hello"],
         workdir=expected_workdir,
         user=f"{settings.RUN_UID}:{settings.RUN_GID}",
         environment=EXPECTED_EXEC_ENV,
@@ -224,13 +241,13 @@ def test_execute_command_with_absolute_workdir(mock_docker_client):
     result = session.execute_command("echo hello", workdir="/custom/path")
     assert result.exit_code == 0
     session.container.exec_run.assert_called_once_with(
-        ["/bin/sh", "-c", "echo hello"],
+        ["/bin/sh", "-c", PIPEFAIL_WRAPPER, "--", "echo hello"],
         workdir="/custom/path",
         user=f"{settings.RUN_UID}:{settings.RUN_GID}",
         environment=EXPECTED_EXEC_ENV,
     )
 
 
-def test_get_exec_environment():
+def test_get_exec_environment(mock_docker_client):
     session = SandboxDockerSession()
     assert session._get_exec_environment() == EXPECTED_EXEC_ENV

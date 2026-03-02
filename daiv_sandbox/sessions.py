@@ -24,6 +24,12 @@ SANDBOX_ROOT = "/repo"
 WORKDIR_ROOT = "/workdir"
 SANDBOX_HOME = "/home/daiv-sandbox"
 
+# Portable pipefail wrapper: uses bash when available (dash lacks pipefail support),
+# otherwise falls back to ash/sh which accept `-o pipefail` as a CLI flag.
+PIPEFAIL_WRAPPER = (
+    'if [ -x /bin/bash ]; then exec /bin/bash -o pipefail -c "$1"; else exec /bin/sh -o pipefail -c "$1"; fi'
+)
+
 
 def _sh_quote(value: str) -> str:
     """
@@ -429,7 +435,7 @@ class SandboxDockerSession(Session):
         logger.info("Executing command in %s:%s -> '%s'", self.container.short_id, command_workdir, command)
 
         result = self.container.exec_run(
-            ["/bin/sh", "-c", command],
+            ["/bin/sh", "-c", PIPEFAIL_WRAPPER, "--", command],
             workdir=command_workdir,
             user=self._get_user(),
             environment=self._get_exec_environment(),

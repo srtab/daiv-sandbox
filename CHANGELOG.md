@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- Fixed pipeline exit codes being masked by the last command; commands are now executed with `pipefail` enabled so a failing stage in a pipeline (e.g. `cmd1 | cmd2`) correctly propagates a non-zero exit code.
+
 ## [0.4.0] - 2026-02-22
 
 ### Added
