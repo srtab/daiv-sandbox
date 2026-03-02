@@ -429,7 +429,7 @@ class SandboxDockerSession(Session):
         logger.info("Executing command in %s:%s -> '%s'", self.container.short_id, command_workdir, command)
 
         result = self.container.exec_run(
-            ["/bin/sh", "-c", command],
+            ["/bin/sh", "-o", "pipefail", "-c", command],
             workdir=command_workdir,
             user=self._get_user(),
             environment=self._get_exec_environment(),
