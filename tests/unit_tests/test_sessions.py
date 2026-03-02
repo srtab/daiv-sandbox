@@ -155,7 +155,7 @@ def test_execute_command(mock_docker_client):
     assert result.output == "output"
     # Should use SANDBOX_ROOT by default
     session.container.exec_run.assert_called_once_with(
-        ["/bin/bash", "-o", "pipefail", "-c", "echo hello"],
+        ["/bin/sh", "-c", ANY, "--", "echo hello"],
         workdir=SANDBOX_ROOT,
         user=f"{settings.RUN_UID}:{settings.RUN_GID}",
         environment=EXPECTED_EXEC_ENV,
@@ -172,7 +172,7 @@ def test_execute_command_pipefail_propagates_exit_code(mock_docker_client):
     result = session.execute_command("false | true")
     assert result.exit_code == 1
     session.container.exec_run.assert_called_once_with(
-        ["/bin/bash", "-o", "pipefail", "-c", "false | true"],
+        ["/bin/sh", "-c", ANY, "--", "false | true"],
         workdir=SANDBOX_ROOT,
         user=f"{settings.RUN_UID}:{settings.RUN_GID}",
         environment=EXPECTED_EXEC_ENV,
@@ -226,7 +226,7 @@ def test_execute_command_with_relative_workdir(mock_docker_client):
     assert result.exit_code == 0
     expected_workdir = f"{SANDBOX_ROOT}/subdir"
     session.container.exec_run.assert_called_once_with(
-        ["/bin/bash", "-o", "pipefail", "-c", "echo hello"],
+        ["/bin/sh", "-c", ANY, "--", "echo hello"],
         workdir=expected_workdir,
         user=f"{settings.RUN_UID}:{settings.RUN_GID}",
         environment=EXPECTED_EXEC_ENV,
@@ -241,7 +241,7 @@ def test_execute_command_with_absolute_workdir(mock_docker_client):
     result = session.execute_command("echo hello", workdir="/custom/path")
     assert result.exit_code == 0
     session.container.exec_run.assert_called_once_with(
-        ["/bin/bash", "-o", "pipefail", "-c", "echo hello"],
+        ["/bin/sh", "-c", ANY, "--", "echo hello"],
         workdir="/custom/path",
         user=f"{settings.RUN_UID}:{settings.RUN_GID}",
         environment=EXPECTED_EXEC_ENV,
