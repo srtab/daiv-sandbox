@@ -136,7 +136,7 @@ def test_copy_to_runtime_creates_directory(mock_docker_client):
     )
 
 
-def test_copy_from_runtime_raises_error_if_file_not_found():
+def test_copy_from_runtime_raises_error_if_file_not_found(mock_docker_client):
     session = SandboxDockerSession()
     session.container = MagicMock()
     session.container.get_archive.return_value = ([], {"size": 0})
@@ -248,6 +248,6 @@ def test_execute_command_with_absolute_workdir(mock_docker_client):
     )
 
 
-def test_get_exec_environment():
+def test_get_exec_environment(mock_docker_client):
     session = SandboxDockerSession()
     assert session._get_exec_environment() == EXPECTED_EXEC_ENV

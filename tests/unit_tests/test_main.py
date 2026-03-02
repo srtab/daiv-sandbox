@@ -245,7 +245,8 @@ def test_run_commands_single_command_fail_fast_true(mock_session, client):  # no
 
 
 def test_health(client):
-    response = client.get("/-/health/")
+    with patch("daiv_sandbox.main.SandboxDockerSession.ping", return_value=True):
+        response = client.get("/-/health/")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
