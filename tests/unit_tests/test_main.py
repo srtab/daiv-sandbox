@@ -251,6 +251,13 @@ def test_health(client):
     assert response.json() == {"status": "ok"}
 
 
+def test_health_unhealthy(client):
+    with patch("daiv_sandbox.main.SandboxDockerSession.ping", return_value=False):
+        response = client.get("/-/health/")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Docker client is not responding"}
+
+
 def test_version(client):
     response = client.get("/-/version/")
     assert response.status_code == 200
