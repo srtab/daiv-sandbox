@@ -6,7 +6,7 @@ if TYPE_CHECKING:
     from fastapi.testclient import TestClient
 
 
-def test_pipeline_exit_code_reflects_first_failing_command(client: "TestClient", sandbox_session: "Callable[..., str]"):
+def test_pipeline_exit_code_reflects_first_failing_command(client: TestClient, sandbox_session: Callable[..., str]):
     """A pipeline where an earlier stage fails should return a non-zero exit code."""
     session_id = sandbox_session(base_image="alpine:latest")
 
@@ -17,7 +17,7 @@ def test_pipeline_exit_code_reflects_first_failing_command(client: "TestClient",
     assert run.json()["results"][0]["exit_code"] != 0
 
 
-def test_pipeline_exit_code_zero_when_all_succeed(client: "TestClient", sandbox_session: "Callable[..., str]"):
+def test_pipeline_exit_code_zero_when_all_succeed(client: TestClient, sandbox_session: Callable[..., str]):
     """A pipeline where all stages succeed should still return exit code 0."""
     session_id = sandbox_session(base_image="alpine:latest")
 
