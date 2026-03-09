@@ -1,15 +1,18 @@
 import base64
 import io
 import logging
-from typing import Annotated, Literal
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import sentry_sdk
-from fastapi import Depends, FastAPI, HTTPException, Response, Security, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, status
 from fastapi import Path as FastAPIPath
 from fastapi.security.api_key import APIKeyHeader
+from redis.asyncio import Redis
 
 from daiv_sandbox import __version__
 from daiv_sandbox.config import settings
+from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, SessionBusyError
 from daiv_sandbox.logs import LOGGING_CONFIG
 from daiv_sandbox.schemas import (
     ErrorMessage,
@@ -21,6 +24,9 @@ from daiv_sandbox.schemas import (
 )
 from daiv_sandbox.scripts import CMD_GIT_DIFF_EXTRACTOR_SCRIPT
 from daiv_sandbox.sessions import SandboxDockerSession
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +65,35 @@ To enhance security, `daiv-sandbox` leverages [`gVisor`](https://github.com/goog
 While `gVisor` significantly improves security, it may introduce some performance overhead due to its additional isolation mechanisms. This trade-off is generally acceptable for applications prioritizing security over raw execution speed.
 """  # noqa: E501
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    redis_client: Redis | None = None
+
+    if settings.REDIS_URL:
+        redis_client = Redis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=True)
+        app.state.redis = redis_client
+        app.state.session_lock_manager = RedisSessionLockManager(
+            redis_client,
+            ttl_seconds=settings.SESSION_LOCK_TTL_SECONDS,
+            wait_seconds=settings.SESSION_LOCK_WAIT_SECONDS,
+            refresh_interval_seconds=settings.SESSION_LOCK_REFRESH_SECONDS,
+        )
+    else:
+        if settings.ENVIRONMENT == "production":
+            logger.warning(
+                "REDIS_URL is not configured; per-session locking is disabled and concurrent requests may race"
+            )
+        app.state.redis = None
+        app.state.session_lock_manager = NoopSessionLockManager()
+
+    try:
+        yield
+    finally:
+        if redis_client is not None:
+            await redis_client.aclose()
+
+
 app = FastAPI(
     debug=settings.ENVIRONMENT == "local",
     title="DAIV Runtime Sandbox",
@@ -68,7 +103,10 @@ app = FastAPI(
     license_info={"name": "Apache License 2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0"},
     contact={"name": "DAIV", "url": "https://github.com/srtab/daiv-sandbox"},
     root_path=settings.API_V1_STR,
+    lifespan=lifespan,
 )
+app.state.redis = None
+app.state.session_lock_manager = NoopSessionLockManager()
 
 
 api_key_header = APIKeyHeader(
@@ -95,6 +133,10 @@ common_responses = {
     },
     status.HTTP_400_BAD_REQUEST: {
         "content": {"application/json": {"example": {"detail": "Error message"}}},
+        "model": ErrorMessage,
+    },
+    status.HTTP_409_CONFLICT: {
+        "content": {"application/json": {"example": {"detail": "Session is busy"}}},
         "model": ErrorMessage,
     },
 }
@@ -155,11 +197,14 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     cmd_executor = SandboxDockerSession.start(
         image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
     )
+    if cmd_executor.session_id is None:
+        raise RuntimeError("Started session is missing a session ID")
     return StartSessionResponse(session_id=cmd_executor.session_id)
 
 
 @app.post("/session/{session_id}/", responses=common_responses, name="Run commands on a session")
 async def run_on_session(
+    http_request: Request,
     session_id: Annotated[str, FastAPIPath(title="The ID of the session to run commands in.")],
     request: RunRequest,
     api_key: str = Depends(get_api_key),
@@ -169,91 +214,102 @@ async def run_on_session(
     the `extract_patch` parameter is set to `true` in the request to start the session and there were changes
     made by the commands.
     """
-    cmd_executor = SandboxDockerSession(session_id=session_id)
+    try:
+        async with http_request.app.state.session_lock_manager.acquire(session_id):
+            cmd_executor = SandboxDockerSession(session_id=session_id)
 
-    if not cmd_executor.container:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
+            if not cmd_executor.container:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
 
-    # Patch with the changes applied by the commands.
-    base64_patch: str | None = None
-    # Results of the commands.
-    results: list[RunResult] = []
+            # Patch with the changes applied by the commands.
+            base64_patch: str | None = None
+            # Results of the commands.
+            results: list[RunResult] = []
 
-    ephemeral_session = cmd_executor.get_label(DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL) == "1"
+            ephemeral_session = cmd_executor.get_label(DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL) == "1"
 
-    if request.archive:
-        cmd_executor.copy_to_container(io.BytesIO(request.archive), clear_before_copy=ephemeral_session)
+            if request.archive:
+                cmd_executor.copy_to_container(io.BytesIO(request.archive), clear_before_copy=ephemeral_session)
 
-    for command in request.commands:
-        result = cmd_executor.execute_command(command)
-        results.append(result)
+            for command in request.commands:
+                result = cmd_executor.execute_command(command)
+                results.append(result)
 
-        # Stop execution if fail_fast is enabled and command failed
-        if request.fail_fast and result.exit_code != 0:
-            break
+                # Stop execution if fail_fast is enabled and command failed
+                if request.fail_fast and result.exit_code != 0:
+                    break
 
-    if request.archive and (
-        extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
-    ):
-        patch_extractor = SandboxDockerSession(session_id=extract_patch_session_id)
+            if request.archive and (
+                extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
+            ):
+                patch_extractor = SandboxDockerSession(session_id=extract_patch_session_id)
 
-        # Clean up old directories and metadata, but keep /workdir/new (it's a mounted volume).
-        patch_extractor.execute_command("rm -rf /workdir/old /workdir/meta")
-        patch_extractor.execute_command("mkdir -p /workdir/old")
+                # Clean up old directories and metadata, but keep /workdir/new (it's a mounted volume).
+                patch_extractor.execute_command("rm -rf /workdir/old /workdir/meta")
+                patch_extractor.execute_command("mkdir -p /workdir/old")
 
-        # Copy original archive to patch extractor for baseline comparison.
-        patch_extractor.copy_to_container(io.BytesIO(request.archive), dest="/workdir/old/")
+                # Copy original archive to patch extractor for baseline comparison.
+                patch_extractor.copy_to_container(io.BytesIO(request.archive), dest="/workdir/old/")
 
-        # Always diff from the extracted root for consistency with the archive layout.
-        patch_result = patch_extractor.execute_command(CMD_GIT_DIFF_EXTRACTOR_SCRIPT, workdir="/workdir")
+                # Always diff from the extracted root for consistency with the archive layout.
+                patch_result = patch_extractor.execute_command(CMD_GIT_DIFF_EXTRACTOR_SCRIPT, workdir="/workdir")
 
-        if patch_result.exit_code != 0 and NO_CHANGES_MESSAGE not in patch_result.output:
-            logger.error("Failed to extract patch: [%s] %s", patch_result.exit_code, patch_result.output)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=(
-                    "Failed to extract patch with the changes made by the commands. Check the logs for more details."
-                ),
-            )
+                if patch_result.exit_code != 0 and NO_CHANGES_MESSAGE not in patch_result.output:
+                    logger.error("Failed to extract patch: [%s] %s", patch_result.exit_code, patch_result.output)
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=(
+                            "Failed to extract patch with the changes made by the commands. Check the logs for more "
+                            "details."
+                        ),
+                    )
 
-        if NO_CHANGES_MESSAGE in patch_result.output or patch_result.output.strip() == "":
-            base64_patch = None
-        else:
-            base64_patch = base64.b64encode(patch_result.output.encode()).decode()
+                if NO_CHANGES_MESSAGE in patch_result.output or patch_result.output.strip() == "":
+                    base64_patch = None
+                else:
+                    base64_patch = base64.b64encode(patch_result.output.encode()).decode()
 
-    return RunResponse(results=results, patch=base64_patch)
+            return RunResponse(results=results, patch=base64_patch)
+    except SessionBusyError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session is busy") from e
 
 
 @app.delete("/session/{session_id}/", responses=common_responses, name="Close a session")
 async def close_session(
-    session_id: Annotated[str, FastAPIPath(title="The ID of the session to close")], api_key: str = Depends(get_api_key)
+    request: Request,
+    session_id: Annotated[str, FastAPIPath(title="The ID of the session to close")],
+    api_key: str = Depends(get_api_key),
 ) -> Response:
     """
     Close a session by removing the Docker container and associated resources.
     """
     from docker.errors import NotFound as VolumeNotFound
 
-    cmd_executor = SandboxDockerSession(session_id=session_id)
+    try:
+        async with request.app.state.session_lock_manager.acquire(session_id):
+            cmd_executor = SandboxDockerSession(session_id=session_id)
 
-    if patch_extractor_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
-        patch_extractor = SandboxDockerSession(session_id=patch_extractor_session_id)
-        patch_extractor.remove_container()
+            if patch_extractor_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
+                patch_extractor = SandboxDockerSession(session_id=patch_extractor_session_id)
+                patch_extractor.remove_container()
 
-    cmd_executor.remove_container()
+            cmd_executor.remove_container()
 
-    # Remove shared workdir volume after all containers are removed.
-    if workdir_volume_name := cmd_executor.get_label(DAIV_SANDBOX_WORKDIR_VOLUME_LABEL):
-        try:
-            volume = cmd_executor.client.volumes.get(workdir_volume_name)
-            volume.remove(force=False)
-            logger.info("Removed shared volume '%s'", workdir_volume_name)
-        except VolumeNotFound:
-            logger.warning("Volume '%s' not found (already removed)", workdir_volume_name)
-        except Exception as e:
-            # Volume might still be in use or other error - log but don't fail the request
-            logger.warning("Failed to remove volume '%s': %s", workdir_volume_name, e)
+            # Remove shared workdir volume after all containers are removed.
+            if workdir_volume_name := cmd_executor.get_label(DAIV_SANDBOX_WORKDIR_VOLUME_LABEL):
+                try:
+                    volume = cmd_executor.client.volumes.get(workdir_volume_name)
+                    volume.remove(force=False)
+                    logger.info("Removed shared volume '%s'", workdir_volume_name)
+                except VolumeNotFound:
+                    logger.warning("Volume '%s' not found (already removed)", workdir_volume_name)
+                except Exception as e:
+                    # Volume might still be in use or other error - log but don't fail the request
+                    logger.warning("Failed to remove volume '%s': %s", workdir_volume_name, e)
 
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except SessionBusyError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session is busy") from e
 
 
 @app.get(

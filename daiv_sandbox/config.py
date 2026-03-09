@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     RUN_UID: int = 1000
     RUN_GID: int = 1000
 
+    # Session locking
+    REDIS_URL: str | None = None
+    SESSION_LOCK_TTL_SECONDS: int = 900
+    SESSION_LOCK_WAIT_SECONDS: float = 1.0
+    SESSION_LOCK_REFRESH_SECONDS: float = 30.0
+
     # Git
     GIT_IMAGE: str = "alpine/git:2.52.0"
 
