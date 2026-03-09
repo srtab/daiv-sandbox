@@ -88,10 +88,12 @@ def _sanitize_archive_bytes(data: bytes, *, uid: int, gid: int) -> bytes:
                     continue
 
                 if not (member.isfile() or member.isdir()):
-                    raise ValueError(
-                        "Archive contains an unsupported entry type "
-                        f"({member.name!r}, type={member.type!r}); only files/dirs are allowed"
+                    logger.warning(
+                        "Skipping unsupported archive entry %r (type=%r); only files/dirs are allowed",
+                        member.name,
+                        member.type,
                     )
+                    continue
 
                 # Mirror `chmod -R a+rX,u+w` semantics while clearing special bits.
                 base_mode = member.mode & 0o777

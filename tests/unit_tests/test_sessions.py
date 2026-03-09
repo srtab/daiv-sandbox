@@ -1,3 +1,5 @@
+import io
+import tarfile
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
@@ -6,7 +8,14 @@ from docker.models.containers import ExecResult
 from docker.models.images import Image
 
 from daiv_sandbox.config import settings
-from daiv_sandbox.sessions import PIPEFAIL_WRAPPER, SANDBOX_HOME, SANDBOX_ROOT, WORKDIR_ROOT, SandboxDockerSession
+from daiv_sandbox.sessions import (
+    PIPEFAIL_WRAPPER,
+    SANDBOX_HOME,
+    SANDBOX_ROOT,
+    WORKDIR_ROOT,
+    SandboxDockerSession,
+    _sanitize_archive_bytes,
+)
 
 EXPECTED_EXEC_ENV = {
     "HOME": SANDBOX_HOME,
@@ -251,3 +260,45 @@ def test_execute_command_with_absolute_workdir(mock_docker_client):
 def test_get_exec_environment(mock_docker_client):
     session = SandboxDockerSession()
     assert session._get_exec_environment() == EXPECTED_EXEC_ENV
+
+
+def test_sanitize_archive_bytes_skips_symlinks():
+    """Symlink entries should be silently skipped, not raise ValueError."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        content = b"hello"
+        info = tarfile.TarInfo(name="file.txt")
+        info.size = len(content)
+        tf.addfile(info, io.BytesIO(content))
+        sym = tarfile.TarInfo(name="CLAUDE.md")
+        sym.type = tarfile.SYMTYPE
+        sym.linkname = "file.txt"
+        tf.addfile(sym)
+
+    result = _sanitize_archive_bytes(buf.getvalue(), uid=1000, gid=1000)
+
+    with tarfile.open(fileobj=io.BytesIO(result)) as out_tf:
+        names = out_tf.getnames()
+    assert "file.txt" in names
+    assert "CLAUDE.md" not in names
+
+
+def test_sanitize_archive_bytes_skips_hardlinks():
+    """Hardlink entries should be silently skipped, not raise ValueError."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        content = b"hello"
+        info = tarfile.TarInfo(name="file.txt")
+        info.size = len(content)
+        tf.addfile(info, io.BytesIO(content))
+        lnk = tarfile.TarInfo(name="hardlink.txt")
+        lnk.type = tarfile.LNKTYPE
+        lnk.linkname = "file.txt"
+        tf.addfile(lnk)
+
+    result = _sanitize_archive_bytes(buf.getvalue(), uid=1000, gid=1000)
+
+    with tarfile.open(fileobj=io.BytesIO(result)) as out_tf:
+        names = out_tf.getnames()
+    assert "file.txt" in names
+    assert "hardlink.txt" not in names
