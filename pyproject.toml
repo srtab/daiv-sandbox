@@ -32,7 +32,7 @@ dev = [
   "mypy==1.19.1",
   "prek>=0.2.28",
   "pyopenssl==26.0.0",
-  "pyproject-fmt==2.18.1",
+  "pyproject-fmt==2.20.0",
   "pytest-cov==7.0.0",
   "pytest-env==1.6.0",
   "pytest-mock==3.15.1",
@@ -99,12 +99,6 @@ lint.isort.split-on-trailing-comma = false
 [tool.pyproject-fmt]
 keep_full_version = true
 
-[tool.pytest]
-ini_options.addopts = "--cov --cov-config=.coveragerc"
-
-[tool.pytest_env]
-DAIV_SANDBOX_API_KEY = "notsosecret"
-
 [tool.mypy]
 python_version = "3.14"
 check_untyped_defs = true
@@ -118,3 +112,9 @@ module = [
   "sentry_sdk.*",
 ]
 ignore_missing_imports = true
+
+[tool.pytest]
+ini_options.addopts = "--cov --cov-config=.coveragerc"
+
+[tool.pytest_env]
+DAIV_SANDBOX_API_KEY = "notsosecret"
