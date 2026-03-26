@@ -34,6 +34,15 @@ class RunRequest(BaseModel):
             "Defaults to False for backward compatibility."
         ),
     )
+    timeout: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Maximum execution time in seconds for each command. "
+            "Overrides the server default (DAIV_SANDBOX_COMMAND_TIMEOUT). "
+            "0 means no timeout."
+        ),
+    )
 
 
 class RunResult(BaseModel):
