@@ -1,6 +1,7 @@
 import base64
 import io
 import uuid
+from contextlib import AbstractAsyncContextManager
 from unittest.mock import Mock, patch
 
 import pytest
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from daiv_sandbox import __version__
 from daiv_sandbox.config import settings
+from daiv_sandbox.locks import SessionBusyError
 from daiv_sandbox.main import app
 from daiv_sandbox.schemas import RunResult
 
@@ -24,7 +26,26 @@ def mock_session():
 
 @pytest.fixture
 def client():
-    return TestClient(app, headers={"X-API-Key": settings.API_KEY.get_secret_value()}, root_path=settings.API_V1_STR)
+    with TestClient(
+        app, headers={"X-API-Key": settings.API_KEY.get_secret_value()}, root_path=settings.API_V1_STR
+    ) as client:
+        yield client
+
+
+class _BusyLockContext(AbstractAsyncContextManager[None]):
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+
+    async def __aenter__(self) -> None:
+        raise SessionBusyError(self.session_id)
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class BusySessionLockManager:
+    def acquire(self, session_id: str) -> _BusyLockContext:
+        return _BusyLockContext(session_id)
 
 
 @pytest.mark.parametrize("endpoint", ["/session/", "/session/id/"])
@@ -244,6 +265,15 @@ def test_run_commands_single_command_fail_fast_true(mock_session, client):  # no
     assert mock_session.execute_command.call_count == 1
 
 
+def test_run_commands_returns_conflict_when_session_is_locked(mock_session, client, monkeypatch):
+    monkeypatch.setattr(app.state, "session_lock_manager", BusySessionLockManager())
+
+    response = client.post(f"/session/{mock_session.session_id}/", json={"commands": ["echo hello"]})
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Session is busy"}
+
+
 def test_health(client):
     with patch("daiv_sandbox.main.SandboxDockerSession.ping", return_value=True):
         response = client.get("/-/health/")
@@ -391,3 +421,12 @@ def test_close_session_handles_missing_volume(client):
 
         # Verify container was still removed
         mock_cmd_executor.remove_container.assert_called_once()
+
+
+def test_close_session_returns_conflict_when_session_is_locked(mock_session, client, monkeypatch):
+    monkeypatch.setattr(app.state, "session_lock_manager", BusySessionLockManager())
+
+    response = client.delete(f"/session/{mock_session.session_id}/")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Session is busy"}

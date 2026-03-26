@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     RUN_GID: int = 1000
     COMMAND_TIMEOUT: int = Field(default=0, ge=0)  # per-command timeout in seconds; 0 = no timeout
 
+    # Session locking
+    REDIS_URL: str | None = None
+    SESSION_LOCK_TTL_SECONDS: int = 900
+    SESSION_LOCK_WAIT_SECONDS: float = 1.0
+    SESSION_LOCK_REFRESH_SECONDS: float = 30.0
+
     # Git
     GIT_IMAGE: str = "alpine/git:2.52.0"
 

@@ -205,8 +205,7 @@ class SandboxDockerSession(Session):
         Ping the Docker client.
 
         Args:
-            client (DockerClient | None): Docker client, if not provided, a new client will be created based on
-                local Docker context.
+            client (DockerClient | None): Docker client, if not provided, the shared client will be reused.
 
         Returns:
             bool: True if the client is pingable, False otherwise.
@@ -220,8 +219,7 @@ class SandboxDockerSession(Session):
 
         Args:
             image (str): Docker image to use.
-            client (DockerClient | None): Docker client, if not provided, a new client will be created based on
-                local Docker context.
+            client (DockerClient | None): Docker client, if not provided, the shared client will be reused.
 
         Returns:
             SandboxDockerSession: The session object.
@@ -242,8 +240,7 @@ class SandboxDockerSession(Session):
         Args:
             name (str): The name of the volume to create.
             labels (dict[str, str] | None): The labels to add to the volume.
-            client (DockerClient | None): Docker client, if not provided, a new client will be created based on
-                local Docker context.
+            client (DockerClient | None): Docker client, if not provided, the shared client will be reused.
 
         Returns:
             Volume: The created volume.
@@ -512,8 +509,6 @@ class SandboxDockerSession(Session):
             return None
 
         try:
-            container.reload()
-
             if container.status != "running":
                 logger.warning(
                     "Container '%s' is not running (status: %s). Attempting to restart...",

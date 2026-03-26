@@ -7,7 +7,10 @@ from daiv_sandbox.main import app
 
 @pytest.fixture
 def client():
-    return TestClient(app, headers={"X-API-Key": settings.API_KEY.get_secret_value()}, root_path=settings.API_V1_STR)
+    with TestClient(
+        app, headers={"X-API-Key": settings.API_KEY.get_secret_value()}, root_path=settings.API_V1_STR
+    ) as client:
+        yield client
 
 
 @pytest.fixture
