@@ -1,7 +1,7 @@
 import warnings
 from typing import Literal
 
-from pydantic import HttpUrl, SecretStr  # noqa: TC002
+from pydantic import Field, HttpUrl, SecretStr  # noqa: TC002
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 warnings.filterwarnings(
@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     RUNTIME: Literal["runc", "runsc"] = "runc"
     RUN_UID: int = 1000
     RUN_GID: int = 1000
+    COMMAND_TIMEOUT: int = Field(default=0, ge=0)  # per-command timeout in seconds; 0 = no timeout
 
     # Git
     GIT_IMAGE: str = "alpine/git:2.52.0"
