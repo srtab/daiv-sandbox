@@ -88,10 +88,12 @@ def _sanitize_archive_bytes(data: bytes, *, uid: int, gid: int) -> bytes:
                     continue
 
                 if not (member.isfile() or member.isdir()):
-                    raise ValueError(
-                        "Archive contains an unsupported entry type "
-                        f"({member.name!r}, type={member.type!r}); only files/dirs are allowed"
+                    logger.warning(
+                        "Skipping unsupported archive entry %r (type=%r); only files/dirs are allowed",
+                        member.name,
+                        member.type,
                     )
+                    continue
 
                 # Mirror `chmod -R a+rX,u+w` semantics while clearing special bits.
                 base_mode = member.mode & 0o777
@@ -441,22 +443,24 @@ class SandboxDockerSession(Session):
             environment=self._get_exec_environment(),
         )
 
+        # Decode the output to UTF-8, replacing invalid characters with U+FFFD. This is to avoid raising an exception
+        # when the output contains invalid characters.
+        output = result.output.decode("utf-8", errors="replace")
+
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "Command in %s:%s exited with code %s: %s",
                 self.container.short_id,
                 command_workdir,
                 result.exit_code,
-                result.output.decode(),
+                output,
             )
         elif result.exit_code != 0:
             logger.warning(
                 "Command in %s:%s exited with code %s", self.container.short_id, command_workdir, result.exit_code
             )
 
-        return RunResult(
-            command=command, output=result.output.decode(), exit_code=result.exit_code, workdir=command_workdir
-        )
+        return RunResult(command=command, output=output, exit_code=result.exit_code, workdir=command_workdir)
 
     def _get_user(self) -> str:
         """

@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Fixed pipeline exit codes being masked by the last command; commands are now executed with `pipefail` enabled so a failing stage in a pipeline (e.g. `cmd1 | cmd2`) correctly propagates a non-zero exit code.
 - Fixed same-session request races across replicas by adding Redis-backed per-session locking for run and close operations.
+- Fixed `ValueError` raised when an uploaded archive contains symlinks, hardlinks, or other non-regular entries (e.g. `CLAUDE.md` as a symlink); such entries are now silently skipped instead of aborting the request.
+- Fixed `UnicodeDecodeError` raised when an output contains invalid characters; such characters are now replaced with U+FFFD.
 
 ## [0.4.0] - 2026-02-22
 

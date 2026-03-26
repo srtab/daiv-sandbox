@@ -17,12 +17,12 @@ classifiers = [
 ]
 dependencies = [
   "docker==7.1.0",
-  "fastapi[standard]==0.135.1",
-  "ipython==9.10.0",
+  "fastapi[standard]==0.135.2",
+  "ipython==9.11.0",
   "pydantic==2.12.5",
   "pydantic-settings==2.13.1",
   "redis>=7.2.1",
-  "sentry-sdk==2.53.0",
+  "sentry-sdk==2.56.0",
 ]
 urls.changelog = "https://github.com/srtab/daiv-sandbox/blob/main/CHANGELOG.md"
 urls.issues = "https://github.com/srtab/daiv-sandbox/issues"
@@ -32,13 +32,13 @@ urls.source = "https://github.com/srtab/daiv-sandbox"
 dev = [
   "mypy==1.19.1",
   "prek>=0.2.28",
-  "pyopenssl==25.3.0",
-  "pyproject-fmt==2.17.0",
-  "pytest-cov==7.0.0",
-  "pytest-env==1.5.0",
+  "pyopenssl==26.0.0",
+  "pyproject-fmt==2.20.0",
+  "pytest-cov==7.1.0",
+  "pytest-env==1.6.0",
   "pytest-mock==3.15.1",
   "pytest-xdist==3.8.0",
-  "ruff==0.15.4",
+  "ruff==0.15.7",
 ]
 
 [tool.ruff]

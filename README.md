@@ -123,9 +123,7 @@ Here is an example using `python`:
 import httpx
 
 response = httpx.post(
-    "http://localhost:8000/api/v1/session/",
-    headers={"X-API-Key": "notsosecret"},
-    json={"base_image": "python:3.12"},
+    "http://localhost:8000/api/v1/session/", headers={"X-API-Key": "notsosecret"}, json={"base_image": "python:3.12"}
 )
 
 response.raise_for_status()
@@ -197,11 +195,7 @@ tarstream.seek(0)
 response = httpx.post(
     "http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/",
     headers={"X-API-Key": "notsosecret"},
-    json={
-        "archive": base64.b64encode(tarstream.getvalue()).decode(),
-        "commands": ["ls -la"],
-        "fail_fast": True,
-    },
+    json={"archive": base64.b64encode(tarstream.getvalue()).decode(), "commands": ["ls -la"], "fail_fast": True},
 )
 
 response.raise_for_status()
