@@ -100,12 +100,6 @@ lint.isort.split-on-trailing-comma = false
 [tool.pyproject-fmt]
 keep_full_version = true
 
-[tool.pytest]
-ini_options.addopts = "--cov --cov-config=.coveragerc"
-
-[tool.pytest_env]
-DAIV_SANDBOX_API_KEY = "notsosecret"
-
 [tool.mypy]
 python_version = "3.14"
 check_untyped_defs = true
@@ -119,3 +113,9 @@ module = [
   "sentry_sdk.*",
 ]
 ignore_missing_imports = true
+
+[tool.pytest]
+ini_options.addopts = "--cov --cov-config=.coveragerc"
+
+[tool.pytest_env]
+DAIV_SANDBOX_API_KEY = "notsosecret"
