@@ -9,18 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added `timeout` parameter to run commands request to set a per-command execution timeout in seconds. Overrides the server default (`DAIV_SANDBOX_COMMAND_TIMEOUT`). Commands that exceed the timeout are terminated with exit code `124`.
+- Added `timeout` parameter to run commands request to set a per-command execution timeout in seconds. Overrides the server default (`DAIV_SANDBOX_COMMAND_TIMEOUT`). Commands that exceed the timeout are terminated with exit code `124` and remaining commands are skipped.
 - Added `COMMAND_TIMEOUT` setting to configure a server-wide default per-command timeout. Defaults to `0` (no timeout).
+- Added optional Redis-backed per-session locking (`REDIS_URL` setting) to prevent concurrent requests from racing on the same session across replicas. Returns `409 Conflict` when a session is busy.
 
 ### Changed
 
 - Improved server concurrency: all blocking Docker operations are now executed off the async event loop, allowing multiple sessions to be served in parallel.
 - Improved session close performance: when a patch extractor is present, both containers are now removed concurrently.
+- Closing an already-removed session now returns `204` instead of raising an error.
 
 ### Fixed
 
 - Fixed pipeline exit codes being masked by the last command; commands are now executed with `pipefail` enabled so a failing stage in a pipeline (e.g. `cmd1 | cmd2`) correctly propagates a non-zero exit code.
-- Fixed same-session request races across replicas by adding Redis-backed per-session locking for run and close operations.
+- Fixed potential resource leak when session creation fails after the volume or patch extractor container were already created.
 - Fixed `ValueError` raised when an uploaded archive contains symlinks, hardlinks, or other non-regular entries (e.g. `CLAUDE.md` as a symlink); such entries are now silently skipped instead of aborting the request.
 - Fixed `UnicodeDecodeError` raised when an output contains invalid characters; such characters are now replaced with U+FFFD.
 

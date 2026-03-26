@@ -13,7 +13,7 @@ def test_redis_session_lock_manager_releases_owned_lock():
     redis_lock.release.return_value = None
     redis_client.lock.return_value = redis_lock
     lock_manager = RedisSessionLockManager(
-        redis_client, ttl_seconds=10, wait_seconds=0.0, refresh_interval_seconds=60.0
+        redis_client, ttl_seconds=60, wait_seconds=0.0, refresh_interval_seconds=10.0
     )
 
     async def run() -> None:
@@ -24,7 +24,7 @@ def test_redis_session_lock_manager_releases_owned_lock():
 
     redis_client.lock.assert_called_once_with(
         "daiv-sandbox:session-lock:session-123",
-        timeout=10,
+        timeout=60,
         sleep=0.1,
         blocking_timeout=0.0,
         thread_local=False,
@@ -42,7 +42,7 @@ def test_redis_session_lock_manager_raises_when_session_is_busy():
     redis_lock.acquire.return_value = False
     redis_client.lock.return_value = redis_lock
     lock_manager = RedisSessionLockManager(
-        redis_client, ttl_seconds=10, wait_seconds=0.0, refresh_interval_seconds=60.0
+        redis_client, ttl_seconds=60, wait_seconds=0.0, refresh_interval_seconds=10.0
     )
 
     async def run() -> None:

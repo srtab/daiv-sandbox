@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
 
     from redis.asyncio import Redis
     from redis.asyncio.lock import Lock
+
+logger = logging.getLogger(__name__)
 
 
 class SessionBusyError(RuntimeError):
@@ -46,6 +49,11 @@ class RedisSessionLockManager:
             raise ValueError("refresh_interval_seconds must be greater than zero")
         if acquire_sleep_seconds <= 0:
             raise ValueError("acquire_sleep_seconds must be greater than zero")
+        if refresh_interval_seconds >= ttl_seconds:
+            raise ValueError(
+                f"refresh_interval_seconds ({refresh_interval_seconds}) must be less than "
+                f"ttl_seconds ({ttl_seconds}) to prevent lock expiry before refresh"
+            )
 
         self.redis_client = redis_client
         self.key_prefix = key_prefix
@@ -63,11 +71,12 @@ class RedisSessionLockManager:
                 await asyncio.sleep(self.refresh_interval_seconds)
                 refreshed = await lock.reacquire()
                 if not refreshed:
+                    logger.warning("Lost session lock during refresh (key=%s)", lock.name)
                     return
-        except asyncio.CancelledError:
-            raise
         except LockError:
-            return
+            logger.warning("Lost session lock due to LockError (key=%s)", lock.name)
+        except Exception:
+            logger.exception("Unexpected error in lock refresh loop (key=%s)", lock.name)
 
     @asynccontextmanager
     async def acquire(self, session_id: str) -> AsyncIterator[None]:
@@ -92,5 +101,7 @@ class RedisSessionLockManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await refresh_task
 
-            with contextlib.suppress(LockError):
+            try:
                 await lock.release()
+            except LockError:
+                logger.warning("Failed to release session lock (key=%s); it will expire after TTL", lock.name)
