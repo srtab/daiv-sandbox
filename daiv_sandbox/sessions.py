@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import logging
 import tarfile
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, BinaryIO
@@ -175,15 +176,27 @@ class SandboxDockerSession(Session):
     A session is a Docker container that is used to execute commands.
     """
 
+    _shared_client: DockerClient | None = None
+    _client_lock: threading.Lock = threading.Lock()
+
+    @classmethod
+    def _get_shared_client(cls) -> DockerClient:
+        """Return a lazily-initialized, reused Docker client."""
+        if cls._shared_client is None:
+            with cls._client_lock:
+                if cls._shared_client is None:
+                    cls._shared_client = from_env()
+        return cls._shared_client
+
     def __init__(self, session_id: str | None = None, client: DockerClient | None = None):
         """
         Create a new sandbox session using Docker.
 
         Args:
-            client: Docker client, if not provided, a new client will be created based on local Docker context
+            client: Docker client, if not provided, the shared client will be reused.
         """
         self.session_id: str | None = session_id
-        self.client: DockerClient = client or from_env()
+        self.client: DockerClient = client or self._get_shared_client()
         self.container: Container | None = self._get_container(session_id) if session_id else None
 
     @classmethod

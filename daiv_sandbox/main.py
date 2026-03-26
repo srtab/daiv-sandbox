@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import logging
@@ -23,7 +24,7 @@ from daiv_sandbox.schemas import (
     StartSessionResponse,
 )
 from daiv_sandbox.scripts import CMD_GIT_DIFF_EXTRACTOR_SCRIPT
-from daiv_sandbox.sessions import SandboxDockerSession
+from daiv_sandbox.sessions import SANDBOX_ROOT, SandboxDockerSession
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -42,6 +43,7 @@ TYPE_PATCH_EXTRACTOR = "patch_extractor"
 TYPE_CMD_EXECUTOR = "cmd_executor"
 
 NO_CHANGES_MESSAGE = "nothing to commit, working tree clean"
+EXIT_CODE_TIMEOUT = 124  # matches timeout(1) convention
 
 
 # Configure Sentry
@@ -154,17 +156,18 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     """
     import uuid
 
-    from daiv_sandbox.sessions import SANDBOX_ROOT
-
     cmd_executor_labels = {DAIV_SANDBOX_TYPE_LABEL: TYPE_CMD_EXECUTOR}
     workdir_volume_name: str | None = None
 
     if request.extract_patch:
         # Create a shared Docker volume for the workspace
         workdir_volume_name = f"daiv-sandbox-workdir-{uuid.uuid4()}"
-        SandboxDockerSession.create_named_volume(name=workdir_volume_name, labels={DAIV_SANDBOX_MANAGED_LABEL: "1"})
+        await asyncio.to_thread(
+            SandboxDockerSession.create_named_volume, name=workdir_volume_name, labels={DAIV_SANDBOX_MANAGED_LABEL: "1"}
+        )
 
-        patch_extractor = SandboxDockerSession.start(
+        patch_extractor = await asyncio.to_thread(
+            SandboxDockerSession.start,
             image=settings.GIT_IMAGE,
             labels={DAIV_SANDBOX_TYPE_LABEL: TYPE_PATCH_EXTRACTOR},
             network_mode="none",
@@ -194,8 +197,8 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     if request.cpus:
         cmd_executor_kwargs["cpus"] = request.cpus
 
-    cmd_executor = SandboxDockerSession.start(
-        image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
+    cmd_executor = await asyncio.to_thread(
+        SandboxDockerSession.start, image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
     )
     if cmd_executor.session_id is None:
         raise RuntimeError("Started session is missing a session ID")
@@ -216,10 +219,13 @@ async def run_on_session(
     """
     try:
         async with http_request.app.state.session_lock_manager.acquire(session_id):
-            cmd_executor = SandboxDockerSession(session_id=session_id)
+            cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
 
             if not cmd_executor.container:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
+
+            raw_timeout = request.timeout if request.timeout is not None else settings.COMMAND_TIMEOUT
+            effective_timeout = float(raw_timeout) if raw_timeout > 0 else None
 
             # Patch with the changes applied by the commands.
             base64_patch: str | None = None
@@ -229,10 +235,24 @@ async def run_on_session(
             ephemeral_session = cmd_executor.get_label(DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL) == "1"
 
             if request.archive:
-                cmd_executor.copy_to_container(io.BytesIO(request.archive), clear_before_copy=ephemeral_session)
+                await asyncio.to_thread(
+                    cmd_executor.copy_to_container, io.BytesIO(request.archive), clear_before_copy=ephemeral_session
+                )
 
             for command in request.commands:
-                result = cmd_executor.execute_command(command)
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(cmd_executor.execute_command, command), timeout=effective_timeout
+                    )
+                except TimeoutError:
+                    # Note: the underlying thread running exec_run continues until the Docker command
+                    # finishes naturally; it is cleaned up when the session is closed (container removed).
+                    result = RunResult(
+                        command=command,
+                        output=f"Command timed out after {effective_timeout:.0f}s",
+                        exit_code=EXIT_CODE_TIMEOUT,
+                        workdir=SANDBOX_ROOT,
+                    )
                 results.append(result)
 
                 # Stop execution if fail_fast is enabled and command failed
@@ -242,17 +262,22 @@ async def run_on_session(
             if request.archive and (
                 extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
             ):
-                patch_extractor = SandboxDockerSession(session_id=extract_patch_session_id)
+                patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=extract_patch_session_id)
 
                 # Clean up old directories and metadata, but keep /workdir/new (it's a mounted volume).
-                patch_extractor.execute_command("rm -rf /workdir/old /workdir/meta")
-                patch_extractor.execute_command("mkdir -p /workdir/old")
+                await asyncio.to_thread(
+                    patch_extractor.execute_command, "rm -rf /workdir/old /workdir/meta && mkdir -p /workdir/old"
+                )
 
                 # Copy original archive to patch extractor for baseline comparison.
-                patch_extractor.copy_to_container(io.BytesIO(request.archive), dest="/workdir/old/")
+                await asyncio.to_thread(
+                    patch_extractor.copy_to_container, io.BytesIO(request.archive), dest="/workdir/old/"
+                )
 
                 # Always diff from the extracted root for consistency with the archive layout.
-                patch_result = patch_extractor.execute_command(CMD_GIT_DIFF_EXTRACTOR_SCRIPT, workdir="/workdir")
+                patch_result = await asyncio.to_thread(
+                    patch_extractor.execute_command, CMD_GIT_DIFF_EXTRACTOR_SCRIPT, workdir="/workdir"
+                )
 
                 if patch_result.exit_code != 0 and NO_CHANGES_MESSAGE not in patch_result.output:
                     logger.error("Failed to extract patch: [%s] %s", patch_result.exit_code, patch_result.output)
@@ -287,19 +312,22 @@ async def close_session(
 
     try:
         async with request.app.state.session_lock_manager.acquire(session_id):
-            cmd_executor = SandboxDockerSession(session_id=session_id)
+            cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
 
             if patch_extractor_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
-                patch_extractor = SandboxDockerSession(session_id=patch_extractor_session_id)
-                patch_extractor.remove_container()
-
-            cmd_executor.remove_container()
+                patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=patch_extractor_session_id)
+                await asyncio.gather(
+                    asyncio.to_thread(patch_extractor.remove_container),
+                    asyncio.to_thread(cmd_executor.remove_container),
+                )
+            else:
+                await asyncio.to_thread(cmd_executor.remove_container)
 
             # Remove shared workdir volume after all containers are removed.
             if workdir_volume_name := cmd_executor.get_label(DAIV_SANDBOX_WORKDIR_VOLUME_LABEL):
                 try:
-                    volume = cmd_executor.client.volumes.get(workdir_volume_name)
-                    volume.remove(force=False)
+                    volume = await asyncio.to_thread(cmd_executor.client.volumes.get, workdir_volume_name)
+                    await asyncio.to_thread(volume.remove, force=False)
                     logger.info("Removed shared volume '%s'", workdir_volume_name)
                 except VolumeNotFound:
                     logger.warning("Volume '%s' not found (already removed)", workdir_volume_name)
@@ -319,7 +347,7 @@ async def health() -> dict[Literal["status"], Literal["ok"]]:
     """
     Check if the Docker client is responding.
     """
-    if not SandboxDockerSession.ping():
+    if not await asyncio.to_thread(SandboxDockerSession.ping):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Docker client is not responding")
     return {"status": "ok"}
 

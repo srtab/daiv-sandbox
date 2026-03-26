@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Added `timeout` parameter to run commands request to set a per-command execution timeout in seconds. Overrides the server default (`DAIV_SANDBOX_COMMAND_TIMEOUT`). Commands that exceed the timeout are terminated with exit code `124`.
+- Added `COMMAND_TIMEOUT` setting to configure a server-wide default per-command timeout. Defaults to `0` (no timeout).
+
+### Changed
+
+- Improved server concurrency: all blocking Docker operations are now executed off the async event loop, allowing multiple sessions to be served in parallel.
+- Improved session close performance: when a patch extractor is present, both containers are now removed concurrently.
+
 ### Fixed
 
 - Fixed pipeline exit codes being masked by the last command; commands are now executed with `pipefail` enabled so a failing stage in a pipeline (e.g. `cmd1 | cmd2`) correctly propagates a non-zero exit code.

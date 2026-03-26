@@ -33,6 +33,8 @@ def mock_image():
 
 @pytest.fixture
 def mock_docker_client(mock_image):
+    # Reset the shared client singleton so each test gets a fresh mock.
+    SandboxDockerSession._shared_client = None
     with patch("daiv_sandbox.sessions.from_env") as mock_from_env:
         mock_client = MagicMock(
             images=MagicMock(
@@ -45,6 +47,8 @@ def mock_docker_client(mock_image):
         mock_from_env.return_value = mock_client
 
         yield mock_client
+
+    SandboxDockerSession._shared_client = None
 
 
 def test_ping(mock_docker_client):
