@@ -22,7 +22,7 @@ dependencies = [
   "pydantic==2.13.0",
   "pydantic-settings==2.13.1",
   "redis>=7.2.1",
-  "sentry-sdk==2.57.0",
+  "sentry-sdk==2.58.0",
 ]
 urls.changelog = "https://github.com/srtab/daiv-sandbox/blob/main/CHANGELOG.md"
 urls.issues = "https://github.com/srtab/daiv-sandbox/issues"
