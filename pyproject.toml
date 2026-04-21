@@ -19,7 +19,7 @@ dependencies = [
   "docker==7.1.0",
   "fastapi[standard]==0.135.3",
   "ipython==9.12.0",
-  "pydantic==2.12.5",
+  "pydantic==2.13.0",
   "pydantic-settings==2.13.1",
   "redis>=7.2.1",
   "sentry-sdk==2.57.0",
