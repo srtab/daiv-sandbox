@@ -389,11 +389,14 @@ class SandboxDockerSession(Session):
             raise ValueError("Refusing to extract an archive into the container root directory")
 
         if not (
-            to_dir_norm in (SANDBOX_ROOT, WORKDIR_ROOT)
+            to_dir_norm in (SANDBOX_ROOT, WORKDIR_ROOT, SKILLS_ROOT)
             or to_dir_norm.startswith(f"{SANDBOX_ROOT}/")
             or to_dir_norm.startswith(f"{WORKDIR_ROOT}/")
+            or to_dir_norm.startswith(f"{SKILLS_ROOT}/")
         ):
-            raise ValueError(f"Refusing to extract an archive outside of {SANDBOX_ROOT!r} or {WORKDIR_ROOT!r}")
+            raise ValueError(
+                f"Refusing to extract an archive outside of {SANDBOX_ROOT!r}, {WORKDIR_ROOT!r}, or {SKILLS_ROOT!r}"
+            )
 
         if clear_before_copy:
             q = _sh_quote(to_dir_norm)

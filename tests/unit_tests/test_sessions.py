@@ -318,6 +318,44 @@ def test_sanitize_archive_bytes_skips_hardlinks():
     assert "hardlink.txt" not in names
 
 
+def test_copy_to_container_allows_skills_root(mock_docker_client):
+    """copy_to_container accepts /skills (and subdirs) as a destination."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session.container.put_archive.return_value = True
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="skill.md")
+        info.size = 5
+        tf.addfile(info, io.BytesIO(b"hello"))
+    buf.seek(0)
+
+    # Should not raise; /skills is accepted.
+    session.copy_to_container(buf, dest=SKILLS_ROOT, clear_before_copy=False)
+
+    # Subpaths under /skills also accepted.
+    buf.seek(0)
+    session.copy_to_container(buf, dest=f"{SKILLS_ROOT}/builtin", clear_before_copy=False)
+
+
+def test_copy_to_container_rejects_non_reserved_root(mock_docker_client):
+    """Paths outside reserved roots are still refused."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="x")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
+
+    with pytest.raises(ValueError, match="Refusing to extract"):
+        session.copy_to_container(buf, dest="/etc/passwd", clear_before_copy=False)
+
+
 def test_start_container_creates_skills_root(mock_docker_client):
     """A freshly-started container has /skills owned by the sandbox user."""
     session = SandboxDockerSession()
