@@ -24,6 +24,9 @@ logger = logging.getLogger("daiv_sandbox")
 SANDBOX_ROOT = "/repo"
 WORKDIR_ROOT = "/workdir"
 SANDBOX_HOME = "/home/daiv-sandbox"
+# Reserved for future skill seeding (see spec §3.15). Created and chowned at
+# start_container time so the directory is ready when the seed step lands.
+SKILLS_ROOT = "/skills"
 
 # Portable pipefail wrapper: uses bash when available (dash lacks pipefail support),
 # otherwise falls back to ash/sh which accept `-o pipefail` as a CLI flag.
@@ -296,7 +299,9 @@ class SandboxDockerSession(Session):
         logger.info("Container '%s' started (status: %s)", container.short_id, container.status)
 
         # Ensure the sandbox directories exist and are writable by the sandbox user.
-        mkdir_result = container.exec_run(["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root")
+        mkdir_result = container.exec_run(
+            ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
+        )
         if mkdir_result.exit_code != 0:
             raise RuntimeError(
                 f"Failed to create sandbox directories in {container.short_id}: "
@@ -304,7 +309,7 @@ class SandboxDockerSession(Session):
             )
 
         chown_result = container.exec_run(
-            ["chown", self._get_user(), "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root"
+            ["chown", self._get_user(), "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
         )
         if chown_result.exit_code != 0:
             raise RuntimeError(

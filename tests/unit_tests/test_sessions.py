@@ -12,6 +12,7 @@ from daiv_sandbox.sessions import (
     PIPEFAIL_WRAPPER,
     SANDBOX_HOME,
     SANDBOX_ROOT,
+    SKILLS_ROOT,
     WORKDIR_ROOT,
     SandboxDockerSession,
     _sanitize_archive_bytes,
@@ -100,10 +101,19 @@ def test__start_container(mock_docker_client):
     assert session.session_id == mock_docker_client.containers.run.return_value.id
     # Should create sandbox directories and chown them
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root"
+        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
     )
     mock_container.exec_run.assert_any_call(
-        ["chown", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root"
+        [
+            "chown",
+            f"{settings.RUN_UID}:{settings.RUN_GID}",
+            "--",
+            SANDBOX_ROOT,
+            WORKDIR_ROOT,
+            SANDBOX_HOME,
+            SKILLS_ROOT,
+        ],
+        user="root",
     )
 
 
@@ -306,3 +316,29 @@ def test_sanitize_archive_bytes_skips_hardlinks():
         names = out_tf.getnames()
     assert "file.txt" in names
     assert "hardlink.txt" not in names
+
+
+def test_start_container_creates_skills_root(mock_docker_client):
+    """A freshly-started container has /skills owned by the sandbox user."""
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session._start_container("alpine:latest")
+
+    # mkdir -p was called including SKILLS_ROOT alongside the other roots.
+    mock_container.exec_run.assert_any_call(
+        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
+    )
+    # chown was called for SKILLS_ROOT alongside the other roots.
+    mock_container.exec_run.assert_any_call(
+        [
+            "chown",
+            f"{settings.RUN_UID}:{settings.RUN_GID}",
+            "--",
+            SANDBOX_ROOT,
+            WORKDIR_ROOT,
+            SANDBOX_HOME,
+            SKILLS_ROOT,
+        ],
+        user="root",
+    )
