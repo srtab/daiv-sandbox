@@ -430,3 +430,52 @@ def test_close_session_returns_conflict_when_session_is_locked(mock_session, cli
 
     assert response.status_code == 409
     assert response.json() == {"detail": "Session is busy"}
+
+
+def _minimal_archive_b64() -> str:
+    """Build a minimal tar archive with a single README.md and return base64 string."""
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="README.md")
+        info.size = 5
+        tf.addfile(info, io.BytesIO(b"hello"))
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def test_seed_session_extracts_repo_archive(mock_session, client):
+    """Successful seed returns 204 and runs marker-file write."""
+    from docker.models.containers import ExecResult
+
+    # Container is truthy. exec_run is called twice:
+    # 1. test -f /workdir/.daiv-seeded → exit 1 (not yet seeded)
+    # 2. touch /workdir/.daiv-seeded → exit 0
+    mock_session.container.exec_run.side_effect = [
+        ExecResult(exit_code=1, output=b""),
+        ExecResult(exit_code=0, output=b""),
+    ]
+
+    resp = client.post(f"/session/{mock_session.session_id}/seed/", json={"repo_archive": _minimal_archive_b64()})
+    assert resp.status_code == 204, resp.text
+    mock_session.copy_to_container.assert_called_once()
+
+
+def test_seed_session_rejects_unknown_session(client):
+    """When the session has no container, return 404."""
+    with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
+        instance = cls.return_value
+        instance.container = None
+        resp = client.post("/session/does-not-exist/seed/", json={"repo_archive": _minimal_archive_b64()})
+        assert resp.status_code == 404
+
+
+def test_seed_session_rejects_double_seed(mock_session, client):
+    """A second seed attempt on an already-seeded session returns 409."""
+    from docker.models.containers import ExecResult
+
+    # Marker exists → 409.
+    mock_session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    resp = client.post(f"/session/{mock_session.session_id}/seed/", json={"repo_archive": _minimal_archive_b64()})
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": "Session already seeded"}

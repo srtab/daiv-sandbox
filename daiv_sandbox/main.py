@@ -20,10 +20,11 @@ from daiv_sandbox.schemas import (
     RunRequest,
     RunResponse,
     RunResult,
+    SeedSessionRequest,
     StartSessionRequest,
     StartSessionResponse,
 )
-from daiv_sandbox.scripts import CMD_INIT_META_SCRIPT, CMD_TURN_DIFF_SCRIPT  # noqa: F401
+from daiv_sandbox.scripts import CMD_INIT_META_SCRIPT, CMD_TURN_DIFF_SCRIPT
 from daiv_sandbox.sessions import SANDBOX_ROOT, SandboxDockerSession
 
 if TYPE_CHECKING:
@@ -222,6 +223,60 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     if cmd_executor.session_id is None:
         raise RuntimeError("Started session is missing a session ID")
     return StartSessionResponse(session_id=cmd_executor.session_id)
+
+
+@app.post("/session/{session_id}/seed/", responses=common_responses, name="Seed initial session state")
+async def seed_session(
+    http_request: Request,
+    session_id: Annotated[str, FastAPIPath(title="The ID of the session to seed.")],
+    request: SeedSessionRequest,
+    api_key: str = Depends(get_api_key),
+) -> Response:
+    """
+    Establish the initial state of /repo and initialise the patch-extractor's meta repo.
+
+    One-shot per session: subsequent calls return 409.
+    """
+    async with http_request.app.state.session_lock_manager.acquire(session_id):
+        cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
+
+        if not cmd_executor.container:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
+
+        # Marker-file approach: Docker labels are immutable on running containers,
+        # so we record "seeded" via /workdir/.daiv-seeded inside the cmd_executor.
+        check = await asyncio.to_thread(
+            cmd_executor.container.exec_run, ["/bin/sh", "-c", "test -f /workdir/.daiv-seeded"], user="root"
+        )
+        if check.exit_code == 0:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session already seeded")
+
+        # Extract the archive into /repo. clear_before_copy=False because the
+        # workdir volume is freshly created and contains nothing to clear.
+        await asyncio.to_thread(
+            cmd_executor.copy_to_container, io.BytesIO(request.repo_archive), dest=SANDBOX_ROOT, clear_before_copy=False
+        )
+
+        # Initialise the patch-extractor meta repo with the seeded state.
+        if extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
+            patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=extract_patch_session_id)
+            init_result = await asyncio.to_thread(
+                patch_extractor.execute_command, CMD_INIT_META_SCRIPT, workdir="/workdir"
+            )
+            if init_result.exit_code != 0:
+                logger.error("Failed to init meta repo: [%s] %s", init_result.exit_code, init_result.output)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to initialise patch-extractor meta repo. Check logs.",
+                )
+
+        marker_result = await asyncio.to_thread(
+            cmd_executor.container.exec_run, ["/bin/sh", "-c", "touch /workdir/.daiv-seeded"], user="root"
+        )
+        if marker_result.exit_code != 0:
+            logger.error("Failed to mark session seeded: %s", marker_result.output)
+
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.post("/session/{session_id}/", responses=common_responses, name="Run commands on a session")
