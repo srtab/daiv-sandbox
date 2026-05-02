@@ -470,6 +470,59 @@ def test_seed_session_rejects_unknown_session(client):
         assert resp.status_code == 404
 
 
+def test_apply_mutations_creates_file(mock_session, client):
+    """Happy path: a single put returns ok=True for that path."""
+    payload = {
+        "mutations": [
+            {"path": "/repo/new_file.py", "content": base64.b64encode(b"print('hi')\n").decode(), "mode": 0o644}
+        ]
+    }
+    resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["results"] == [{"path": "/repo/new_file.py", "ok": True, "error": None}]
+    mock_session.write_file.assert_called_once()
+
+
+def test_apply_mutations_rejects_path_outside_repo(mock_session, client):
+    """Per-item rejection for /skills, /workdir, /etc, traversal — not 4xx."""
+    bad_paths = ["/skills/foo.md", "/workdir/x", "/etc/passwd", "/repo/../etc/passwd"]
+    for path in bad_paths:
+        payload = {"mutations": [{"path": path, "content": base64.b64encode(b"x").decode(), "mode": 0o644}]}
+        resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
+        assert resp.status_code == 200, f"path={path}: status={resp.status_code}"
+        result = resp.json()["results"][0]
+        assert result["ok"] is False, f"expected rejection for {path}, got {result}"
+        assert result["error"] is not None
+
+
+def test_apply_mutations_unknown_session_returns_404(client):
+    """When the session has no container, return 404."""
+    with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
+        instance = cls.return_value
+        instance.container = None
+        payload = {"mutations": [{"path": "/repo/x", "content": base64.b64encode(b"x").decode(), "mode": 0o644}]}
+        resp = client.post("/session/no-such-id/files/", json=payload)
+        assert resp.status_code == 404
+
+
+def test_apply_mutations_empty_batch_rejected(mock_session, client):
+    """Schema-level rejection of empty mutations list → 422."""
+    resp = client.post(f"/session/{mock_session.session_id}/files/", json={"mutations": []})
+    assert resp.status_code == 422
+
+
+def test_apply_mutations_oversized_batch_rejected(mock_session, client):
+    """More than 64 mutations → 422."""
+    payload = {
+        "mutations": [
+            {"path": f"/repo/f{i}.py", "content": base64.b64encode(b"").decode(), "mode": 0o644} for i in range(65)
+        ]
+    }
+    resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
+    assert resp.status_code == 422
+
+
 def test_seed_session_rejects_double_seed(mock_session, client):
     """A second seed attempt on an already-seeded session returns 409."""
     from docker.models.containers import ExecResult
