@@ -7,14 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Breaking changes
+
+- Removed `StartSessionRequest.ephemeral` and the `DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL` mechanism.
+- Removed `RunRequest.archive`. Initial session state is now established via the new `POST /session/{id}/seed/` endpoint.
+
 ### Added
 
+- `POST /session/{id}/seed/` — one-shot per session, extracts a repo archive into `/repo` and initialises the patch-extractor's meta repo.
+- `POST /session/{id}/files/` — applies a batch of file mutations and advances the meta HEAD; per-item validation, returns `MutationResult[]`.
+- `SKILLS_ROOT = "/skills"` reserved at session start (`mkdir -p` + `chown`) for future skill seeding.
 - Added `timeout` parameter to run commands request to set a per-command execution timeout in seconds. Overrides the server default (`DAIV_SANDBOX_COMMAND_TIMEOUT`). Commands that exceed the timeout are terminated with exit code `124` and remaining commands are skipped.
 - Added `COMMAND_TIMEOUT` setting to configure a server-wide default per-command timeout. Defaults to `0` (no timeout).
 - Added optional Redis-backed per-session locking (`REDIS_URL` setting) to prevent concurrent requests from racing on the same session across replicas. Returns `409 Conflict` when a session is busy.
 
 ### Changed
 
+- `run_on_session` is commands-only; per-call patch is `HEAD~1..HEAD` against the stateful meta repo (advanced after every `apply_file_mutations` call and every `run_commands` call).
 - Improved server concurrency: all blocking Docker operations are now executed off the async event loop, allowing multiple sessions to be served in parallel.
 - Improved session close performance: when a patch extractor is present, both containers are now removed concurrently.
 - Closing an already-removed session now returns `204` instead of raising an error.
