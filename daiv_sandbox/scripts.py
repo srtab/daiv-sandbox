@@ -1,37 +1,39 @@
-CMD_GIT_DIFF_EXTRACTOR_SCRIPT = """\
+CMD_INIT_META_SCRIPT = """\
 set -euo pipefail
 
-OLD="/workdir/old/."
-NEW="/workdir/new/."
-META="/workdir/meta"
+META=/workdir/meta
+NEW=/workdir/new
 EXCLUDES="$META/.git-excludes"
 
-# Clean up old directories and metadata (but not NEW, which is read-only mounted).
-rm -rf "$META" "$OLD/.git"
+rm -rf "$META"
 mkdir -p "$META"
 
-# Create excludes file to ignore .git directories without modifying the source trees
-cat > "$EXCLUDES" << 'EOF'
+cat > "$EXCLUDES" <<'EOF'
 .git
 .git/
 EOF
 
-# Capture OLD and NEW as two commits in a tiny temp repo
 git -C "$META" init -q
 git -C "$META" config user.name daiv-sandbox
 git -C "$META" config user.email daiv-sandbox@local
 git -C "$META" config core.excludesFile "$EXCLUDES"
 
-# commit baseline (OLD)
-git -C "$META" --work-tree="$OLD" add -A
-git -C "$META" --work-tree="$OLD" commit -qm "baseline"
+# Empty root commit so HEAD~1 always exists from the very first turn.
+git -C "$META" commit -q --allow-empty -m "root"
 
-BASE_COMMIT=$(git -C "$META" rev-parse HEAD)
-
-# commit post-sandbox (NEW)
+# The seeded state becomes the second commit. HEAD = seed, HEAD~1 = root.
 git -C "$META" --work-tree="$NEW" add -A
-git -C "$META" --work-tree="$NEW" commit -qm "post"
+git -C "$META" --work-tree="$NEW" commit -q --allow-empty -m "seed"
+"""
 
-# Emit only this turn's delta (binary-safe, rename-aware)
-git -C "$META" -c diff.renames=true diff -M --binary "$BASE_COMMIT"..HEAD
+
+CMD_TURN_DIFF_SCRIPT = """\
+set -euo pipefail
+
+META=/workdir/meta
+NEW=/workdir/new
+
+git -C "$META" --work-tree="$NEW" add -A
+git -C "$META" --work-tree="$NEW" commit -q --allow-empty -m "turn"
+git -C "$META" -c diff.renames=true diff -M --binary HEAD~1..HEAD
 """

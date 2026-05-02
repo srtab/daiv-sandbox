@@ -23,7 +23,7 @@ from daiv_sandbox.schemas import (
     StartSessionRequest,
     StartSessionResponse,
 )
-from daiv_sandbox.scripts import CMD_GIT_DIFF_EXTRACTOR_SCRIPT
+from daiv_sandbox.scripts import CMD_INIT_META_SCRIPT, CMD_TURN_DIFF_SCRIPT  # noqa: F401
 from daiv_sandbox.sessions import SANDBOX_ROOT, SandboxDockerSession
 
 if TYPE_CHECKING:
@@ -296,7 +296,7 @@ async def run_on_session(
 
             # Always diff from the extracted root for consistency with the archive layout.
             patch_result = await asyncio.to_thread(
-                patch_extractor.execute_command, CMD_GIT_DIFF_EXTRACTOR_SCRIPT, workdir="/workdir"
+                patch_extractor.execute_command, CMD_TURN_DIFF_SCRIPT, workdir="/workdir"
             )
 
             if patch_result.exit_code != 0 and NO_CHANGES_MESSAGE not in patch_result.output:
