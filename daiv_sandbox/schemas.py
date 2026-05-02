@@ -3,10 +3,6 @@ from pydantic import Base64Bytes, BaseModel, Field
 
 class StartSessionRequest(BaseModel):
     base_image: str = Field(description="Docker image to be used as the base image for the sandbox.")
-    ephemeral: bool = Field(
-        default=False,
-        description="Whether to start the session as ephemeral, not persisting the workspace between commands.",
-    )
     extract_patch: bool = Field(
         default=False, description="Whether to extract a patch with the changes made by the executed commands."
     )
@@ -24,9 +20,6 @@ class StartSessionResponse(BaseModel):
 
 class RunRequest(BaseModel):
     commands: list[str] = Field(description="List of bash commands to be executed in the sandbox.")
-    archive: Base64Bytes | None = Field(
-        default=None, description="Base64-encoded archive with files to be copied to the sandbox."
-    )
     fail_fast: bool = Field(
         default=False,
         description=(
@@ -55,6 +48,36 @@ class RunResult(BaseModel):
 class RunResponse(BaseModel):
     results: list[RunResult] = Field(description="List of results of each command.")
     patch: str | None = Field(description="Base64-encoded patch with the changes.")
+
+
+class PutMutation(BaseModel):
+    path: str = Field(description="Absolute path inside the sandbox, must be under /repo.")
+    content: Base64Bytes = Field(description="Base64-encoded full file content.")
+    mode: int = Field(ge=0, le=0o7777, description="POSIX mode bits to set on the file.")
+
+
+class ApplyMutationsRequest(BaseModel):
+    mutations: list[PutMutation] = Field(min_length=1, max_length=64)
+
+
+class MutationResult(BaseModel):
+    path: str = Field(description="The path the mutation targeted.")
+    ok: bool = Field(description="Whether the mutation was applied successfully.")
+    error: str | None = Field(default=None, description="Per-item error message when ok=False.")
+
+
+class ApplyMutationsResponse(BaseModel):
+    results: list[MutationResult]
+
+
+class SeedSessionRequest(BaseModel):
+    """Initial state for a freshly-started session.
+
+    Future-extensible: e.g. a `skills_archive: Base64Bytes | None = None` field
+    will land here when skill seeding is implemented (spec §3.15).
+    """
+
+    repo_archive: Base64Bytes = Field(description="Tar archive that becomes the initial state of /repo.")
 
 
 class ErrorMessage(BaseModel):
