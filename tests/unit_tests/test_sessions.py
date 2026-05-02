@@ -318,6 +318,60 @@ def test_sanitize_archive_bytes_skips_hardlinks():
     assert "hardlink.txt" not in names
 
 
+def test_write_file_builds_singlefile_tar_for_repo_path(mock_docker_client, monkeypatch):
+    """write_file places content at /repo/<rel> via copy_to_container with the right mode."""
+    captured: dict = {}
+
+    def fake_copy(self, tardata, dest=None, clear_before_copy=True):
+        captured["dest"] = dest
+        captured["clear"] = clear_before_copy
+        captured["tar_bytes"] = tardata.getvalue() if hasattr(tardata, "getvalue") else tardata.read()
+
+    monkeypatch.setattr(SandboxDockerSession, "copy_to_container", fake_copy)
+
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.write_file(f"{SANDBOX_ROOT}/sub/dir/foo.py", b"print('hi')\n", mode=0o755)
+
+    assert captured["dest"] == f"{SANDBOX_ROOT}/sub/dir"
+    assert captured["clear"] is False
+
+    with tarfile.open(fileobj=io.BytesIO(captured["tar_bytes"])) as tf:
+        members = tf.getmembers()
+        assert len(members) == 1
+        assert members[0].name == "foo.py"
+        assert members[0].isfile()
+        assert (members[0].mode & 0o7777) == 0o755
+        assert tf.extractfile(members[0]).read() == b"print('hi')\n"
+
+
+def test_write_file_rejects_path_outside_sandbox_root(mock_docker_client):
+    """write_file refuses paths outside SANDBOX_ROOT."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+
+    with pytest.raises(ValueError, match="must be under"):
+        session.write_file("/etc/passwd", b"pwned", mode=0o644)
+
+
+def test_write_file_rejects_traversal(mock_docker_client):
+    """write_file refuses paths with .. segments."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+
+    with pytest.raises(ValueError):
+        session.write_file(f"{SANDBOX_ROOT}/../etc/passwd", b"pwned", mode=0o644)
+
+
+def test_write_file_rejects_nul_in_path(mock_docker_client):
+    """write_file refuses paths containing NUL or newline characters."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+
+    with pytest.raises(ValueError):
+        session.write_file(f"{SANDBOX_ROOT}/foo\x00bar", b"x", mode=0o644)
+
+
 def test_copy_to_container_allows_skills_root(mock_docker_client):
     """copy_to_container accepts /skills (and subdirs) as a destination."""
     session = SandboxDockerSession()

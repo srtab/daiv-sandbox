@@ -45,6 +45,41 @@ def _sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def _validate_sandbox_path(path: str, allowed_roots: tuple[str, ...]) -> str:
+    """
+    Lexically validate that *path* is a safe absolute path under one of *allowed_roots*.
+
+    Returns the canonicalised absolute path. Raises ValueError on any rejection.
+    """
+    if "\x00" in path or "\n" in path or "\r" in path:
+        raise ValueError(f"path must not contain NUL or newline characters: {path!r}")
+    p = PurePosixPath(path)
+    if not p.is_absolute():
+        raise ValueError(f"path must be absolute, got: {path!r}")
+    if ".." in p.parts:
+        raise ValueError(f"path must not contain '..' segments: {path!r}")
+    canonical = str(p)
+    for root in allowed_roots:
+        root_norm = root.rstrip("/") or "/"
+        if canonical == root_norm:
+            raise ValueError(f"path must not equal a reserved root: {path!r}")
+        if canonical.startswith(f"{root_norm}/"):
+            return canonical
+    raise ValueError(f"path must be under one of {allowed_roots}, got: {path!r}")
+
+
+def _build_single_file_tar(filename: str, content: bytes, *, mode: int) -> bytes:
+    """Build an uncompressed tar containing one regular-file member."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name=filename)
+        info.size = len(content)
+        info.mode = mode & 0o7777
+        info.type = tarfile.REGTYPE
+        tf.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
 def _normalize_tar_member_name(name: str) -> str | None:
     """
     Normalize tar member names and reject traversal / absolute paths.
@@ -479,6 +514,21 @@ class SandboxDockerSession(Session):
             )
 
         return RunResult(command=command, output=output, exit_code=result.exit_code, workdir=command_workdir)
+
+    def write_file(self, path: str, content: bytes, *, mode: int) -> None:
+        """
+        Write *content* to *path* (absolute, under SANDBOX_ROOT) inside the container.
+
+        The path is validated lexically. The content is shipped via a single-file tar
+        through the existing copy_to_container pipeline (sanitised, mode preserved).
+        """
+        canonical = _validate_sandbox_path(path, allowed_roots=(SANDBOX_ROOT,))
+        parent_dir, _, filename = canonical.rpartition("/")
+        if not parent_dir or not filename:
+            raise ValueError(f"path resolves to an unusable location: {path!r}")
+
+        tar_bytes = _build_single_file_tar(filename, content, mode=mode & 0o7777)
+        self.copy_to_container(io.BytesIO(tar_bytes), dest=parent_dir, clear_before_copy=False)
 
     def _get_user(self) -> str:
         """
