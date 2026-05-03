@@ -7,10 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### Breaking changes
-
-- Removed `StartSessionRequest.ephemeral` and the `DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL` mechanism.
-- Removed `RunRequest.archive`. Initial session state is now established via the new `POST /session/{id}/seed/` endpoint.
+## [0.5.0] - 2026-05-03
 
 ### Added
 
@@ -20,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `timeout` parameter to run commands request to set a per-command execution timeout in seconds. Overrides the server default (`DAIV_SANDBOX_COMMAND_TIMEOUT`). Commands that exceed the timeout are terminated with exit code `124` and remaining commands are skipped.
 - Added `COMMAND_TIMEOUT` setting to configure a server-wide default per-command timeout. Defaults to `0` (no timeout).
 - Added optional Redis-backed per-session locking (`REDIS_URL` setting) to prevent concurrent requests from racing on the same session across replicas. Returns `409 Conflict` when a session is busy.
+- Added `scripts/dump_schemas.py` to export request/response JSON schemas for downstream `daiv` consumers.
 
 ### Changed
 
@@ -34,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed potential resource leak when session creation fails after the volume or patch extractor container were already created.
 - Fixed `ValueError` raised when an uploaded archive contains symlinks, hardlinks, or other non-regular entries (e.g. `CLAUDE.md` as a symlink); such entries are now silently skipped instead of aborting the request.
 - Fixed `UnicodeDecodeError` raised when an output contains invalid characters; such characters are now replaced with U+FFFD.
+
+### Removed
+
+- Removed `StartSessionRequest.ephemeral` and the `DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL` mechanism. **Breaking change**
+- Removed `RunRequest.archive`; initial session state is now established via the new `POST /session/{id}/seed/` endpoint. **Breaking change**
 
 ## [0.4.0] - 2026-02-22
 
@@ -326,7 +329,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/srtab/daiv-sandbox/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/srtab/daiv-sandbox/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/srtab/daiv-sandbox/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/srtab/daiv-sandbox/compare/v0.2.0...v0.3.0
