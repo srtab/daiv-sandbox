@@ -234,9 +234,10 @@ async def seed_session(
     Establish the initial state of a freshly-started session.
 
     Multipart fields (at least one is required):
-      * ``repo_archive``    — tar (optionally gzip-compressed) extracted into ``/repo``.
-                              When present, the patch-extractor's meta repo is initialised.
-      * ``skills_archive``  — tar (optionally gzip-compressed) extracted into ``/skills``.
+      * ``repo_archive``    — tar (auto-detected compression: gzip, bzip2, xz, zstd, or plain)
+                              extracted into ``/repo``. When present, the patch-extractor's
+                              meta repo is initialised.
+      * ``skills_archive``  — tar (same compression options) extracted into ``/skills``.
 
     One-shot per session: subsequent calls return 409.
     """
@@ -259,14 +260,26 @@ async def seed_session(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session already seeded")
 
         if repo_archive is not None:
-            await asyncio.to_thread(
-                cmd_executor.copy_to_container, repo_archive.file, dest=SANDBOX_ROOT, clear_before_copy=False
-            )
+            try:
+                await asyncio.to_thread(
+                    cmd_executor.copy_to_container, repo_archive.file, dest=SANDBOX_ROOT, clear_before_copy=False
+                )
+            except ValueError as exc:
+                logger.warning("seed_session: invalid repo_archive for session %s: %s", session_id, exc)
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"repo_archive is invalid: {exc}"
+                ) from exc
 
         if skills_archive is not None:
-            await asyncio.to_thread(
-                cmd_executor.copy_to_container, skills_archive.file, dest=SKILLS_ROOT, clear_before_copy=False
-            )
+            try:
+                await asyncio.to_thread(
+                    cmd_executor.copy_to_container, skills_archive.file, dest=SKILLS_ROOT, clear_before_copy=False
+                )
+            except ValueError as exc:
+                logger.warning("seed_session: invalid skills_archive for session %s: %s", session_id, exc)
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"skills_archive is invalid: {exc}"
+                ) from exc
 
         # Meta init only when /repo was seeded — without /repo content there is nothing to snapshot.
         if repo_archive is not None and (
@@ -287,7 +300,11 @@ async def seed_session(
             cmd_executor.container.exec_run, ["/bin/sh", "-c", "touch /workdir/.daiv-seeded"], user="root"
         )
         if marker_result.exit_code != 0:
-            logger.error("Failed to mark session seeded: %s", marker_result.output)
+            logger.error("Failed to mark session as seeded: [%s] %s", marker_result.exit_code, marker_result.output)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to mark session as seeded. Check logs.",
+            )
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 

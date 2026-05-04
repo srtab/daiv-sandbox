@@ -25,8 +25,6 @@ logger = logging.getLogger("daiv_sandbox")
 SANDBOX_ROOT = "/repo"
 WORKDIR_ROOT = "/workdir"
 SANDBOX_HOME = "/home/daiv-sandbox"
-# Reserved for future skill seeding (see spec §3.15). Created and chowned at
-# start_container time so the directory is ready when the seed step lands.
 SKILLS_ROOT = "/skills"
 
 # Portable pipefail wrapper: uses bash when available (dash lacks pipefail support),
@@ -130,7 +128,9 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
     - Normalizes ownership to the sandbox uid/gid.
     - Normalizes permissions similar to: chmod -R a+rX,u+w
 
-    The caller owns both streams; this function does not seek either one.
+    Both streams are consumed/written from their current positions. The caller must
+    seek ``in_stream`` to the desired start offset before calling this function.
+    ``out_stream`` is not seeked back afterward.
     """
     try:
         with tarfile.open(fileobj=in_stream, mode="r:*") as in_tf, tarfile.open(fileobj=out_stream, mode="w") as out_tf:
@@ -182,8 +182,8 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
                     out_tf.addfile(out_info, fileobj=extracted)
                 finally:
                     extracted.close()
-    except tarfile.TarError as e:  # pragma: no cover (depends on tarfile internals)
-        raise ValueError("Invalid tar archive") from e
+    except (tarfile.TarError, EOFError, OSError) as e:
+        raise ValueError(f"Invalid or truncated archive: {e}") from e
 
 
 class Session(ABC):
@@ -367,8 +367,6 @@ class SandboxDockerSession(Session):
         """
         Remove the container.
 
-        Args:
-            session_id (str): The ID of the container to remove.
         """
         try:
             self.client.containers.get(self.session_id).remove(force=True)
@@ -382,7 +380,6 @@ class SandboxDockerSession(Session):
         Copy a file or directory from the container to the host.
 
         Args:
-            session_id (str): The ID of the container to copy the archive from.
             host_dir (str): The path to the file or directory to copy from the container.
 
         Returns:
@@ -409,10 +406,10 @@ class SandboxDockerSession(Session):
         Copy a file or directory to a specific path in the container.
 
         Args:
-            session_id (str): The ID of the container to copy the archive to.
-            tardata (BinaryIO): The tar archive to be copied to the container.
-            dest (str | None): The destination path to copy the archive to. Defaults to SANDBOX_ROOT.
-            clear_before_copy (bool): Whether to clear the destination directory before copying the archive.
+            tardata (IO[bytes]): Seekable tar archive to copy. Must be positioned at offset 0 or
+                pre-seeked; the method rewinds it before sanitization.
+            dest (str | None): Destination path inside the container. Defaults to SANDBOX_ROOT.
+            clear_before_copy (bool): Clear the destination directory before extracting.
         """
         tardata.seek(0)
 
@@ -482,7 +479,6 @@ class SandboxDockerSession(Session):
         Execute a command in the container.
 
         Args:
-            session_id (str): The ID of the container to execute the command in.
             command (str): The command to execute.
             workdir (str | None): The working directory of the command. Defaults to SANDBOX_ROOT.
 
@@ -563,7 +559,6 @@ class SandboxDockerSession(Session):
         Get the container by ID. If the container is not running, attempt to restart it.
 
         Args:
-            session_id (str): The ID of the container to ensure is running.
 
         Returns:
             Container | None: The container object if it exists and is running, None otherwise.
