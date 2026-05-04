@@ -451,8 +451,8 @@ def test_seed_session_extracts_repo_archive(mock_session, client):
     from daiv_sandbox.sessions import SANDBOX_ROOT
 
     mock_session.container.exec_run.side_effect = [
-        ExecResult(exit_code=1, output=b""),  # not yet seeded
-        ExecResult(exit_code=0, output=b""),  # touch marker
+        ExecResult(exit_code=1, output=b""),
+        ExecResult(exit_code=0, output=b""),
     ]
 
     resp = client.post(
@@ -549,8 +549,8 @@ def test_seed_session_extracts_skills_archive_only(mock_session, client):
     from daiv_sandbox.sessions import SKILLS_ROOT
 
     mock_session.container.exec_run.side_effect = [
-        ExecResult(exit_code=1, output=b""),  # not yet seeded
-        ExecResult(exit_code=0, output=b""),  # touch marker
+        ExecResult(exit_code=1, output=b""),
+        ExecResult(exit_code=0, output=b""),
     ]
 
     resp = client.post(
@@ -571,8 +571,8 @@ def test_seed_session_extracts_both_archives(mock_session, client):
     from daiv_sandbox.sessions import SANDBOX_ROOT, SKILLS_ROOT
 
     mock_session.container.exec_run.side_effect = [
-        ExecResult(exit_code=1, output=b""),  # not yet seeded
-        ExecResult(exit_code=0, output=b""),  # touch marker
+        ExecResult(exit_code=1, output=b""),
+        ExecResult(exit_code=0, output=b""),
     ]
 
     resp = client.post(
@@ -592,8 +592,4 @@ def test_seed_session_requires_at_least_one_archive(mock_session, client):
     """Posting neither archive returns 422."""
     resp = client.post(f"/session/{mock_session.session_id}/seed/")
     assert resp.status_code == 422
-    detail = resp.json()["detail"]
-    # Accept either FastAPI's structured 422 (when both fields are required) or our
-    # explicit detail string. The endpoint declares both as Optional, so the
-    # message comes from the endpoint, not the framework.
-    assert "at least one" in (detail if isinstance(detail, str) else str(detail)).lower()
+    assert "at least one" in resp.json()["detail"].lower()

@@ -414,10 +414,7 @@ class SandboxDockerSession(Session):
             dest (str | None): The destination path to copy the archive to. Defaults to SANDBOX_ROOT.
             clear_before_copy (bool): Whether to clear the destination directory before copying the archive.
         """
-        # Sanitize archive end-to-end via a spooled stream — small archives stay
-        # in memory; larger ones spill to disk rather than doubling RAM use.
-        if hasattr(tardata, "seek"):
-            tardata.seek(0)
+        tardata.seek(0)
 
         # Resolve destination: default to SANDBOX_ROOT, absolute stays absolute, relative resolves under SANDBOX_ROOT
         to_dir = SANDBOX_ROOT

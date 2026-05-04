@@ -258,7 +258,6 @@ async def seed_session(
         if check.exit_code == 0:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session already seeded")
 
-        # `UploadFile.file` is a SpooledTemporaryFile; copy_to_container streams from it.
         if repo_archive is not None:
             await asyncio.to_thread(
                 cmd_executor.copy_to_container, repo_archive.file, dest=SANDBOX_ROOT, clear_before_copy=False
