@@ -15,6 +15,7 @@ from daiv_sandbox.sessions import (
     SKILLS_ROOT,
     WORKDIR_ROOT,
     SandboxDockerSession,
+    _build_single_file_tar_stream,
     _sanitize_archive_bytes,
 )
 
@@ -325,7 +326,8 @@ def test_write_file_builds_singlefile_tar_for_repo_path(mock_docker_client, monk
     def fake_copy(self, tardata, dest=None, clear_before_copy=True):
         captured["dest"] = dest
         captured["clear"] = clear_before_copy
-        captured["tar_bytes"] = tardata.getvalue() if hasattr(tardata, "getvalue") else tardata.read()
+        captured["tardata_type"] = type(tardata)
+        captured["tar_bytes"] = tardata.read()
 
     monkeypatch.setattr(SandboxDockerSession, "copy_to_container", fake_copy)
 
@@ -335,6 +337,7 @@ def test_write_file_builds_singlefile_tar_for_repo_path(mock_docker_client, monk
 
     assert captured["dest"] == f"{SANDBOX_ROOT}/sub/dir"
     assert captured["clear"] is False
+    assert not issubclass(captured["tardata_type"], (bytes, bytearray))
 
     with tarfile.open(fileobj=io.BytesIO(captured["tar_bytes"])) as tf:
         members = tf.getmembers()
@@ -343,6 +346,36 @@ def test_write_file_builds_singlefile_tar_for_repo_path(mock_docker_client, monk
         assert members[0].isfile()
         assert (members[0].mode & 0o7777) == 0o755
         assert tf.extractfile(members[0]).read() == b"print('hi')\n"
+
+
+def test_build_single_file_tar_stream_returns_seekable_stream():
+    """Helper returns a seekable stream (not bytes) positioned at offset 0."""
+    content = b"hello world"
+    with _build_single_file_tar_stream("foo.txt", content, mode=0o644) as stream:
+        assert not isinstance(stream, (bytes, bytearray))
+        assert hasattr(stream, "read") and hasattr(stream, "seek")
+        assert stream.tell() == 0
+
+        with tarfile.open(fileobj=stream) as tf:
+            members = tf.getmembers()
+            assert len(members) == 1
+            assert members[0].name == "foo.txt"
+            assert members[0].isfile()
+            assert (members[0].mode & 0o7777) == 0o644
+            assert tf.extractfile(members[0]).read() == content
+
+
+def test_build_single_file_tar_stream_handles_large_content():
+    """Large content does not force the helper to materialize a `bytes` archive."""
+    big = b"x" * (4 * 1024 * 1024)  # 4 MiB — well above the in-memory spool limit.
+    with _build_single_file_tar_stream("big.bin", big, mode=0o600) as stream:
+        assert not isinstance(stream, (bytes, bytearray))
+        with tarfile.open(fileobj=stream) as tf:
+            members = tf.getmembers()
+            assert len(members) == 1
+            assert members[0].name == "big.bin"
+            assert (members[0].mode & 0o7777) == 0o600
+            assert tf.extractfile(members[0]).read() == big
 
 
 def test_write_file_rejects_path_outside_sandbox_root(mock_docker_client):

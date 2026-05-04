@@ -3,10 +3,11 @@ from __future__ import annotations
 import io
 import logging
 import tarfile
+import tempfile
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, BinaryIO
+from typing import IO, TYPE_CHECKING, BinaryIO
 
 from docker import DockerClient, from_env
 from docker.errors import ImageNotFound, NotFound
@@ -68,16 +69,30 @@ def _validate_sandbox_path(path: str, allowed_roots: tuple[str, ...]) -> str:
     raise ValueError(f"path must be under one of {allowed_roots}, got: {path!r}")
 
 
-def _build_single_file_tar(filename: str, content: bytes, *, mode: int) -> bytes:
-    """Build an uncompressed tar containing one regular-file member."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tf:
-        info = tarfile.TarInfo(name=filename)
-        info.size = len(content)
-        info.mode = mode & 0o7777
-        info.type = tarfile.REGTYPE
-        tf.addfile(info, io.BytesIO(content))
-    return buf.getvalue()
+_SINGLE_FILE_TAR_SPOOL_LIMIT = 1 << 20  # 1 MiB
+
+
+def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int) -> IO[bytes]:
+    """
+    Build an uncompressed tar containing one regular-file member.
+
+    Returns a seekable file-like object positioned at offset 0. Small archives stay
+    in memory; larger ones spill to disk. Caller owns the stream and must close it
+    (use as a context manager).
+    """
+    stream = tempfile.SpooledTemporaryFile(max_size=_SINGLE_FILE_TAR_SPOOL_LIMIT)  # noqa: SIM115
+    try:
+        with tarfile.open(fileobj=stream, mode="w") as tf:
+            info = tarfile.TarInfo(name=filename)
+            info.size = len(content)
+            info.mode = mode & 0o7777
+            info.type = tarfile.REGTYPE
+            tf.addfile(info, io.BytesIO(content))
+        stream.seek(0)
+    except BaseException:
+        stream.close()
+        raise
+    return stream
 
 
 def _normalize_tar_member_name(name: str) -> str | None:
@@ -197,7 +212,7 @@ class Session(ABC):
         """
 
     @abstractmethod
-    def copy_to_container(self, data: BinaryIO, dest: str | None = None):
+    def copy_to_container(self, data: IO[bytes], dest: str | None = None):
         """
         Copy a file or directory to the container.
         """
@@ -393,7 +408,7 @@ class SandboxDockerSession(Session):
 
         return io.BytesIO(b"".join(bits))
 
-    def copy_to_container(self, tardata: BinaryIO, dest: str | None = None, clear_before_copy: bool = True):
+    def copy_to_container(self, tardata: IO[bytes], dest: str | None = None, clear_before_copy: bool = True):
         """
         Copy a file or directory to a specific path in the container.
 
@@ -527,8 +542,8 @@ class SandboxDockerSession(Session):
         if not parent_dir or not filename:
             raise ValueError(f"path resolves to an unusable location: {path!r}")
 
-        tar_bytes = _build_single_file_tar(filename, content, mode=mode & 0o7777)
-        self.copy_to_container(io.BytesIO(tar_bytes), dest=parent_dir, clear_before_copy=False)
+        with _build_single_file_tar_stream(filename, content, mode=mode) as tar_stream:
+            self.copy_to_container(tar_stream, dest=parent_dir, clear_before_copy=False)
 
     def _get_user(self) -> str:
         """
