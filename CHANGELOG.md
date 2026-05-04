@@ -7,14 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.5.0] - 2026-05-04
+
 ### Added
 
+- `POST /session/{id}/seed/` — one-shot per session, accepts archives as `multipart/form-data` fields (`repo_archive`, `skills_archive`). At least one field must be provided; `repo_archive` is extracted into `/repo` and initialises the patch-extractor's meta repo; `skills_archive` is extracted into `/skills`. **Breaking change** — clients must update from the former JSON body.
+- `POST /session/{id}/files/` — applies a batch of file mutations and advances the meta HEAD; per-item validation, returns `MutationResult[]`.
+- `SKILLS_ROOT = "/skills"` reserved at session start (`mkdir -p` + `chown`) for skill seeding.
 - Added `timeout` parameter to run commands request to set a per-command execution timeout in seconds. Overrides the server default (`DAIV_SANDBOX_COMMAND_TIMEOUT`). Commands that exceed the timeout are terminated with exit code `124` and remaining commands are skipped.
 - Added `COMMAND_TIMEOUT` setting to configure a server-wide default per-command timeout. Defaults to `0` (no timeout).
 - Added optional Redis-backed per-session locking (`REDIS_URL` setting) to prevent concurrent requests from racing on the same session across replicas. Returns `409 Conflict` when a session is busy.
+- Added `scripts/dump_schemas.py` to export request/response JSON schemas for downstream `daiv` consumers.
 
 ### Changed
 
+- `run_on_session` is commands-only; per-call patch is `HEAD~1..HEAD` against the stateful meta repo (advanced after every `apply_file_mutations` call and every `run_commands` call).
+- Archive sanitization and `copy_to_container` now stream end-to-end through a `SpooledTemporaryFile`; archives larger than 8 MiB no longer require a full in-memory copy on the server.
 - Improved server concurrency: all blocking Docker operations are now executed off the async event loop, allowing multiple sessions to be served in parallel.
 - Improved session close performance: when a patch extractor is present, both containers are now removed concurrently.
 - Closing an already-removed session now returns `204` instead of raising an error.
@@ -25,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed potential resource leak when session creation fails after the volume or patch extractor container were already created.
 - Fixed `ValueError` raised when an uploaded archive contains symlinks, hardlinks, or other non-regular entries (e.g. `CLAUDE.md` as a symlink); such entries are now silently skipped instead of aborting the request.
 - Fixed `UnicodeDecodeError` raised when an output contains invalid characters; such characters are now replaced with U+FFFD.
+- Fixed seed endpoint to return a proper error response when archive extraction or meta-repo initialisation fails, instead of leaving the session in an inconsistent state.
+
+### Removed
+
+- Removed `StartSessionRequest.ephemeral` and the `DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL` mechanism. **Breaking change**
+- Removed `RunRequest.archive`; initial session state is now established via `POST /session/{id}/seed/`. **Breaking change**
 
 ## [0.4.0] - 2026-02-22
 
@@ -317,7 +331,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/srtab/daiv-sandbox/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/srtab/daiv-sandbox/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/srtab/daiv-sandbox/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/srtab/daiv-sandbox/compare/v0.2.0...v0.3.0

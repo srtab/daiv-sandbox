@@ -12,13 +12,21 @@ def test_extract_patch(client: TestClient, sandbox_session: Callable[..., str]):
     """Test that extract patch is not None when changes are made."""
     session_id = sandbox_session(base_image="alpine:latest", extract_patch=True)
 
-    # test that extract patch is not None when changes are made
-    archive = make_tar_gz({"a.txt": b"old\n", "b.txt": b"old2\n"})
-    run = client.post(f"/session/{session_id}/", json={"archive": archive, "commands": ["echo new > a.txt"]})
+    # Seed the workspace via the new endpoint.
+    seed = client.post(
+        f"/session/{session_id}/seed/",
+        files={
+            "repo_archive": ("repo.tar.gz", make_tar_gz({"a.txt": b"old\n", "b.txt": b"old2\n"}), "application/gzip")
+        },
+    )
+    assert seed.status_code == 204, seed.text
+
+    # Bash-induced change is reflected in the per-turn diff.
+    run = client.post(f"/session/{session_id}/", json={"commands": ["echo new > a.txt"]})
     assert run.status_code == 200, run.text
     assert run.json()["patch"] is not None
 
-    # test that extract patch is None when the commands do not make any changes
-    run = client.post(f"/session/{session_id}/", json={"archive": archive, "commands": ["ls -la"]})
+    # No changes → patch is None.
+    run = client.post(f"/session/{session_id}/", json={"commands": ["ls -la"]})
     assert run.status_code == 200, run.text
     assert run.json()["patch"] is None

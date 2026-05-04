@@ -1,12 +1,11 @@
 import asyncio
 import base64
-import io
 import logging
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import sentry_sdk
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, UploadFile, status
 from fastapi import Path as FastAPIPath
 from fastapi.security.api_key import APIKeyHeader
 from redis.asyncio import Redis
@@ -16,15 +15,18 @@ from daiv_sandbox.config import settings
 from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, SessionBusyError
 from daiv_sandbox.logs import LOGGING_CONFIG
 from daiv_sandbox.schemas import (
+    ApplyMutationsRequest,
+    ApplyMutationsResponse,
     ErrorMessage,
+    MutationResult,
     RunRequest,
     RunResponse,
     RunResult,
     StartSessionRequest,
     StartSessionResponse,
 )
-from daiv_sandbox.scripts import CMD_GIT_DIFF_EXTRACTOR_SCRIPT
-from daiv_sandbox.sessions import SANDBOX_ROOT, SandboxDockerSession
+from daiv_sandbox.scripts import CMD_INIT_META_SCRIPT, CMD_TURN_DIFF_SCRIPT
+from daiv_sandbox.sessions import SANDBOX_ROOT, SKILLS_ROOT, SandboxDockerSession, _validate_sandbox_path
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -35,7 +37,6 @@ HEADER_API_KEY_NAME = "X-API-Key"
 
 DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
 DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL = "daiv.sandbox.patch_extractor_session_id"
-DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL = "daiv.sandbox.ephemeral_session"
 DAIV_SANDBOX_WORKDIR_VOLUME_LABEL = "daiv.sandbox.workdir_volume"
 DAIV_SANDBOX_MANAGED_LABEL = "daiv.sandbox.managed"
 
@@ -184,9 +185,6 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         cmd_executor_labels[DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL] = patch_extractor.session_id
         cmd_executor_labels[DAIV_SANDBOX_WORKDIR_VOLUME_LABEL] = workdir_volume_name
 
-    if request.ephemeral:
-        cmd_executor_labels[DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL] = "1"
-
     cmd_executor_kwargs = {}
 
     if workdir_volume_name:
@@ -224,6 +222,147 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     return StartSessionResponse(session_id=cmd_executor.session_id)
 
 
+@app.post("/session/{session_id}/seed/", responses=common_responses, name="Seed initial session state")
+async def seed_session(
+    http_request: Request,
+    session_id: Annotated[str, FastAPIPath(title="The ID of the session to seed.")],
+    repo_archive: UploadFile | None = None,
+    skills_archive: UploadFile | None = None,
+    api_key: str = Depends(get_api_key),
+) -> Response:
+    """
+    Establish the initial state of a freshly-started session.
+
+    Multipart fields (at least one is required):
+      * ``repo_archive``    — tar (auto-detected compression: gzip, bzip2, xz, zstd, or plain)
+                              extracted into ``/repo``. When present, the patch-extractor's
+                              meta repo is initialised.
+      * ``skills_archive``  — tar (same compression options) extracted into ``/skills``.
+
+    One-shot per session: subsequent calls return 409.
+    """
+    if repo_archive is None and skills_archive is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="At least one of repo_archive or skills_archive must be provided",
+        )
+
+    async with http_request.app.state.session_lock_manager.acquire(session_id):
+        cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
+
+        if not cmd_executor.container:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
+
+        check = await asyncio.to_thread(
+            cmd_executor.container.exec_run, ["/bin/sh", "-c", "test -f /workdir/.daiv-seeded"], user="root"
+        )
+        if check.exit_code == 0:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session already seeded")
+
+        if repo_archive is not None:
+            try:
+                await asyncio.to_thread(
+                    cmd_executor.copy_to_container, repo_archive.file, dest=SANDBOX_ROOT, clear_before_copy=False
+                )
+            except ValueError as exc:
+                logger.warning("seed_session: invalid repo_archive for session %s: %s", session_id, exc)
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"repo_archive is invalid: {exc}"
+                ) from exc
+
+        if skills_archive is not None:
+            try:
+                await asyncio.to_thread(
+                    cmd_executor.copy_to_container, skills_archive.file, dest=SKILLS_ROOT, clear_before_copy=False
+                )
+            except ValueError as exc:
+                logger.warning("seed_session: invalid skills_archive for session %s: %s", session_id, exc)
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"skills_archive is invalid: {exc}"
+                ) from exc
+
+        # Meta init only when /repo was seeded — without /repo content there is nothing to snapshot.
+        if repo_archive is not None and (
+            extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
+        ):
+            patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=extract_patch_session_id)
+            init_result = await asyncio.to_thread(
+                patch_extractor.execute_command, CMD_INIT_META_SCRIPT, workdir="/workdir"
+            )
+            if init_result.exit_code != 0:
+                logger.error("Failed to init meta repo: [%s] %s", init_result.exit_code, init_result.output)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to initialise patch-extractor meta repo. Check logs.",
+                )
+
+        marker_result = await asyncio.to_thread(
+            cmd_executor.container.exec_run, ["/bin/sh", "-c", "touch /workdir/.daiv-seeded"], user="root"
+        )
+        if marker_result.exit_code != 0:
+            logger.error("Failed to mark session as seeded: [%s] %s", marker_result.exit_code, marker_result.output)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to mark session as seeded. Check logs.",
+            )
+
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.post("/session/{session_id}/files/", responses=common_responses, name="Apply file mutations to a session")
+async def apply_file_mutations(
+    http_request: Request,
+    session_id: Annotated[str, FastAPIPath(title="The ID of the session to mutate.")],
+    request: ApplyMutationsRequest,
+    api_key: str = Depends(get_api_key),
+) -> ApplyMutationsResponse:
+    """
+    Apply a batch of file mutations to /repo and advance the patch-extractor's meta HEAD.
+
+    Per-item validation: each mutation that fails returns a MutationResult(ok=False, error=...).
+    Request-level errors (4xx) are reserved for auth, schema, body-size, and unknown-session.
+    """
+    async with http_request.app.state.session_lock_manager.acquire(session_id):
+        cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
+
+        if not cmd_executor.container:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
+
+        results: list[MutationResult] = []
+        any_succeeded = False
+
+        for mutation in request.mutations:
+            try:
+                _validate_sandbox_path(mutation.path, allowed_roots=(SANDBOX_ROOT,))
+            except ValueError as exc:
+                results.append(MutationResult(path=mutation.path, ok=False, error=str(exc)))
+                continue
+
+            try:
+                await asyncio.to_thread(cmd_executor.write_file, mutation.path, mutation.content, mode=mutation.mode)
+            except Exception as exc:
+                logger.exception("apply_mutations: write failed for %s", mutation.path)
+                results.append(MutationResult(path=mutation.path, ok=False, error=str(exc)))
+                continue
+
+            results.append(MutationResult(path=mutation.path, ok=True, error=None))
+            any_succeeded = True
+
+        if any_succeeded and (
+            extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
+        ):
+            patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=extract_patch_session_id)
+            advance = await asyncio.to_thread(patch_extractor.execute_command, CMD_TURN_DIFF_SCRIPT, workdir="/workdir")
+            if advance.exit_code != 0:
+                logger.error("HEAD-advance failed: [%s] %s", advance.exit_code, advance.output)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Patch-extractor HEAD-advance failed; session may be inconsistent.",
+                )
+
+        return ApplyMutationsResponse(results=results)
+
+
 @app.post("/session/{session_id}/", responses=common_responses, name="Run commands on a session")
 async def run_on_session(
     http_request: Request,
@@ -232,9 +371,8 @@ async def run_on_session(
     api_key: str = Depends(get_api_key),
 ) -> RunResponse:
     """
-    Run a set of commands on a session and return the results, including the patch of the changed files if
-    the `extract_patch` parameter is set to `true` in the request to start the session and there were changes
-    made by the commands.
+    Run a set of commands on a session and return the results, including the patch of changes
+    made by these commands (HEAD~1..HEAD against the meta repo).
     """
     async with http_request.app.state.session_lock_manager.acquire(session_id):
         cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
@@ -245,16 +383,7 @@ async def run_on_session(
         raw_timeout = request.timeout if request.timeout is not None else settings.COMMAND_TIMEOUT
         effective_timeout = float(raw_timeout) if raw_timeout > 0 else None
 
-        base64_patch: str | None = None
         results: list[RunResult] = []
-
-        ephemeral_session = cmd_executor.get_label(DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL) == "1"
-
-        if request.archive:
-            await asyncio.to_thread(
-                cmd_executor.copy_to_container, io.BytesIO(request.archive), clear_before_copy=ephemeral_session
-            )
-
         for command in request.commands:
             try:
                 result = await asyncio.wait_for(
@@ -275,38 +404,22 @@ async def run_on_session(
                 break
             results.append(result)
 
-            # Stop execution if fail_fast is enabled and command failed
             if request.fail_fast and result.exit_code != 0:
                 break
 
-        if request.archive and (
-            extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
-        ):
+        base64_patch: str | None = None
+
+        if extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
             patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=extract_patch_session_id)
-
-            # Clean up old directories and metadata, but keep /workdir/new (it's a mounted volume).
-            await asyncio.to_thread(
-                patch_extractor.execute_command, "rm -rf /workdir/old /workdir/meta && mkdir -p /workdir/old"
-            )
-
-            # Copy original archive to patch extractor for baseline comparison.
-            await asyncio.to_thread(
-                patch_extractor.copy_to_container, io.BytesIO(request.archive), dest="/workdir/old/"
-            )
-
-            # Always diff from the extracted root for consistency with the archive layout.
             patch_result = await asyncio.to_thread(
-                patch_extractor.execute_command, CMD_GIT_DIFF_EXTRACTOR_SCRIPT, workdir="/workdir"
+                patch_extractor.execute_command, CMD_TURN_DIFF_SCRIPT, workdir="/workdir"
             )
 
             if patch_result.exit_code != 0 and NO_CHANGES_MESSAGE not in patch_result.output:
-                logger.error("Failed to extract patch: [%s] %s", patch_result.exit_code, patch_result.output)
+                logger.error("Failed to extract turn diff: [%s] %s", patch_result.exit_code, patch_result.output)
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=(
-                        "Failed to extract patch with the changes made by the commands. Check the logs for more "
-                        "details."
-                    ),
+                    detail="Failed to extract patch with the changes made by the commands. Check logs.",
                 )
 
             if NO_CHANGES_MESSAGE in patch_result.output or patch_result.output.strip() == "":

@@ -430,3 +430,277 @@ def test_close_session_returns_conflict_when_session_is_locked(mock_session, cli
 
     assert response.status_code == 409
     assert response.json() == {"detail": "Session is busy"}
+
+
+def _minimal_archive_bytes(member_name: str = "README.md", member_content: bytes = b"hello") -> bytes:
+    """Build a minimal uncompressed tar archive with a single member."""
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name=member_name)
+        info.size = len(member_content)
+        tf.addfile(info, io.BytesIO(member_content))
+    return buf.getvalue()
+
+
+def test_seed_session_extracts_repo_archive(mock_session, client):
+    """repo_archive only: copy_to_container is called once with /repo as dest."""
+    from docker.models.containers import ExecResult
+
+    from daiv_sandbox.sessions import SANDBOX_ROOT
+
+    mock_session.container.exec_run.side_effect = [
+        ExecResult(exit_code=1, output=b""),
+        ExecResult(exit_code=0, output=b""),
+    ]
+
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+    )
+    assert resp.status_code == 204, resp.text
+    mock_session.copy_to_container.assert_called_once()
+    assert mock_session.copy_to_container.call_args.kwargs.get("dest") == SANDBOX_ROOT
+
+
+def test_seed_session_rejects_unknown_session(client):
+    """When the session has no container, return 404."""
+    with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
+        instance = cls.return_value
+        instance.container = None
+        resp = client.post(
+            "/session/does-not-exist/seed/",
+            files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+        )
+        assert resp.status_code == 404
+
+
+def test_apply_mutations_creates_file(mock_session, client):
+    """Happy path: a single put returns ok=True for that path."""
+    payload = {
+        "mutations": [
+            {"path": "/repo/new_file.py", "content": base64.b64encode(b"print('hi')\n").decode(), "mode": 0o644}
+        ]
+    }
+    resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["results"] == [{"path": "/repo/new_file.py", "ok": True, "error": None}]
+    mock_session.write_file.assert_called_once()
+
+
+def test_apply_mutations_rejects_path_outside_repo(mock_session, client):
+    """Per-item rejection for /skills, /workdir, /etc, traversal — not 4xx."""
+    bad_paths = ["/skills/foo.md", "/workdir/x", "/etc/passwd", "/repo/../etc/passwd"]
+    for path in bad_paths:
+        payload = {"mutations": [{"path": path, "content": base64.b64encode(b"x").decode(), "mode": 0o644}]}
+        resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
+        assert resp.status_code == 200, f"path={path}: status={resp.status_code}"
+        result = resp.json()["results"][0]
+        assert result["ok"] is False, f"expected rejection for {path}, got {result}"
+        assert result["error"] is not None
+
+
+def test_apply_mutations_unknown_session_returns_404(client):
+    """When the session has no container, return 404."""
+    with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
+        instance = cls.return_value
+        instance.container = None
+        payload = {"mutations": [{"path": "/repo/x", "content": base64.b64encode(b"x").decode(), "mode": 0o644}]}
+        resp = client.post("/session/no-such-id/files/", json=payload)
+        assert resp.status_code == 404
+
+
+def test_apply_mutations_empty_batch_rejected(mock_session, client):
+    """Schema-level rejection of empty mutations list → 422."""
+    resp = client.post(f"/session/{mock_session.session_id}/files/", json={"mutations": []})
+    assert resp.status_code == 422
+
+
+def test_apply_mutations_oversized_batch_rejected(mock_session, client):
+    """More than 64 mutations → 422."""
+    payload = {
+        "mutations": [
+            {"path": f"/repo/f{i}.py", "content": base64.b64encode(b"").decode(), "mode": 0o644} for i in range(65)
+        ]
+    }
+    resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
+    assert resp.status_code == 422
+
+
+def test_seed_session_rejects_double_seed(mock_session, client):
+    """A second seed attempt on an already-seeded session returns 409."""
+    from docker.models.containers import ExecResult
+
+    mock_session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+    )
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": "Session already seeded"}
+
+
+def test_seed_session_extracts_skills_archive_only(mock_session, client):
+    """skills_archive only: copy_to_container hits /skills, meta init does NOT run."""
+    from docker.models.containers import ExecResult
+
+    from daiv_sandbox.sessions import SKILLS_ROOT
+
+    mock_session.container.exec_run.side_effect = [
+        ExecResult(exit_code=1, output=b""),
+        ExecResult(exit_code=0, output=b""),
+    ]
+
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"skills_archive": ("skills.tar", _minimal_archive_bytes("intro.md", b"# hi\n"), "application/x-tar")},
+    )
+    assert resp.status_code == 204, resp.text
+    mock_session.copy_to_container.assert_called_once()
+    assert mock_session.copy_to_container.call_args.kwargs.get("dest") == SKILLS_ROOT
+    # Patch-extractor meta init must not run when there is no /repo content.
+    mock_session.execute_command.assert_not_called()
+
+
+def test_seed_session_extracts_both_archives(mock_session, client):
+    """Both archives: copy_to_container called twice with the right destinations, in order."""
+    from docker.models.containers import ExecResult
+
+    from daiv_sandbox.sessions import SANDBOX_ROOT, SKILLS_ROOT
+
+    mock_session.container.exec_run.side_effect = [
+        ExecResult(exit_code=1, output=b""),
+        ExecResult(exit_code=0, output=b""),
+    ]
+
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files=[
+            ("repo_archive", ("repo.tar", _minimal_archive_bytes(), "application/x-tar")),
+            ("skills_archive", ("skills.tar", _minimal_archive_bytes("intro.md", b"# hi\n"), "application/x-tar")),
+        ],
+    )
+    assert resp.status_code == 204, resp.text
+    assert mock_session.copy_to_container.call_count == 2
+    dests = [call.kwargs.get("dest") for call in mock_session.copy_to_container.call_args_list]
+    assert dests == [SANDBOX_ROOT, SKILLS_ROOT]
+
+
+def test_seed_session_requires_at_least_one_archive(mock_session, client):
+    """Posting neither archive returns 422."""
+    resp = client.post(f"/session/{mock_session.session_id}/seed/")
+    assert resp.status_code == 422
+    assert "at least one" in resp.json()["detail"].lower()
+
+
+def test_seed_session_invalid_repo_archive_returns_422(mock_session, client):
+    """copy_to_container raising ValueError for repo_archive returns 422."""
+    from docker.models.containers import ExecResult
+
+    mock_session.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
+    mock_session.copy_to_container.side_effect = ValueError("Invalid or truncated archive: ...")
+
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"repo_archive": ("repo.tar", b"not a tar", "application/x-tar")},
+    )
+    assert resp.status_code == 422
+    assert "repo_archive" in resp.json()["detail"].lower()
+
+
+def test_seed_session_invalid_skills_archive_returns_422(mock_session, client):
+    """copy_to_container raising ValueError for skills_archive returns 422."""
+    from docker.models.containers import ExecResult
+
+    mock_session.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
+    mock_session.copy_to_container.side_effect = ValueError("Invalid or truncated archive: ...")
+
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"skills_archive": ("skills.tar", b"garbage", "application/x-tar")},
+    )
+    assert resp.status_code == 422
+    assert "skills_archive" in resp.json()["detail"].lower()
+
+
+def test_seed_session_meta_init_runs_on_repo_archive(client):
+    """When a patch extractor is linked, CMD_INIT_META_SCRIPT is executed after /repo is copied."""
+    from docker.models.containers import ExecResult
+
+    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
+
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_cls:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.container = Mock()
+        mock_cmd_executor.container.exec_run.side_effect = [
+            ExecResult(exit_code=1, output=b""),  # seeded check → not seeded
+            ExecResult(exit_code=0, output=b""),  # marker write
+        ]
+        mock_cmd_executor.get_label.side_effect = lambda label: (
+            "patch-extractor-id" if label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL else None
+        )
+
+        mock_patch_extractor = Mock()
+        mock_patch_extractor.execute_command.return_value = RunResult(
+            command="init", output="", exit_code=0, workdir="/workdir"
+        )
+
+        mock_cls.side_effect = [mock_cmd_executor, mock_patch_extractor]
+
+        resp = client.post(
+            "/session/test-session/seed/",
+            files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+        )
+
+    assert resp.status_code == 204, resp.text
+    mock_cmd_executor.copy_to_container.assert_called_once()
+    mock_patch_extractor.execute_command.assert_called_once()
+
+
+def test_seed_session_meta_init_failure_returns_500(client):
+    """If CMD_INIT_META_SCRIPT exits non-zero, seed returns 500."""
+    from docker.models.containers import ExecResult
+
+    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
+
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_cls:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.container = Mock()
+        mock_cmd_executor.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
+        mock_cmd_executor.get_label.side_effect = lambda label: (
+            "patch-extractor-id" if label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL else None
+        )
+
+        mock_patch_extractor = Mock()
+        mock_patch_extractor.execute_command.return_value = RunResult(
+            command="init", output="fatal: not a git repo", exit_code=128, workdir="/workdir"
+        )
+
+        mock_cls.side_effect = [mock_cmd_executor, mock_patch_extractor]
+
+        resp = client.post(
+            "/session/test-session/seed/",
+            files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+        )
+
+    assert resp.status_code == 500
+    assert "patch-extractor" in resp.json()["detail"].lower()
+
+
+def test_seed_session_marker_write_failure_returns_500(mock_session, client):
+    """If the seeded-marker touch fails, seed returns 500."""
+    from docker.models.containers import ExecResult
+
+    mock_session.container.exec_run.side_effect = [
+        ExecResult(exit_code=1, output=b""),  # seeded check → not seeded
+        ExecResult(exit_code=1, output=b"read-only filesystem"),  # marker write fails
+    ]
+
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+    )
+    assert resp.status_code == 500
+    assert "seeded" in resp.json()["detail"].lower()

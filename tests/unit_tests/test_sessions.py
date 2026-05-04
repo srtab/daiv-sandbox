@@ -12,9 +12,11 @@ from daiv_sandbox.sessions import (
     PIPEFAIL_WRAPPER,
     SANDBOX_HOME,
     SANDBOX_ROOT,
+    SKILLS_ROOT,
     WORKDIR_ROOT,
     SandboxDockerSession,
-    _sanitize_archive_bytes,
+    _build_single_file_tar_stream,
+    _sanitize_archive_stream,
 )
 
 EXPECTED_EXEC_ENV = {
@@ -100,10 +102,19 @@ def test__start_container(mock_docker_client):
     assert session.session_id == mock_docker_client.containers.run.return_value.id
     # Should create sandbox directories and chown them
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root"
+        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
     )
     mock_container.exec_run.assert_any_call(
-        ["chown", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root"
+        [
+            "chown",
+            f"{settings.RUN_UID}:{settings.RUN_GID}",
+            "--",
+            SANDBOX_ROOT,
+            WORKDIR_ROOT,
+            SANDBOX_HOME,
+            SKILLS_ROOT,
+        ],
+        user="root",
     )
 
 
@@ -266,31 +277,34 @@ def test_get_exec_environment(mock_docker_client):
     assert session._get_exec_environment() == EXPECTED_EXEC_ENV
 
 
-def test_sanitize_archive_bytes_skips_symlinks():
-    """Symlink entries should be silently skipped, not raise ValueError."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tf:
+def test_sanitize_archive_stream_skips_symlinks():
+    """Symlink entries are silently skipped in the streamed output."""
+    in_buf = io.BytesIO()
+    with tarfile.open(fileobj=in_buf, mode="w") as tf:
         content = b"hello"
         info = tarfile.TarInfo(name="file.txt")
         info.size = len(content)
         tf.addfile(info, io.BytesIO(content))
-        sym = tarfile.TarInfo(name="CLAUDE.md")
+        sym = tarfile.TarInfo(name="symlink.txt")
         sym.type = tarfile.SYMTYPE
         sym.linkname = "file.txt"
         tf.addfile(sym)
+    in_buf.seek(0)
 
-    result = _sanitize_archive_bytes(buf.getvalue(), uid=1000, gid=1000)
+    out_buf = io.BytesIO()
+    _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+    out_buf.seek(0)
 
-    with tarfile.open(fileobj=io.BytesIO(result)) as out_tf:
+    with tarfile.open(fileobj=out_buf) as out_tf:
         names = out_tf.getnames()
     assert "file.txt" in names
-    assert "CLAUDE.md" not in names
+    assert "symlink.txt" not in names
 
 
-def test_sanitize_archive_bytes_skips_hardlinks():
-    """Hardlink entries should be silently skipped, not raise ValueError."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tf:
+def test_sanitize_archive_stream_skips_hardlinks():
+    """Hardlink entries are silently skipped in the streamed output."""
+    in_buf = io.BytesIO()
+    with tarfile.open(fileobj=in_buf, mode="w") as tf:
         content = b"hello"
         info = tarfile.TarInfo(name="file.txt")
         info.size = len(content)
@@ -299,10 +313,231 @@ def test_sanitize_archive_bytes_skips_hardlinks():
         lnk.type = tarfile.LNKTYPE
         lnk.linkname = "file.txt"
         tf.addfile(lnk)
+    in_buf.seek(0)
 
-    result = _sanitize_archive_bytes(buf.getvalue(), uid=1000, gid=1000)
+    out_buf = io.BytesIO()
+    _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+    out_buf.seek(0)
 
-    with tarfile.open(fileobj=io.BytesIO(result)) as out_tf:
+    with tarfile.open(fileobj=out_buf) as out_tf:
         names = out_tf.getnames()
     assert "file.txt" in names
     assert "hardlink.txt" not in names
+
+
+def test_write_file_builds_singlefile_tar_for_repo_path(mock_docker_client, monkeypatch):
+    """write_file places content at /repo/<rel> via copy_to_container with the right mode."""
+    captured: dict = {}
+
+    def fake_copy(self, tardata, dest=None, clear_before_copy=True):
+        captured["dest"] = dest
+        captured["clear"] = clear_before_copy
+        captured["tardata_type"] = type(tardata)
+        captured["tar_bytes"] = tardata.read()
+
+    monkeypatch.setattr(SandboxDockerSession, "copy_to_container", fake_copy)
+
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.write_file(f"{SANDBOX_ROOT}/sub/dir/foo.py", b"print('hi')\n", mode=0o755)
+
+    assert captured["dest"] == f"{SANDBOX_ROOT}/sub/dir"
+    assert captured["clear"] is False
+    assert not issubclass(captured["tardata_type"], (bytes, bytearray))
+
+    with tarfile.open(fileobj=io.BytesIO(captured["tar_bytes"])) as tf:
+        members = tf.getmembers()
+        assert len(members) == 1
+        assert members[0].name == "foo.py"
+        assert members[0].isfile()
+        assert (members[0].mode & 0o7777) == 0o755
+        assert tf.extractfile(members[0]).read() == b"print('hi')\n"
+
+
+def test_copy_to_container_streams_sanitized_output_to_put_archive(mock_docker_client):
+    """copy_to_container hands a file-like (not bytes) to put_archive."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session.container.put_archive.return_value = True
+
+    src = io.BytesIO()
+    with tarfile.open(fileobj=src, mode="w") as tf:
+        info = tarfile.TarInfo(name="hello.txt")
+        info.size = 5
+        tf.addfile(info, io.BytesIO(b"hello"))
+    src.seek(0)
+
+    session.copy_to_container(src, dest=SANDBOX_ROOT, clear_before_copy=False)
+
+    assert session.container.put_archive.called
+    _path, sanitized_arg = session.container.put_archive.call_args.args
+    # The Docker SDK accepts either bytes or a file-like; we now pass the latter
+    # so large archives never materialize in memory.
+    assert not isinstance(sanitized_arg, (bytes, bytearray))
+    assert hasattr(sanitized_arg, "read") and hasattr(sanitized_arg, "seek")
+
+
+def test_build_single_file_tar_stream_returns_seekable_stream():
+    """Helper returns a seekable stream (not bytes) positioned at offset 0."""
+    content = b"hello world"
+    with _build_single_file_tar_stream("foo.txt", content, mode=0o644) as stream:
+        assert not isinstance(stream, (bytes, bytearray))
+        assert hasattr(stream, "read") and hasattr(stream, "seek")
+        assert stream.tell() == 0
+
+        with tarfile.open(fileobj=stream) as tf:
+            members = tf.getmembers()
+            assert len(members) == 1
+            assert members[0].name == "foo.txt"
+            assert members[0].isfile()
+            assert (members[0].mode & 0o7777) == 0o644
+            assert tf.extractfile(members[0]).read() == content
+
+
+def test_build_single_file_tar_stream_handles_large_content():
+    """Large content does not force the helper to materialize a `bytes` archive."""
+    big = b"x" * (4 * 1024 * 1024)  # 4 MiB — well above the in-memory spool limit.
+    with _build_single_file_tar_stream("big.bin", big, mode=0o600) as stream:
+        assert not isinstance(stream, (bytes, bytearray))
+        with tarfile.open(fileobj=stream) as tf:
+            members = tf.getmembers()
+            assert len(members) == 1
+            assert members[0].name == "big.bin"
+            assert (members[0].mode & 0o7777) == 0o600
+            assert tf.extractfile(members[0]).read() == big
+
+
+def test_write_file_rejects_path_outside_sandbox_root(mock_docker_client):
+    """write_file refuses paths outside SANDBOX_ROOT."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+
+    with pytest.raises(ValueError, match="must be under"):
+        session.write_file("/etc/passwd", b"pwned", mode=0o644)
+
+
+def test_write_file_rejects_traversal(mock_docker_client):
+    """write_file refuses paths with .. segments."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+
+    with pytest.raises(ValueError):
+        session.write_file(f"{SANDBOX_ROOT}/../etc/passwd", b"pwned", mode=0o644)
+
+
+def test_write_file_rejects_nul_in_path(mock_docker_client):
+    """write_file refuses paths containing NUL or newline characters."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+
+    with pytest.raises(ValueError):
+        session.write_file(f"{SANDBOX_ROOT}/foo\x00bar", b"x", mode=0o644)
+
+
+def test_copy_to_container_allows_skills_root(mock_docker_client):
+    """copy_to_container accepts /skills (and subdirs) as a destination."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session.container.put_archive.return_value = True
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="skill.md")
+        info.size = 5
+        tf.addfile(info, io.BytesIO(b"hello"))
+    buf.seek(0)
+
+    # Should not raise; /skills is accepted.
+    session.copy_to_container(buf, dest=SKILLS_ROOT, clear_before_copy=False)
+
+    # Subpaths under /skills also accepted.
+    buf.seek(0)
+    session.copy_to_container(buf, dest=f"{SKILLS_ROOT}/builtin", clear_before_copy=False)
+
+
+def test_copy_to_container_rejects_non_reserved_root(mock_docker_client):
+    """Paths outside reserved roots are still refused."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="x")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
+
+    with pytest.raises(ValueError, match="Refusing to extract"):
+        session.copy_to_container(buf, dest="/etc/passwd", clear_before_copy=False)
+
+
+def test_start_container_creates_skills_root(mock_docker_client):
+    """A freshly-started container has /skills owned by the sandbox user."""
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session._start_container("alpine:latest")
+
+    # mkdir -p was called including SKILLS_ROOT alongside the other roots.
+    mock_container.exec_run.assert_any_call(
+        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
+    )
+    # chown was called for SKILLS_ROOT alongside the other roots.
+    mock_container.exec_run.assert_any_call(
+        [
+            "chown",
+            f"{settings.RUN_UID}:{settings.RUN_GID}",
+            "--",
+            SANDBOX_ROOT,
+            WORKDIR_ROOT,
+            SANDBOX_HOME,
+            SKILLS_ROOT,
+        ],
+        user="root",
+    )
+
+
+def test_sanitize_archive_stream_raises_on_empty_stream():
+    """An empty input stream raises ValueError."""
+    in_buf = io.BytesIO(b"")
+    out_buf = io.BytesIO()
+    with pytest.raises(ValueError, match="Invalid or truncated archive"):
+        _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+
+
+def test_sanitize_archive_stream_raises_on_garbage_bytes():
+    """Bytes that are not a valid tar raise ValueError."""
+    in_buf = io.BytesIO(b"this is definitely not a tar archive!!!!!")
+    out_buf = io.BytesIO()
+    with pytest.raises(ValueError, match="Invalid or truncated archive"):
+        _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+
+
+def test_sanitize_archive_stream_raises_on_absolute_path_member():
+    """Archive with an absolute-path member raises ValueError."""
+    in_buf = io.BytesIO()
+    with tarfile.open(fileobj=in_buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="/etc/passwd")
+        info.size = 5
+        tf.addfile(info, io.BytesIO(b"hello"))
+    in_buf.seek(0)
+
+    out_buf = io.BytesIO()
+    with pytest.raises(ValueError, match="absolute path"):
+        _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+
+
+def test_sanitize_archive_stream_raises_on_traversal_member():
+    """Archive with a '..' traversal path raises ValueError."""
+    in_buf = io.BytesIO()
+    with tarfile.open(fileobj=in_buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="../evil.py")
+        info.size = 5
+        tf.addfile(info, io.BytesIO(b"hello"))
+    in_buf.seek(0)
+
+    out_buf = io.BytesIO()
+    with pytest.raises(ValueError, match="traversal"):
+        _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)

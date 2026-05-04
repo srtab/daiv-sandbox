@@ -3,10 +3,11 @@ from __future__ import annotations
 import io
 import logging
 import tarfile
+import tempfile
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, BinaryIO
+from typing import IO, TYPE_CHECKING, BinaryIO
 
 from docker import DockerClient, from_env
 from docker.errors import ImageNotFound, NotFound
@@ -24,6 +25,7 @@ logger = logging.getLogger("daiv_sandbox")
 SANDBOX_ROOT = "/repo"
 WORKDIR_ROOT = "/workdir"
 SANDBOX_HOME = "/home/daiv-sandbox"
+SKILLS_ROOT = "/skills"
 
 # Portable pipefail wrapper: uses bash when available (dash lacks pipefail support),
 # otherwise falls back to ash/sh which accept `-o pipefail` as a CLI flag.
@@ -40,6 +42,56 @@ def _sh_quote(value: str) -> str:
     """
     # POSIX-safe single-quote escaping:  abc'd -> 'abc'"'"'d'
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _validate_sandbox_path(path: str, allowed_roots: tuple[str, ...]) -> str:
+    """
+    Lexically validate that *path* is a safe absolute path under one of *allowed_roots*.
+
+    Returns the canonicalised absolute path. Raises ValueError on any rejection.
+    """
+    if "\x00" in path or "\n" in path or "\r" in path:
+        raise ValueError(f"path must not contain NUL or newline characters: {path!r}")
+    p = PurePosixPath(path)
+    if not p.is_absolute():
+        raise ValueError(f"path must be absolute, got: {path!r}")
+    if ".." in p.parts:
+        raise ValueError(f"path must not contain '..' segments: {path!r}")
+    canonical = str(p)
+    for root in allowed_roots:
+        root_norm = root.rstrip("/") or "/"
+        if canonical == root_norm:
+            raise ValueError(f"path must not equal a reserved root: {path!r}")
+        if canonical.startswith(f"{root_norm}/"):
+            return canonical
+    raise ValueError(f"path must be under one of {allowed_roots}, got: {path!r}")
+
+
+_SINGLE_FILE_TAR_SPOOL_LIMIT = 1 << 20  # 1 MiB
+_SANITIZED_ARCHIVE_SPOOL_LIMIT = 8 << 20  # 8 MiB — sanitized seed archives spill past this
+
+
+def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int) -> IO[bytes]:
+    """
+    Build an uncompressed tar containing one regular-file member.
+
+    Returns a seekable file-like object positioned at offset 0. Small archives stay
+    in memory; larger ones spill to disk. Caller owns the stream and must close it
+    (use as a context manager).
+    """
+    stream = tempfile.SpooledTemporaryFile(max_size=_SINGLE_FILE_TAR_SPOOL_LIMIT)  # noqa: SIM115
+    try:
+        with tarfile.open(fileobj=stream, mode="w") as tf:
+            info = tarfile.TarInfo(name=filename)
+            info.size = len(content)
+            info.mode = mode & 0o7777
+            info.type = tarfile.REGTYPE
+            tf.addfile(info, io.BytesIO(content))
+        stream.seek(0)
+    except BaseException:
+        stream.close()
+        raise
+    return stream
 
 
 def _normalize_tar_member_name(name: str) -> str | None:
@@ -66,23 +118,22 @@ def _normalize_tar_member_name(name: str) -> str | None:
     return None if normalized in {"", "."} else normalized
 
 
-def _sanitize_archive_bytes(data: bytes, *, uid: int, gid: int) -> bytes:
+def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid: int, gid: int) -> None:
     """
-    Sanitize an incoming (possibly compressed) tar archive for safer extraction.
+    Sanitize an incoming (possibly compressed) tar archive for safer extraction,
+    writing an *uncompressed* tar to ``out_stream``.
 
     - Rejects symlinks, hardlinks, device nodes, and FIFOs.
     - Rejects absolute paths and '..' traversal.
     - Normalizes ownership to the sandbox uid/gid.
     - Normalizes permissions similar to: chmod -R a+rX,u+w
 
-    Returns an *uncompressed* tar archive.
+    Both streams are consumed/written from their current positions. The caller must
+    seek ``in_stream`` to the desired start offset before calling this function.
+    ``out_stream`` is not seeked back afterward.
     """
-    out_buf = io.BytesIO()
     try:
-        with (
-            tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as in_tf,
-            tarfile.open(fileobj=out_buf, mode="w") as out_tf,
-        ):
+        with tarfile.open(fileobj=in_stream, mode="r:*") as in_tf, tarfile.open(fileobj=out_stream, mode="w") as out_tf:
             for member in in_tf:
                 normalized_name = _normalize_tar_member_name(member.name)
                 if normalized_name is None:
@@ -131,10 +182,8 @@ def _sanitize_archive_bytes(data: bytes, *, uid: int, gid: int) -> bytes:
                     out_tf.addfile(out_info, fileobj=extracted)
                 finally:
                     extracted.close()
-    except tarfile.TarError as e:  # pragma: no cover (depends on tarfile internals)
-        raise ValueError("Invalid tar archive") from e
-
-    return out_buf.getvalue()
+    except (tarfile.TarError, EOFError, OSError) as e:
+        raise ValueError(f"Invalid or truncated archive: {e}") from e
 
 
 class Session(ABC):
@@ -159,7 +208,7 @@ class Session(ABC):
         """
 
     @abstractmethod
-    def copy_to_container(self, data: BinaryIO, dest: str | None = None):
+    def copy_to_container(self, data: IO[bytes], dest: str | None = None):
         """
         Copy a file or directory to the container.
         """
@@ -296,7 +345,9 @@ class SandboxDockerSession(Session):
         logger.info("Container '%s' started (status: %s)", container.short_id, container.status)
 
         # Ensure the sandbox directories exist and are writable by the sandbox user.
-        mkdir_result = container.exec_run(["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root")
+        mkdir_result = container.exec_run(
+            ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
+        )
         if mkdir_result.exit_code != 0:
             raise RuntimeError(
                 f"Failed to create sandbox directories in {container.short_id}: "
@@ -304,7 +355,7 @@ class SandboxDockerSession(Session):
             )
 
         chown_result = container.exec_run(
-            ["chown", self._get_user(), "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME], user="root"
+            ["chown", self._get_user(), "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
         )
         if chown_result.exit_code != 0:
             raise RuntimeError(
@@ -316,8 +367,6 @@ class SandboxDockerSession(Session):
         """
         Remove the container.
 
-        Args:
-            session_id (str): The ID of the container to remove.
         """
         try:
             self.client.containers.get(self.session_id).remove(force=True)
@@ -331,7 +380,6 @@ class SandboxDockerSession(Session):
         Copy a file or directory from the container to the host.
 
         Args:
-            session_id (str): The ID of the container to copy the archive from.
             host_dir (str): The path to the file or directory to copy from the container.
 
         Returns:
@@ -353,26 +401,17 @@ class SandboxDockerSession(Session):
 
         return io.BytesIO(b"".join(bits))
 
-    def copy_to_container(self, tardata: BinaryIO, dest: str | None = None, clear_before_copy: bool = True):
+    def copy_to_container(self, tardata: IO[bytes], dest: str | None = None, clear_before_copy: bool = True):
         """
         Copy a file or directory to a specific path in the container.
 
         Args:
-            session_id (str): The ID of the container to copy the archive to.
-            tardata (BinaryIO): The tar archive to be copied to the container.
-            dest (str | None): The destination path to copy the archive to. Defaults to SANDBOX_ROOT.
-            clear_before_copy (bool): Whether to clear the destination directory before copying the archive.
+            tardata (IO[bytes]): Seekable tar archive to copy. Must be positioned at offset 0 or
+                pre-seeked; the method rewinds it before sanitization.
+            dest (str | None): Destination path inside the container. Defaults to SANDBOX_ROOT.
+            clear_before_copy (bool): Clear the destination directory before extracting.
         """
-        # Read and sanitize archive bytes before sending to the Docker daemon.
-        raw_bytes: bytes
-        if hasattr(tardata, "getvalue"):
-            raw_bytes = tardata.getvalue()  # type: ignore[no-any-return]
-        else:
-            if hasattr(tardata, "seek"):
-                tardata.seek(0)
-            raw_bytes = tardata.read()
-
-        sanitized = _sanitize_archive_bytes(raw_bytes, uid=settings.RUN_UID, gid=settings.RUN_GID)
+        tardata.seek(0)
 
         # Resolve destination: default to SANDBOX_ROOT, absolute stays absolute, relative resolves under SANDBOX_ROOT
         to_dir = SANDBOX_ROOT
@@ -384,11 +423,14 @@ class SandboxDockerSession(Session):
             raise ValueError("Refusing to extract an archive into the container root directory")
 
         if not (
-            to_dir_norm in (SANDBOX_ROOT, WORKDIR_ROOT)
+            to_dir_norm in (SANDBOX_ROOT, WORKDIR_ROOT, SKILLS_ROOT)
             or to_dir_norm.startswith(f"{SANDBOX_ROOT}/")
             or to_dir_norm.startswith(f"{WORKDIR_ROOT}/")
+            or to_dir_norm.startswith(f"{SKILLS_ROOT}/")
         ):
-            raise ValueError(f"Refusing to extract an archive outside of {SANDBOX_ROOT!r} or {WORKDIR_ROOT!r}")
+            raise ValueError(
+                f"Refusing to extract an archive outside of {SANDBOX_ROOT!r}, {WORKDIR_ROOT!r}, or {SKILLS_ROOT!r}"
+            )
 
         if clear_before_copy:
             q = _sh_quote(to_dir_norm)
@@ -407,7 +449,12 @@ class SandboxDockerSession(Session):
                 f"(exit_code: {mkdir_result.exit_code}) -> {mkdir_result.output}"
             )
 
-        if self.container.put_archive(to_dir_norm, sanitized):
+        with tempfile.SpooledTemporaryFile(max_size=_SANITIZED_ARCHIVE_SPOOL_LIMIT) as sanitized:
+            _sanitize_archive_stream(tardata, sanitized, uid=settings.RUN_UID, gid=settings.RUN_GID)
+            sanitized.seek(0)
+            put_ok = self.container.put_archive(to_dir_norm, sanitized)
+
+        if put_ok:
             # Normalize permissions/ownership on the extracted tree.
             #
             # NOTE: The archive is sanitized to disallow symlinks/hardlinks, which avoids dangerous recursive
@@ -432,7 +479,6 @@ class SandboxDockerSession(Session):
         Execute a command in the container.
 
         Args:
-            session_id (str): The ID of the container to execute the command in.
             command (str): The command to execute.
             workdir (str | None): The working directory of the command. Defaults to SANDBOX_ROOT.
 
@@ -472,6 +518,21 @@ class SandboxDockerSession(Session):
 
         return RunResult(command=command, output=output, exit_code=result.exit_code, workdir=command_workdir)
 
+    def write_file(self, path: str, content: bytes, *, mode: int) -> None:
+        """
+        Write *content* to *path* (absolute, under SANDBOX_ROOT) inside the container.
+
+        The path is validated lexically. The content is shipped via a single-file tar
+        through the existing copy_to_container pipeline (sanitised, mode preserved).
+        """
+        canonical = _validate_sandbox_path(path, allowed_roots=(SANDBOX_ROOT,))
+        parent_dir, _, filename = canonical.rpartition("/")
+        if not parent_dir or not filename:
+            raise ValueError(f"path resolves to an unusable location: {path!r}")
+
+        with _build_single_file_tar_stream(filename, content, mode=mode) as tar_stream:
+            self.copy_to_container(tar_stream, dest=parent_dir, clear_before_copy=False)
+
     def _get_user(self) -> str:
         """
         Get the user to execute sandbox commands as.
@@ -498,7 +559,6 @@ class SandboxDockerSession(Session):
         Get the container by ID. If the container is not running, attempt to restart it.
 
         Args:
-            session_id (str): The ID of the container to ensure is running.
 
         Returns:
             Container | None: The container object if it exists and is running, None otherwise.
