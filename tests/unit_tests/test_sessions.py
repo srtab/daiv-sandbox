@@ -497,3 +497,47 @@ def test_start_container_creates_skills_root(mock_docker_client):
         ],
         user="root",
     )
+
+
+def test_sanitize_archive_stream_raises_on_empty_stream():
+    """An empty input stream raises ValueError."""
+    in_buf = io.BytesIO(b"")
+    out_buf = io.BytesIO()
+    with pytest.raises(ValueError, match="Invalid or truncated archive"):
+        _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+
+
+def test_sanitize_archive_stream_raises_on_garbage_bytes():
+    """Bytes that are not a valid tar raise ValueError."""
+    in_buf = io.BytesIO(b"this is definitely not a tar archive!!!!!")
+    out_buf = io.BytesIO()
+    with pytest.raises(ValueError, match="Invalid or truncated archive"):
+        _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+
+
+def test_sanitize_archive_stream_raises_on_absolute_path_member():
+    """Archive with an absolute-path member raises ValueError."""
+    in_buf = io.BytesIO()
+    with tarfile.open(fileobj=in_buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="/etc/passwd")
+        info.size = 5
+        tf.addfile(info, io.BytesIO(b"hello"))
+    in_buf.seek(0)
+
+    out_buf = io.BytesIO()
+    with pytest.raises(ValueError, match="absolute path"):
+        _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+
+
+def test_sanitize_archive_stream_raises_on_traversal_member():
+    """Archive with a '..' traversal path raises ValueError."""
+    in_buf = io.BytesIO()
+    with tarfile.open(fileobj=in_buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="../evil.py")
+        info.size = 5
+        tf.addfile(info, io.BytesIO(b"hello"))
+    in_buf.seek(0)
+
+    out_buf = io.BytesIO()
+    with pytest.raises(ValueError, match="traversal"):
+        _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)

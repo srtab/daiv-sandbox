@@ -593,3 +593,114 @@ def test_seed_session_requires_at_least_one_archive(mock_session, client):
     resp = client.post(f"/session/{mock_session.session_id}/seed/")
     assert resp.status_code == 422
     assert "at least one" in resp.json()["detail"].lower()
+
+
+def test_seed_session_invalid_repo_archive_returns_422(mock_session, client):
+    """copy_to_container raising ValueError for repo_archive returns 422."""
+    from docker.models.containers import ExecResult
+
+    mock_session.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
+    mock_session.copy_to_container.side_effect = ValueError("Invalid or truncated archive: ...")
+
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"repo_archive": ("repo.tar", b"not a tar", "application/x-tar")},
+    )
+    assert resp.status_code == 422
+    assert "repo_archive" in resp.json()["detail"].lower()
+
+
+def test_seed_session_invalid_skills_archive_returns_422(mock_session, client):
+    """copy_to_container raising ValueError for skills_archive returns 422."""
+    from docker.models.containers import ExecResult
+
+    mock_session.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
+    mock_session.copy_to_container.side_effect = ValueError("Invalid or truncated archive: ...")
+
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"skills_archive": ("skills.tar", b"garbage", "application/x-tar")},
+    )
+    assert resp.status_code == 422
+    assert "skills_archive" in resp.json()["detail"].lower()
+
+
+def test_seed_session_meta_init_runs_on_repo_archive(client):
+    """When a patch extractor is linked, CMD_INIT_META_SCRIPT is executed after /repo is copied."""
+    from docker.models.containers import ExecResult
+
+    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
+
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_cls:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.container = Mock()
+        mock_cmd_executor.container.exec_run.side_effect = [
+            ExecResult(exit_code=1, output=b""),  # seeded check → not seeded
+            ExecResult(exit_code=0, output=b""),  # marker write
+        ]
+        mock_cmd_executor.get_label.side_effect = lambda label: (
+            "patch-extractor-id" if label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL else None
+        )
+
+        mock_patch_extractor = Mock()
+        mock_patch_extractor.execute_command.return_value = RunResult(
+            command="init", output="", exit_code=0, workdir="/workdir"
+        )
+
+        mock_cls.side_effect = [mock_cmd_executor, mock_patch_extractor]
+
+        resp = client.post(
+            "/session/test-session/seed/",
+            files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+        )
+
+    assert resp.status_code == 204, resp.text
+    mock_cmd_executor.copy_to_container.assert_called_once()
+    mock_patch_extractor.execute_command.assert_called_once()
+
+
+def test_seed_session_meta_init_failure_returns_500(client):
+    """If CMD_INIT_META_SCRIPT exits non-zero, seed returns 500."""
+    from docker.models.containers import ExecResult
+
+    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
+
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_cls:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.container = Mock()
+        mock_cmd_executor.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
+        mock_cmd_executor.get_label.side_effect = lambda label: (
+            "patch-extractor-id" if label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL else None
+        )
+
+        mock_patch_extractor = Mock()
+        mock_patch_extractor.execute_command.return_value = RunResult(
+            command="init", output="fatal: not a git repo", exit_code=128, workdir="/workdir"
+        )
+
+        mock_cls.side_effect = [mock_cmd_executor, mock_patch_extractor]
+
+        resp = client.post(
+            "/session/test-session/seed/",
+            files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+        )
+
+    assert resp.status_code == 500
+    assert "patch-extractor" in resp.json()["detail"].lower()
+
+
+def test_seed_session_marker_write_failure_returns_500(mock_session, client):
+    """If the seeded-marker touch fails, seed returns 500."""
+    from docker.models.containers import ExecResult
+
+    mock_session.container.exec_run.side_effect = [
+        ExecResult(exit_code=1, output=b""),  # seeded check → not seeded
+        ExecResult(exit_code=1, output=b"read-only filesystem"),  # marker write fails
+    ]
+
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+    )
+    assert resp.status_code == 500
+    assert "seeded" in resp.json()["detail"].lower()

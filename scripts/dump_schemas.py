@@ -18,7 +18,6 @@ from daiv_sandbox.schemas import (
     RunRequest,
     RunResponse,
     RunResult,
-    SeedSessionRequest,
     StartSessionRequest,
     StartSessionResponse,
 )
@@ -31,7 +30,6 @@ _TYPES = [
     RunRequest,
     RunResponse,
     RunResult,
-    SeedSessionRequest,
     StartSessionRequest,
     StartSessionResponse,
 ]
