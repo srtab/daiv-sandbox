@@ -6,11 +6,11 @@ sandbox image's git sidecar.
 """
 
 import base64
-import io
-import tarfile
 from typing import TYPE_CHECKING
 
 import pytest
+
+from .utils import make_tar_gz
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -18,13 +18,8 @@ if TYPE_CHECKING:
     from fastapi.testclient import TestClient
 
 
-def _archive_one_file(name: str, content: bytes) -> str:
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tf:
-        info = tarfile.TarInfo(name=name)
-        info.size = len(content)
-        tf.addfile(info, io.BytesIO(content))
-    return base64.b64encode(buf.getvalue()).decode()
+def _archive_only_readme() -> bytes:
+    return make_tar_gz({"README.md": b"hello\n"})
 
 
 # Parameterised across base images so we catch image-specific quirks
@@ -42,7 +37,9 @@ _BASE_IMAGES = [
 @pytest.fixture(params=_BASE_IMAGES, ids=lambda p: p.replace(":", "_").replace("/", "_"))
 def session_with_seed(request, client: TestClient, sandbox_session: Callable[..., str]):
     sid = sandbox_session(base_image=request.param, extract_patch=True)
-    seed = client.post(f"/session/{sid}/seed/", json={"repo_archive": _archive_one_file("README.md", b"hello\n")})
+    seed = client.post(
+        f"/session/{sid}/seed/", files={"repo_archive": ("repo.tar.gz", _archive_only_readme(), "application/gzip")}
+    )
     assert seed.status_code == 204, seed.text
     return sid
 

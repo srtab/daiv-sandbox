@@ -1,4 +1,3 @@
-import base64
 import io
 import os
 import shutil
@@ -8,25 +7,25 @@ import tempfile
 from pathlib import Path
 
 
-def make_tar_gz(files: dict[str, bytes]) -> str:
+def make_tar_gz(files: dict[str, bytes]) -> bytes:
+    """Build a gzip-compressed tar archive from ``files`` and return raw bytes."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for name, content in files.items():
             ti = tarfile.TarInfo(name)
             ti.size = len(content)
             tf.addfile(ti, io.BytesIO(content))
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    return buf.getvalue()
 
 
 def make_tar_gz_with_git(
     files: dict[str, bytes] | None = None, *, commit_message: str = "Initial commit", default_branch: str = "main"
-) -> str:
+) -> bytes:
     """
     Create a .tar.gz archive containing a valid git repository at its root.
 
-    The returned value is a base64-encoded string suitable for passing as the
-    `archive` field in integration tests (the sandbox will extract it into its
-    working directory).
+    The returned value is raw bytes suitable for passing as a multipart upload
+    field in integration tests (the sandbox will extract it into its working directory).
     """
     files = files or {"README.md": b"# test repo\n"}
 
@@ -78,4 +77,4 @@ def make_tar_gz_with_git(
                     arcname = str(full_path.relative_to(root))
                     tf.add(full_path, arcname=arcname, recursive=False)
 
-        return base64.b64encode(buf.getvalue()).decode("ascii")
+        return buf.getvalue()

@@ -12,7 +12,10 @@ def test_git_commands_dont_raise_safe_directory_exception(client: TestClient, sa
     """Test that git commands don't raise safe directory exception."""
     session_id = sandbox_session(base_image="alpine/git:latest", extract_patch=True)
 
-    seed = client.post(f"/session/{session_id}/seed/", json={"repo_archive": make_tar_gz_with_git()})
+    seed = client.post(
+        f"/session/{session_id}/seed/",
+        files={"repo_archive": ("repo.tar.gz", make_tar_gz_with_git(), "application/gzip")},
+    )
     assert seed.status_code == 204, seed.text
 
     run = client.post(f"/session/{session_id}/", json={"commands": ["git status"]})

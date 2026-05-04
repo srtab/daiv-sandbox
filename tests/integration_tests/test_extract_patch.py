@@ -14,7 +14,10 @@ def test_extract_patch(client: TestClient, sandbox_session: Callable[..., str]):
 
     # Seed the workspace via the new endpoint.
     seed = client.post(
-        f"/session/{session_id}/seed/", json={"repo_archive": make_tar_gz({"a.txt": b"old\n", "b.txt": b"old2\n"})}
+        f"/session/{session_id}/seed/",
+        files={
+            "repo_archive": ("repo.tar.gz", make_tar_gz({"a.txt": b"old\n", "b.txt": b"old2\n"}), "application/gzip")
+        },
     )
     assert seed.status_code == 204, seed.text
 
