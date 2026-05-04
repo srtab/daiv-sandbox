@@ -75,7 +75,7 @@ All settings are configurable via environment variables. The available settings 
 `daiv-sandbox` provides a REST API to interact with. Here is a quick overview of the available endpoints:
 
 - `POST /session/`: Start a sandbox session.
-- `POST /session/{session_id}/seed/`: Seed the initial `/repo` state from a tar archive (one-shot per session).
+- `POST /session/{session_id}/seed/`: Seed the initial `/repo` and/or `/skills` state from tar archives (one-shot per session).
 - `POST /session/{session_id}/files/`: Apply a batch of file mutations to `/repo`.
 - `POST /session/{session_id}/`: Run commands on the sandbox session.
 - `DELETE /session/{session_id}/`: Close the sandbox session.
@@ -140,19 +140,23 @@ print(resp["session_id"])
 
 ### Seeding a Session
 
-A freshly-started session has an empty `/repo`. Before running commands or applying file mutations, seed the workspace by calling `POST /session/{session_id}/seed/` with a tar archive (e.g. a repository snapshot). The archive is extracted into `/repo` and, when `extract_patch` was enabled at session start, the patch-extractor's meta repo is initialised against this state.
+A freshly-started session has empty `/repo` and `/skills` directories. Before running commands or applying file mutations, seed the workspace by calling `POST /session/{session_id}/seed/` with one or both archives as `multipart/form-data` fields. `repo_archive` is extracted into `/repo` (e.g. a repository snapshot) and `skills_archive` is extracted into `/skills` (auxiliary tooling, prompts, etc.). When `extract_patch` was enabled at session start and `repo_archive` is provided, the patch-extractor's meta repo is initialised against this state.
 
-Seeding is **one-shot per session** — a second call returns `409 Conflict`.
+Both fields are optional individually, but **at least one must be provided** — a request with neither returns `422`. Seeding is **one-shot per session** — a second call returns `409 Conflict`.
 
-| Parameter      | Description                                            | Required | Valid Values                 |
-| -------------- | ------------------------------------------------------ | -------- | ---------------------------- |
-| `repo_archive` | Tar archive that becomes the initial state of `/repo`. | Yes      | Base64-encoded `tar` archive |
+Archives may be plain `tar` or gzip-compressed (`tar.gz`); they are sanitised and streamed into the container without being fully buffered in memory.
+
+| Parameter        | Description                                              | Required          | Valid Values               |
+| ---------------- | -------------------------------------------------------- | ----------------- | -------------------------- |
+| `repo_archive`   | Tar archive that becomes the initial state of `/repo`.   | At least one of   | `tar` or `tar.gz` (binary) |
+| `skills_archive` | Tar archive that becomes the initial state of `/skills`. | `repo_archive` or | `tar` or `tar.gz` (binary) |
+|                  |                                                          | `skills_archive`  |                            |
 
 ```sh
 $ curl -X POST \
-  -H "Content-Type: application/json" \
   -H "X-API-Key: notsosecret" \
-  -d "{\"repo_archive\": \"$(base64 -w 0 django-webhooks-master.tar.gz)\"}" \
+  -F "repo_archive=@django-webhooks-master.tar.gz" \
+  -F "skills_archive=@skills.tar.gz" \
   http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/seed/
 ```
 
@@ -245,15 +249,16 @@ session_id = (
     .json()["session_id"]
 )
 
-# 2. Seed /repo from a tar archive.
+# 2. Seed /repo (and optionally /skills) from tar archives via multipart upload.
 tarstream = io.BytesIO()
 with tarfile.open(fileobj=tarstream, mode="w:gz") as tar:
     # Add files to tar...
     pass
+tarstream.seek(0)
 httpx.post(
     f"{API}/session/{session_id}/seed/",
     headers=HEADERS,
-    json={"repo_archive": base64.b64encode(tarstream.getvalue()).decode()},
+    files={"repo_archive": ("repo.tar.gz", tarstream, "application/gzip")},
 ).raise_for_status()
 
 # 3. Run commands. Returns a patch covering this turn's changes.
