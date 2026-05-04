@@ -238,9 +238,12 @@ API = "http://localhost:8000/api/v1"
 HEADERS = {"X-API-Key": "notsosecret"}
 
 # 1. Start a session with extract_patch enabled.
-session_id = httpx.post(
-    f"{API}/session/", headers=HEADERS, json={"base_image": "python:3.12", "extract_patch": True}
-).raise_for_status().json()["session_id"]
+session_id = (
+    httpx
+    .post(f"{API}/session/", headers=HEADERS, json={"base_image": "python:3.12", "extract_patch": True})
+    .raise_for_status()
+    .json()["session_id"]
+)
 
 # 2. Seed /repo from a tar archive.
 tarstream = io.BytesIO()
@@ -254,11 +257,14 @@ httpx.post(
 ).raise_for_status()
 
 # 3. Run commands. Returns a patch covering this turn's changes.
-resp = httpx.post(
-    f"{API}/session/{session_id}/",
-    headers=HEADERS,
-    json={"commands": ["ls -la"], "fail_fast": True, "timeout": 60},
-).raise_for_status().json()
+resp = (
+    httpx
+    .post(
+        f"{API}/session/{session_id}/", headers=HEADERS, json={"commands": ["ls -la"], "fail_fast": True, "timeout": 60}
+    )
+    .raise_for_status()
+    .json()
+)
 
 print(resp["results"][0]["output"])
 if resp["patch"]:
