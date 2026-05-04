@@ -39,7 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Removed `StartSessionRequest.ephemeral` and the `DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL` mechanism. **Breaking change**
 - Removed `RunRequest.archive`; initial session state is now established via `POST /session/{id}/seed/`. **Breaking change**
-- Removed `SeedSessionRequest` JSON schema (replaced by `multipart/form-data` upload fields). **Breaking change**
 
 ## [0.4.0] - 2026-02-22
 
