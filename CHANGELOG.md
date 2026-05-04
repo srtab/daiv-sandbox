@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.6.0] - 2026-05-04
+
+### Added
+
+- `POST /session/{id}/seed/` now accepts an optional `skills_archive` multipart field that is extracted into `/skills`, in addition to the existing `repo_archive` field. At least one of the two must be provided.
+
+### Changed
+
+- `POST /session/{id}/seed/` now accepts archives as `multipart/form-data` fields (`repo_archive`, `skills_archive`) instead of base64-encoded JSON. Both fields are optional but at least one is required (422 otherwise). The patch-extractor's meta repo is initialised only when `repo_archive` is provided. **Breaking change** — clients must update.
+- Archive sanitization (`_sanitize_archive_stream`) and `copy_to_container` now stream end-to-end through a `SpooledTemporaryFile`; archives larger than 8 MiB no longer require a full in-memory copy on the server.
+
+### Removed
+
+- `SeedSessionRequest` schema (replaced by the multipart `UploadFile` parameters). **Breaking change**
+- `_sanitize_archive_bytes` (replaced by `_sanitize_archive_stream`).
+
 ## [0.5.0] - 2026-05-03
 
 ### Added

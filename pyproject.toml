@@ -1,6 +1,6 @@
 [project]
 name = "daiv-sandbox"
-version = "0.5.0"
+version = "0.6.0"
 description = "Runtime sandbox to empower DAIV agents to run arbitrary commands."
 readme = "README.md"
 license = { file = "LICENSE" }
