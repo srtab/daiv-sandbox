@@ -119,23 +119,20 @@ def _normalize_tar_member_name(name: str) -> str | None:
     return None if normalized in {"", "."} else normalized
 
 
-def _sanitize_archive_bytes(data: bytes, *, uid: int, gid: int) -> bytes:
+def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid: int, gid: int) -> None:
     """
-    Sanitize an incoming (possibly compressed) tar archive for safer extraction.
+    Sanitize an incoming (possibly compressed) tar archive for safer extraction,
+    writing an *uncompressed* tar to ``out_stream``.
 
     - Rejects symlinks, hardlinks, device nodes, and FIFOs.
     - Rejects absolute paths and '..' traversal.
     - Normalizes ownership to the sandbox uid/gid.
     - Normalizes permissions similar to: chmod -R a+rX,u+w
 
-    Returns an *uncompressed* tar archive.
+    The caller owns both streams; this function does not seek either one.
     """
-    out_buf = io.BytesIO()
     try:
-        with (
-            tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as in_tf,
-            tarfile.open(fileobj=out_buf, mode="w") as out_tf,
-        ):
+        with tarfile.open(fileobj=in_stream, mode="r:*") as in_tf, tarfile.open(fileobj=out_stream, mode="w") as out_tf:
             for member in in_tf:
                 normalized_name = _normalize_tar_member_name(member.name)
                 if normalized_name is None:
@@ -186,8 +183,6 @@ def _sanitize_archive_bytes(data: bytes, *, uid: int, gid: int) -> bytes:
                     extracted.close()
     except tarfile.TarError as e:  # pragma: no cover (depends on tarfile internals)
         raise ValueError("Invalid tar archive") from e
-
-    return out_buf.getvalue()
 
 
 class Session(ABC):
@@ -418,16 +413,13 @@ class SandboxDockerSession(Session):
             dest (str | None): The destination path to copy the archive to. Defaults to SANDBOX_ROOT.
             clear_before_copy (bool): Whether to clear the destination directory before copying the archive.
         """
-        # Read and sanitize archive bytes before sending to the Docker daemon.
-        raw_bytes: bytes
-        if hasattr(tardata, "getvalue"):
-            raw_bytes = tardata.getvalue()  # type: ignore[no-any-return]
-        else:
-            if hasattr(tardata, "seek"):
-                tardata.seek(0)
-            raw_bytes = tardata.read()
-
-        sanitized = _sanitize_archive_bytes(raw_bytes, uid=settings.RUN_UID, gid=settings.RUN_GID)
+        # Sanitize archive in-memory before sending to the Docker daemon.
+        # NOTE: Task 2 of the seed-streaming plan replaces this with a streaming pipeline.
+        if hasattr(tardata, "seek"):
+            tardata.seek(0)
+        out_buf = io.BytesIO()
+        _sanitize_archive_stream(tardata, out_buf, uid=settings.RUN_UID, gid=settings.RUN_GID)
+        sanitized = out_buf.getvalue()
 
         # Resolve destination: default to SANDBOX_ROOT, absolute stays absolute, relative resolves under SANDBOX_ROOT
         to_dir = SANDBOX_ROOT

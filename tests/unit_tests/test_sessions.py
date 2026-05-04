@@ -16,7 +16,7 @@ from daiv_sandbox.sessions import (
     WORKDIR_ROOT,
     SandboxDockerSession,
     _build_single_file_tar_stream,
-    _sanitize_archive_bytes,
+    _sanitize_archive_stream,
 )
 
 EXPECTED_EXEC_ENV = {
@@ -277,31 +277,34 @@ def test_get_exec_environment(mock_docker_client):
     assert session._get_exec_environment() == EXPECTED_EXEC_ENV
 
 
-def test_sanitize_archive_bytes_skips_symlinks():
-    """Symlink entries should be silently skipped, not raise ValueError."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tf:
+def test_sanitize_archive_stream_skips_symlinks():
+    """Symlink entries are silently skipped in the streamed output."""
+    in_buf = io.BytesIO()
+    with tarfile.open(fileobj=in_buf, mode="w") as tf:
         content = b"hello"
         info = tarfile.TarInfo(name="file.txt")
         info.size = len(content)
         tf.addfile(info, io.BytesIO(content))
-        sym = tarfile.TarInfo(name="CLAUDE.md")
+        sym = tarfile.TarInfo(name="symlink.txt")
         sym.type = tarfile.SYMTYPE
         sym.linkname = "file.txt"
         tf.addfile(sym)
+    in_buf.seek(0)
 
-    result = _sanitize_archive_bytes(buf.getvalue(), uid=1000, gid=1000)
+    out_buf = io.BytesIO()
+    _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+    out_buf.seek(0)
 
-    with tarfile.open(fileobj=io.BytesIO(result)) as out_tf:
+    with tarfile.open(fileobj=out_buf) as out_tf:
         names = out_tf.getnames()
     assert "file.txt" in names
-    assert "CLAUDE.md" not in names
+    assert "symlink.txt" not in names
 
 
-def test_sanitize_archive_bytes_skips_hardlinks():
-    """Hardlink entries should be silently skipped, not raise ValueError."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tf:
+def test_sanitize_archive_stream_skips_hardlinks():
+    """Hardlink entries are silently skipped in the streamed output."""
+    in_buf = io.BytesIO()
+    with tarfile.open(fileobj=in_buf, mode="w") as tf:
         content = b"hello"
         info = tarfile.TarInfo(name="file.txt")
         info.size = len(content)
@@ -310,10 +313,13 @@ def test_sanitize_archive_bytes_skips_hardlinks():
         lnk.type = tarfile.LNKTYPE
         lnk.linkname = "file.txt"
         tf.addfile(lnk)
+    in_buf.seek(0)
 
-    result = _sanitize_archive_bytes(buf.getvalue(), uid=1000, gid=1000)
+    out_buf = io.BytesIO()
+    _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+    out_buf.seek(0)
 
-    with tarfile.open(fileobj=io.BytesIO(result)) as out_tf:
+    with tarfile.open(fileobj=out_buf) as out_tf:
         names = out_tf.getnames()
     assert "file.txt" in names
     assert "hardlink.txt" not in names
