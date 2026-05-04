@@ -26,7 +26,7 @@ def _archive_only_readme() -> bytes:
 # (different shells, missing utilities, alpine-vs-debian path conventions).
 _BASE_IMAGES = [
     "alpine:latest",
-    "debian:slim",
+    "debian:bookworm-slim",
     "ubuntu:24.04",
     "python:3.12-slim",
     "node:20-alpine",
