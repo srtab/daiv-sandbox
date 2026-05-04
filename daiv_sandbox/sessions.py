@@ -70,6 +70,7 @@ def _validate_sandbox_path(path: str, allowed_roots: tuple[str, ...]) -> str:
 
 
 _SINGLE_FILE_TAR_SPOOL_LIMIT = 1 << 20  # 1 MiB
+_SANITIZED_ARCHIVE_SPOOL_LIMIT = 8 << 20  # 8 MiB — sanitized seed archives spill past this
 
 
 def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int) -> IO[bytes]:
@@ -413,13 +414,10 @@ class SandboxDockerSession(Session):
             dest (str | None): The destination path to copy the archive to. Defaults to SANDBOX_ROOT.
             clear_before_copy (bool): Whether to clear the destination directory before copying the archive.
         """
-        # Sanitize archive in-memory before sending to the Docker daemon.
-        # NOTE: Task 2 of the seed-streaming plan replaces this with a streaming pipeline.
+        # Sanitize archive end-to-end via a spooled stream — small archives stay
+        # in memory; larger ones spill to disk rather than doubling RAM use.
         if hasattr(tardata, "seek"):
             tardata.seek(0)
-        out_buf = io.BytesIO()
-        _sanitize_archive_stream(tardata, out_buf, uid=settings.RUN_UID, gid=settings.RUN_GID)
-        sanitized = out_buf.getvalue()
 
         # Resolve destination: default to SANDBOX_ROOT, absolute stays absolute, relative resolves under SANDBOX_ROOT
         to_dir = SANDBOX_ROOT
@@ -457,7 +455,12 @@ class SandboxDockerSession(Session):
                 f"(exit_code: {mkdir_result.exit_code}) -> {mkdir_result.output}"
             )
 
-        if self.container.put_archive(to_dir_norm, sanitized):
+        with tempfile.SpooledTemporaryFile(max_size=_SANITIZED_ARCHIVE_SPOOL_LIMIT) as sanitized:
+            _sanitize_archive_stream(tardata, sanitized, uid=settings.RUN_UID, gid=settings.RUN_GID)
+            sanitized.seek(0)
+            put_ok = self.container.put_archive(to_dir_norm, sanitized)
+
+        if put_ok:
             # Normalize permissions/ownership on the extracted tree.
             #
             # NOTE: The archive is sanitized to disallow symlinks/hardlinks, which avoids dangerous recursive

@@ -354,6 +354,30 @@ def test_write_file_builds_singlefile_tar_for_repo_path(mock_docker_client, monk
         assert tf.extractfile(members[0]).read() == b"print('hi')\n"
 
 
+def test_copy_to_container_streams_sanitized_output_to_put_archive(mock_docker_client):
+    """copy_to_container hands a file-like (not bytes) to put_archive."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session.container.put_archive.return_value = True
+
+    src = io.BytesIO()
+    with tarfile.open(fileobj=src, mode="w") as tf:
+        info = tarfile.TarInfo(name="hello.txt")
+        info.size = 5
+        tf.addfile(info, io.BytesIO(b"hello"))
+    src.seek(0)
+
+    session.copy_to_container(src, dest=SANDBOX_ROOT, clear_before_copy=False)
+
+    assert session.container.put_archive.called
+    _path, sanitized_arg = session.container.put_archive.call_args.args
+    # The Docker SDK accepts either bytes or a file-like; we now pass the latter
+    # so large archives never materialize in memory.
+    assert not isinstance(sanitized_arg, (bytes, bytearray))
+    assert hasattr(sanitized_arg, "read") and hasattr(sanitized_arg, "seek")
+
+
 def test_build_single_file_tar_stream_returns_seekable_stream():
     """Helper returns a seekable stream (not bytes) positioned at offset 0."""
     content = b"hello world"
