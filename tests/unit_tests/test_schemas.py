@@ -31,13 +31,6 @@ def test_apply_mutations_request_size_limits():
         ApplyMutationsRequest(mutations=[one] * 65)
 
 
-def test_seed_session_request_carries_repo_archive():
-    from daiv_sandbox.schemas import SeedSessionRequest
-
-    req = SeedSessionRequest(repo_archive=base64.b64encode(b"tar-bytes"))
-    assert req.repo_archive == b"tar-bytes"
-
-
 def test_run_request_no_longer_accepts_archive():
     from daiv_sandbox.schemas import RunRequest
 

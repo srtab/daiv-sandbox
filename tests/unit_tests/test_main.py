@@ -432,33 +432,36 @@ def test_close_session_returns_conflict_when_session_is_locked(mock_session, cli
     assert response.json() == {"detail": "Session is busy"}
 
 
-def _minimal_archive_b64() -> str:
-    """Build a minimal tar archive with a single README.md and return base64 string."""
+def _minimal_archive_bytes(member_name: str = "README.md", member_content: bytes = b"hello") -> bytes:
+    """Build a minimal uncompressed tar archive with a single member."""
     import tarfile
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:
-        info = tarfile.TarInfo(name="README.md")
-        info.size = 5
-        tf.addfile(info, io.BytesIO(b"hello"))
-    return base64.b64encode(buf.getvalue()).decode()
+        info = tarfile.TarInfo(name=member_name)
+        info.size = len(member_content)
+        tf.addfile(info, io.BytesIO(member_content))
+    return buf.getvalue()
 
 
 def test_seed_session_extracts_repo_archive(mock_session, client):
-    """Successful seed returns 204 and runs marker-file write."""
+    """repo_archive only: copy_to_container is called once with /repo as dest."""
     from docker.models.containers import ExecResult
 
-    # Container is truthy. exec_run is called twice:
-    # 1. test -f /workdir/.daiv-seeded → exit 1 (not yet seeded)
-    # 2. touch /workdir/.daiv-seeded → exit 0
+    from daiv_sandbox.sessions import SANDBOX_ROOT
+
     mock_session.container.exec_run.side_effect = [
-        ExecResult(exit_code=1, output=b""),
-        ExecResult(exit_code=0, output=b""),
+        ExecResult(exit_code=1, output=b""),  # not yet seeded
+        ExecResult(exit_code=0, output=b""),  # touch marker
     ]
 
-    resp = client.post(f"/session/{mock_session.session_id}/seed/", json={"repo_archive": _minimal_archive_b64()})
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+    )
     assert resp.status_code == 204, resp.text
     mock_session.copy_to_container.assert_called_once()
+    assert mock_session.copy_to_container.call_args.kwargs.get("dest") == SANDBOX_ROOT
 
 
 def test_seed_session_rejects_unknown_session(client):
@@ -466,7 +469,10 @@ def test_seed_session_rejects_unknown_session(client):
     with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
         instance = cls.return_value
         instance.container = None
-        resp = client.post("/session/does-not-exist/seed/", json={"repo_archive": _minimal_archive_b64()})
+        resp = client.post(
+            "/session/does-not-exist/seed/",
+            files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+        )
         assert resp.status_code == 404
 
 
@@ -527,8 +533,67 @@ def test_seed_session_rejects_double_seed(mock_session, client):
     """A second seed attempt on an already-seeded session returns 409."""
     from docker.models.containers import ExecResult
 
-    # Marker exists → 409.
     mock_session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
-    resp = client.post(f"/session/{mock_session.session_id}/seed/", json={"repo_archive": _minimal_archive_b64()})
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+    )
     assert resp.status_code == 409
     assert resp.json() == {"detail": "Session already seeded"}
+
+
+def test_seed_session_extracts_skills_archive_only(mock_session, client):
+    """skills_archive only: copy_to_container hits /skills, meta init does NOT run."""
+    from docker.models.containers import ExecResult
+
+    from daiv_sandbox.sessions import SKILLS_ROOT
+
+    mock_session.container.exec_run.side_effect = [
+        ExecResult(exit_code=1, output=b""),  # not yet seeded
+        ExecResult(exit_code=0, output=b""),  # touch marker
+    ]
+
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files={"skills_archive": ("skills.tar", _minimal_archive_bytes("intro.md", b"# hi\n"), "application/x-tar")},
+    )
+    assert resp.status_code == 204, resp.text
+    mock_session.copy_to_container.assert_called_once()
+    assert mock_session.copy_to_container.call_args.kwargs.get("dest") == SKILLS_ROOT
+    # Patch-extractor meta init must not run when there is no /repo content.
+    mock_session.execute_command.assert_not_called()
+
+
+def test_seed_session_extracts_both_archives(mock_session, client):
+    """Both archives: copy_to_container called twice with the right destinations, in order."""
+    from docker.models.containers import ExecResult
+
+    from daiv_sandbox.sessions import SANDBOX_ROOT, SKILLS_ROOT
+
+    mock_session.container.exec_run.side_effect = [
+        ExecResult(exit_code=1, output=b""),  # not yet seeded
+        ExecResult(exit_code=0, output=b""),  # touch marker
+    ]
+
+    resp = client.post(
+        f"/session/{mock_session.session_id}/seed/",
+        files=[
+            ("repo_archive", ("repo.tar", _minimal_archive_bytes(), "application/x-tar")),
+            ("skills_archive", ("skills.tar", _minimal_archive_bytes("intro.md", b"# hi\n"), "application/x-tar")),
+        ],
+    )
+    assert resp.status_code == 204, resp.text
+    assert mock_session.copy_to_container.call_count == 2
+    dests = [call.kwargs.get("dest") for call in mock_session.copy_to_container.call_args_list]
+    assert dests == [SANDBOX_ROOT, SKILLS_ROOT]
+
+
+def test_seed_session_requires_at_least_one_archive(mock_session, client):
+    """Posting neither archive returns 422."""
+    resp = client.post(f"/session/{mock_session.session_id}/seed/")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    # Accept either FastAPI's structured 422 (when both fields are required) or our
+    # explicit detail string. The endpoint declares both as Optional, so the
+    # message comes from the endpoint, not the framework.
+    assert "at least one" in (detail if isinstance(detail, str) else str(detail)).lower()

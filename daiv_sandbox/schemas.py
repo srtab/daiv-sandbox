@@ -70,15 +70,5 @@ class ApplyMutationsResponse(BaseModel):
     results: list[MutationResult]
 
 
-class SeedSessionRequest(BaseModel):
-    """Initial state for a freshly-started session.
-
-    Future-extensible: e.g. a `skills_archive: Base64Bytes | None = None` field
-    will land here when skill seeding is implemented (spec §3.15).
-    """
-
-    repo_archive: Base64Bytes = Field(description="Tar archive that becomes the initial state of /repo.")
-
-
 class ErrorMessage(BaseModel):
     detail: str = Field(description="Error message.")

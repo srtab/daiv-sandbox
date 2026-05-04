@@ -1,12 +1,11 @@
 import asyncio
 import base64
-import io
 import logging
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import sentry_sdk
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, UploadFile, status
 from fastapi import Path as FastAPIPath
 from fastapi.security.api_key import APIKeyHeader
 from redis.asyncio import Redis
@@ -23,12 +22,11 @@ from daiv_sandbox.schemas import (
     RunRequest,
     RunResponse,
     RunResult,
-    SeedSessionRequest,
     StartSessionRequest,
     StartSessionResponse,
 )
 from daiv_sandbox.scripts import CMD_INIT_META_SCRIPT, CMD_TURN_DIFF_SCRIPT
-from daiv_sandbox.sessions import SANDBOX_ROOT, SandboxDockerSession, _validate_sandbox_path
+from daiv_sandbox.sessions import SANDBOX_ROOT, SKILLS_ROOT, SandboxDockerSession, _validate_sandbox_path
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -228,36 +226,53 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
 async def seed_session(
     http_request: Request,
     session_id: Annotated[str, FastAPIPath(title="The ID of the session to seed.")],
-    request: SeedSessionRequest,
+    repo_archive: UploadFile | None = None,
+    skills_archive: UploadFile | None = None,
     api_key: str = Depends(get_api_key),
 ) -> Response:
     """
-    Establish the initial state of /repo and initialise the patch-extractor's meta repo.
+    Establish the initial state of a freshly-started session.
+
+    Multipart fields (at least one is required):
+      * ``repo_archive``    — tar (optionally gzip-compressed) extracted into ``/repo``.
+                              When present, the patch-extractor's meta repo is initialised.
+      * ``skills_archive``  — tar (optionally gzip-compressed) extracted into ``/skills``.
 
     One-shot per session: subsequent calls return 409.
     """
+    if repo_archive is None and skills_archive is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one of repo_archive or skills_archive must be provided",
+        )
+
     async with http_request.app.state.session_lock_manager.acquire(session_id):
         cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
 
         if not cmd_executor.container:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
 
-        # Marker-file approach: Docker labels are immutable on running containers,
-        # so we record "seeded" via /workdir/.daiv-seeded inside the cmd_executor.
         check = await asyncio.to_thread(
             cmd_executor.container.exec_run, ["/bin/sh", "-c", "test -f /workdir/.daiv-seeded"], user="root"
         )
         if check.exit_code == 0:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session already seeded")
 
-        # Extract the archive into /repo. clear_before_copy=False because the
-        # workdir volume is freshly created and contains nothing to clear.
-        await asyncio.to_thread(
-            cmd_executor.copy_to_container, io.BytesIO(request.repo_archive), dest=SANDBOX_ROOT, clear_before_copy=False
-        )
+        # `UploadFile.file` is a SpooledTemporaryFile; copy_to_container streams from it.
+        if repo_archive is not None:
+            await asyncio.to_thread(
+                cmd_executor.copy_to_container, repo_archive.file, dest=SANDBOX_ROOT, clear_before_copy=False
+            )
 
-        # Initialise the patch-extractor meta repo with the seeded state.
-        if extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
+        if skills_archive is not None:
+            await asyncio.to_thread(
+                cmd_executor.copy_to_container, skills_archive.file, dest=SKILLS_ROOT, clear_before_copy=False
+            )
+
+        # Meta init only when /repo was seeded — without /repo content there is nothing to snapshot.
+        if repo_archive is not None and (
+            extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
+        ):
             patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=extract_patch_session_id)
             init_result = await asyncio.to_thread(
                 patch_extractor.execute_command, CMD_INIT_META_SCRIPT, workdir="/workdir"
