@@ -32,7 +32,7 @@ urls.source = "https://github.com/srtab/daiv-sandbox"
 dev = [
   "mypy==1.20.2",
   "prek>=0.3.11",
-  "pyopenssl==26.0.0",
+  "pyopenssl==26.1.0",
   "pyproject-fmt==2.21.1",
   "pytest-cov==7.1.0",
   "pytest-env==1.6.0",
