@@ -281,10 +281,12 @@ async def seed_session(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"skills_archive is invalid: {exc}"
                 ) from exc
 
-        # Meta init only when /repo was seeded — without /repo content there is nothing to snapshot.
-        if repo_archive is not None and (
-            extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
-        ):
+        # Meta init whenever a patch-extractor is linked (extract_patch=True at session start).
+        # Even with no repo_archive (repoless runs or skills-only seeds) the agent will mutate
+        # /repo via apply_file_mutations / bash; both endpoints run HEAD-advance and require
+        # /workdir/meta to exist. The init script's seed commit is `--allow-empty`, so an empty
+        # /workdir/new is fine.
+        if extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
             patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=extract_patch_session_id)
             init_result = await asyncio.to_thread(
                 patch_extractor.execute_command, CMD_INIT_META_SCRIPT, workdir="/workdir"
