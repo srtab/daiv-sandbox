@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- `POST /session/{id}/seed/` now initialises the patch-extractor meta repo whenever the session was started with `extract_patch=True`, even when only `skills_archive` is provided (no `repo_archive`). Without this, the first `apply_file_mutations` or `run` call in a repoless flow failed with HTTP 500 because `/workdir/meta` was missing.
+
 ## [0.5.0] - 2026-05-04
 
 ### Added

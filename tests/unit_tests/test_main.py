@@ -543,7 +543,7 @@ def test_seed_session_rejects_double_seed(mock_session, client):
 
 
 def test_seed_session_extracts_skills_archive_only(mock_session, client):
-    """skills_archive only: copy_to_container hits /skills, meta init does NOT run."""
+    """skills_archive only, no patch-extractor linked: copy_to_container hits /skills, meta init skipped."""
     from docker.models.containers import ExecResult
 
     from daiv_sandbox.sessions import SKILLS_ROOT
@@ -560,8 +560,48 @@ def test_seed_session_extracts_skills_archive_only(mock_session, client):
     assert resp.status_code == 204, resp.text
     mock_session.copy_to_container.assert_called_once()
     assert mock_session.copy_to_container.call_args.kwargs.get("dest") == SKILLS_ROOT
-    # Patch-extractor meta init must not run when there is no /repo content.
+    # No patch-extractor session label → no meta init runs.
     mock_session.execute_command.assert_not_called()
+
+
+def test_seed_session_meta_init_runs_on_skills_archive_only(client):
+    """Repoless seed (skills_archive only) still inits meta when patch-extractor is linked.
+
+    Without this, the first ``apply_file_mutations`` / ``run`` call in a repoless run
+    would 500 on HEAD-advance because ``/workdir/meta`` was never initialised.
+    """
+    from docker.models.containers import ExecResult
+
+    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
+
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_cls:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.container = Mock()
+        mock_cmd_executor.container.exec_run.side_effect = [
+            ExecResult(exit_code=1, output=b""),  # seeded check → not seeded
+            ExecResult(exit_code=0, output=b""),  # marker write
+        ]
+        mock_cmd_executor.get_label.side_effect = lambda label: (
+            "patch-extractor-id" if label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL else None
+        )
+
+        mock_patch_extractor = Mock()
+        mock_patch_extractor.execute_command.return_value = RunResult(
+            command="init", output="", exit_code=0, workdir="/workdir"
+        )
+
+        mock_cls.side_effect = [mock_cmd_executor, mock_patch_extractor]
+
+        resp = client.post(
+            "/session/test-session/seed/",
+            files={
+                "skills_archive": ("skills.tar", _minimal_archive_bytes("intro.md", b"# hi\n"), "application/x-tar")
+            },
+        )
+
+    assert resp.status_code == 204, resp.text
+    mock_cmd_executor.copy_to_container.assert_called_once()
+    mock_patch_extractor.execute_command.assert_called_once()
 
 
 def test_seed_session_extracts_both_archives(mock_session, client):
