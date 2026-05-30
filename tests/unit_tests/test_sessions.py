@@ -1,6 +1,6 @@
 import io
 import tarfile
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
 from docker.errors import ImageNotFound, NotFound
@@ -557,3 +557,49 @@ def test_start_container_creates_scratch_root(mock_docker_client):
     assert any(SCRATCH_ROOT in c.args[0] for c in mkdir_calls), "scratch root not created"
     chown_calls = [c for c in mock_container.exec_run.call_args_list if c.args and c.args[0][0] == "chown"]
     assert any(SCRATCH_ROOT in c.args[0] for c in chown_calls), "scratch root not chowned"
+
+
+def _session_with_container():
+    s = SandboxDockerSession.__new__(SandboxDockerSession)
+    s.container = Mock()
+    s.client = Mock()
+    s.session_id = "sid"
+    return s
+
+
+def _tar_of(path_in_tar: str, content: bytes) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name=path_in_tar)
+        info.size = len(content)
+        tf.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def test_read_file_bytes_extracts_single_member():
+    s = _session_with_container()
+    s.container.get_archive.return_value = (iter([_tar_of("foo.txt", b"hello\n")]), {"size": 6})
+    assert s.read_file_bytes("/scratch/foo.txt") == b"hello\n"
+
+
+def test_list_dir_parses_ls_output():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="sub/\nfile.py\n"))
+    entries = s.list_dir("/scratch")
+    assert ("/scratch/sub", True) in entries
+    assert ("/scratch/file.py", False) in entries
+
+
+def test_grep_parses_matches():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="/scratch/a.py:3:found here\n"))
+    matches = s.grep("found", "/scratch", glob=None)
+    assert matches == [("/scratch/a.py", 3, "found here")]
+
+
+def test_delete_file_runs_rm():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    s.delete_file("/scratch/x")
+    s.execute_command.assert_called_once()
+    assert "rm -f" in s.execute_command.call_args.args[0]

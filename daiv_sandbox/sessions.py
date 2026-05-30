@@ -522,20 +522,116 @@ class SandboxDockerSession(Session):
 
         return RunResult(command=command, output=output, exit_code=result.exit_code, workdir=command_workdir)
 
-    def write_file(self, path: str, content: bytes, *, mode: int) -> None:
+    def write_file(
+        self, path: str, content: bytes, *, mode: int, allowed_roots: tuple[str, ...] = (SANDBOX_ROOT,)
+    ) -> None:
         """
-        Write *content* to *path* (absolute, under SANDBOX_ROOT) inside the container.
+        Write *content* to *path* (absolute, under one of *allowed_roots*) inside the container.
 
         The path is validated lexically. The content is shipped via a single-file tar
         through the existing copy_to_container pipeline (sanitised, mode preserved).
         """
-        canonical = _validate_sandbox_path(path, allowed_roots=(SANDBOX_ROOT,))
+        canonical = _validate_sandbox_path(path, allowed_roots=allowed_roots)
         parent_dir, _, filename = canonical.rpartition("/")
         if not parent_dir or not filename:
             raise ValueError(f"path resolves to an unusable location: {path!r}")
 
         with _build_single_file_tar_stream(filename, content, mode=mode) as tar_stream:
             self.copy_to_container(tar_stream, dest=parent_dir, clear_before_copy=False)
+
+    def read_file_bytes(self, path: str) -> bytes:
+        """Return the raw bytes of a single file via the Docker archive API."""
+        bits, stat = self.container.get_archive(path)
+        if stat["size"] == 0:
+            raise FileNotFoundError(path)
+        raw = b"".join(bits)
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tf:
+            members = [m for m in tf.getmembers() if m.isfile()]
+            if not members:
+                raise FileNotFoundError(path)
+            extracted = tf.extractfile(members[0])
+            if extracted is None:
+                raise FileNotFoundError(path)
+            return extracted.read()
+
+    def list_dir(self, path: str) -> list[tuple[str, bool]]:
+        """List one directory level. Uses `ls -1Ap` (portable; dirs get a trailing '/')."""
+        result = self.execute_command(f"ls -1Ap -- {_sh_quote(path)} 2>/dev/null || true")
+        entries: list[tuple[str, bool]] = []
+        base = path.rstrip("/")
+        for line in result.output.splitlines():
+            name = line.rstrip("\n")
+            if not name:
+                continue
+            is_dir = name.endswith("/")
+            clean = name[:-1] if is_dir else name
+            entries.append((f"{base}/{clean}", is_dir))
+        return entries
+
+    def grep(self, pattern: str, path: str, glob: str | None) -> list[tuple[str, int, str]]:
+        """Literal recursive search via `grep -rHnF`. Returns (path, line, text)."""
+        include = f"--include={_sh_quote(glob)} " if glob else ""
+        cmd = f"grep -rHnF {include}-e {_sh_quote(pattern)} -- {_sh_quote(path)} 2>/dev/null || true"
+        result = self.execute_command(cmd)
+        matches: list[tuple[str, int, str]] = []
+        for line in result.output.splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[1].isdigit():
+                matches.append((parts[0], int(parts[1]), parts[2]))
+        return matches
+
+    def find_paths(self, path: str) -> list[tuple[str, bool]]:
+        """Recursively enumerate entries under `path` via POSIX `find` (for glob matching).
+
+        Uses a busybox-safe type-marker scheme (GNU `find -printf` is unavailable on
+        images like alpine): directories are suffixed with ``/D`` and files with ``/F``.
+        """
+        cmd = (
+            f"{{ find {_sh_quote(path)} -mindepth 1 -type d 2>/dev/null | sed 's/$/\\/D/'; "
+            f"find {_sh_quote(path)} -mindepth 1 ! -type d 2>/dev/null | sed 's/$/\\/F/'; }} || true"
+        )
+        result = self.execute_command(cmd)
+        out: list[tuple[str, bool]] = []
+        for line in result.output.splitlines():
+            if line.endswith("/D"):
+                out.append((line[:-2], True))
+            elif line.endswith("/F"):
+                out.append((line[:-2], False))
+        return out
+
+    def edit_file(self, path: str, old: str, new: str, replace_all: bool, *, allowed_roots: tuple[str, ...]) -> int:
+        """Read, replace, and write back a text file. CRLF-aware. Returns occurrence count.
+
+        Raises FileNotFoundError, UnicodeDecodeError, or ValueError("string_not_found" /
+        "multiple_occurrences") for the endpoint to map to error codes.
+        """
+        raw = self.read_file_bytes(path)
+        text = raw.decode("utf-8")  # UnicodeDecodeError → not a text file
+        # Match-driven CRLF handling: try the literal old, then a CRLF-normalized form, then LF.
+        old_crlf = old.replace("\r\n", "\n").replace("\n", "\r\n")
+        old_lf = old.replace("\r\n", "\n")
+        new_crlf = new.replace("\r\n", "\n").replace("\n", "\r\n")
+        new_lf = new.replace("\r\n", "\n")
+        count = 0
+        matched_old, matched_new = old, new
+        for cand_old, cand_new in ((old, new), (old_crlf, new_crlf), (old_lf, new_lf)):
+            c = text.count(cand_old)
+            if c >= 1:
+                matched_old, matched_new, count = cand_old, cand_new, c
+                break
+        if count == 0:
+            raise ValueError("string_not_found")
+        if count > 1 and not replace_all:
+            raise ValueError("multiple_occurrences")
+        result = text.replace(matched_old, matched_new) if replace_all else text.replace(matched_old, matched_new, 1)
+        self.write_file(path, result.encode("utf-8"), mode=0o644, allowed_roots=allowed_roots)
+        return count
+
+    def delete_file(self, path: str) -> None:
+        """Remove a file. Idempotent (`rm -f`)."""
+        result = self.execute_command(f"rm -f -- {_sh_quote(path)}")
+        if result.exit_code != 0:
+            raise RuntimeError(f"rm failed: {result.output}")
 
     def _get_user(self) -> str:
         """
