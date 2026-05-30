@@ -744,3 +744,41 @@ def test_seed_session_marker_write_failure_returns_500(mock_session, client):
     )
     assert resp.status_code == 500
     assert "seeded" in resp.json()["detail"].lower()
+
+
+def test_fs_write_then_read_roundtrip(mock_session, client):
+    mock_session.write_file.return_value = None
+    mock_session.read_file_bytes.return_value = b"hello\n"
+    sid = mock_session.session_id
+
+    w = client.post(
+        f"/session/{sid}/fs/write",
+        json={"path": "/scratch/a.txt", "content": base64.b64encode(b"hello\n").decode(), "mode": 0o644},
+    )
+    assert w.status_code == 200, w.text
+    assert w.json() == {"ok": True, "error": None}
+
+    r = client.post(f"/session/{sid}/fs/read", json={"path": "/scratch/a.txt", "offset": 0, "limit": 2000})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["encoding"] == "utf-8"
+    assert "hello" in body["content"]
+
+
+def test_fs_write_rejects_path_outside_scratch(mock_session, client):
+    sid = mock_session.session_id
+    resp = client.post(
+        f"/session/{sid}/fs/write",
+        json={"path": "/repo/evil.py", "content": base64.b64encode(b"x").decode(), "mode": 0o644},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is False
+    assert "under" in resp.json()["error"]
+    mock_session.write_file.assert_not_called()
+
+
+def test_fs_ls_returns_entries(mock_session, client):
+    mock_session.list_dir.return_value = [("/scratch/sub", True), ("/scratch/f.py", False)]
+    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/scratch"})
+    assert resp.status_code == 200, resp.text
+    assert {"path": "/scratch/sub", "is_dir": True} in resp.json()["entries"]

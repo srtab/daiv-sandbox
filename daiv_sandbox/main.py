@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Annotated, Literal
 
@@ -18,6 +19,22 @@ from daiv_sandbox.schemas import (
     ApplyMutationsRequest,
     ApplyMutationsResponse,
     ErrorMessage,
+    FsDeleteRequest,
+    FsDeleteResponse,
+    FsEditRequest,
+    FsEditResponse,
+    FsEntry,
+    FsGlobRequest,
+    FsGlobResponse,
+    FsGrepMatch,
+    FsGrepRequest,
+    FsGrepResponse,
+    FsLsRequest,
+    FsLsResponse,
+    FsReadRequest,
+    FsReadResponse,
+    FsWriteRequest,
+    FsWriteResponse,
     MutationResult,
     RunRequest,
     RunResponse,
@@ -26,7 +43,7 @@ from daiv_sandbox.schemas import (
     StartSessionResponse,
 )
 from daiv_sandbox.scripts import CMD_INIT_META_SCRIPT, CMD_TURN_DIFF_SCRIPT
-from daiv_sandbox.sessions import SANDBOX_ROOT, SKILLS_ROOT, SandboxDockerSession, _validate_sandbox_path
+from daiv_sandbox.sessions import SANDBOX_ROOT, SCRATCH_ROOT, SKILLS_ROOT, SandboxDockerSession, _validate_sandbox_path
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -490,6 +507,189 @@ async def version() -> dict[Literal["version"], str]:
     Get the version of the application.
     """
     return {"version": __version__}
+
+
+# --- /scratch file-op endpoints --------------------------------------------
+#
+# These read/write a per-run scratchpad confined to SCRATCH_ROOT. They are
+# Python-free (content via the Docker archive API, search/listing via POSIX
+# grep/find/ls/rm) and NEVER touch the patch-extractor, so scratch is
+# structurally invisible to commits.
+
+_SCRATCH_ROOTS = (SCRATCH_ROOT,)
+
+
+def _validate_scratch_dir(path: str) -> None:
+    """Allow the scratch root itself or any path under it (ls/grep/glob accept the root)."""
+    norm = path.rstrip("/") or "/"
+    if norm != SCRATCH_ROOT and not norm.startswith(f"{SCRATCH_ROOT}/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"path must be under {SCRATCH_ROOT!r}")
+
+
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Translate a glob (supporting **, *, ?, [..]) to a compiled regex anchored to a relative path."""
+    i, n, out = 0, len(pattern), []
+    while i < n:
+        c = pattern[i]
+        if pattern[i : i + 3] == "**/":
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern[i : i + 2] == "**":
+            out.append(".*")
+            i += 2
+        elif c == "*":
+            out.append("[^/]*")
+            i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "[":
+            j = i + 1
+            if j < n and pattern[j] in "!^":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            cls = pattern[i + 1 : j].replace("!", "^", 1) if pattern[i + 1 : i + 2] in "!^" else pattern[i + 1 : j]
+            out.append(f"[{cls}]")
+            i = j + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+@asynccontextmanager
+async def _scratch_executor(http_request: Request, session_id: str) -> AsyncIterator[SandboxDockerSession]:
+    """Acquire the session lock and yield a live cmd_executor, or 404."""
+    async with http_request.app.state.session_lock_manager.acquire(session_id):
+        cmd = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
+        if not cmd.container:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
+        yield cmd
+
+
+@app.post("/session/{session_id}/fs/write", responses=common_responses, name="Write a scratch file")
+async def fs_write(
+    http_request: Request, session_id: str, request: FsWriteRequest, api_key: str = Depends(get_api_key)
+) -> FsWriteResponse:
+    try:
+        _validate_sandbox_path(request.path, allowed_roots=_SCRATCH_ROOTS)
+    except ValueError as exc:
+        return FsWriteResponse(ok=False, error=str(exc))
+    async with _scratch_executor(http_request, session_id) as cmd:
+        try:
+            await asyncio.to_thread(
+                cmd.write_file, request.path, request.content, mode=request.mode, allowed_roots=_SCRATCH_ROOTS
+            )
+        except Exception as exc:
+            logger.exception("fs_write failed for %s", request.path)
+            return FsWriteResponse(ok=False, error=str(exc))
+        return FsWriteResponse(ok=True)
+
+
+@app.post("/session/{session_id}/fs/read", responses=common_responses, name="Read a scratch file")
+async def fs_read(
+    http_request: Request, session_id: str, request: FsReadRequest, api_key: str = Depends(get_api_key)
+) -> FsReadResponse:
+    try:
+        _validate_sandbox_path(request.path, allowed_roots=_SCRATCH_ROOTS)
+    except ValueError as exc:
+        return FsReadResponse(error=str(exc))
+    async with _scratch_executor(http_request, session_id) as cmd:
+        try:
+            raw = await asyncio.to_thread(cmd.read_file_bytes, request.path)
+        except FileNotFoundError:
+            return FsReadResponse(error="file_not_found")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return FsReadResponse(content=base64.b64encode(raw).decode("ascii"), encoding="base64")
+        if not text:
+            return FsReadResponse(content="System reminder: File exists but has empty contents", encoding="utf-8")
+        lines = text.splitlines()
+        page = lines[request.offset : request.offset + request.limit]
+        if request.offset and not page:
+            return FsReadResponse(error=f"Line offset {request.offset} exceeds file length ({len(lines)} lines)")
+        return FsReadResponse(content="\n".join(page), encoding="utf-8")
+
+
+@app.post("/session/{session_id}/fs/ls", responses=common_responses, name="List a scratch directory")
+async def fs_ls(
+    http_request: Request, session_id: str, request: FsLsRequest, api_key: str = Depends(get_api_key)
+) -> FsLsResponse:
+    _validate_scratch_dir(request.path)
+    async with _scratch_executor(http_request, session_id) as cmd:
+        entries = await asyncio.to_thread(cmd.list_dir, request.path)
+        return FsLsResponse(entries=[FsEntry(path=p, is_dir=d) for p, d in entries])
+
+
+@app.post("/session/{session_id}/fs/grep", responses=common_responses, name="Grep scratch files")
+async def fs_grep(
+    http_request: Request, session_id: str, request: FsGrepRequest, api_key: str = Depends(get_api_key)
+) -> FsGrepResponse:
+    _validate_scratch_dir(request.path)
+    async with _scratch_executor(http_request, session_id) as cmd:
+        matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob)
+        return FsGrepResponse(matches=[FsGrepMatch(path=p, line=n, text=t) for p, n, t in matches])
+
+
+@app.post("/session/{session_id}/fs/glob", responses=common_responses, name="Glob scratch files")
+async def fs_glob(
+    http_request: Request, session_id: str, request: FsGlobRequest, api_key: str = Depends(get_api_key)
+) -> FsGlobResponse:
+    _validate_scratch_dir(request.path)
+    async with _scratch_executor(http_request, session_id) as cmd:
+        all_entries = await asyncio.to_thread(cmd.find_paths, request.path)
+        base = request.path.rstrip("/")
+        # Translate the glob (relative to base) and match the absolute entries under base.
+        regex = _glob_to_regex(request.pattern)
+        matched = [
+            FsEntry(path=p, is_dir=d)
+            for (p, d) in all_entries
+            if p.startswith(f"{base}/") and regex.match(p[len(base) + 1 :])
+        ]
+        return FsGlobResponse(matches=matched)
+
+
+@app.post("/session/{session_id}/fs/edit", responses=common_responses, name="Edit a scratch file")
+async def fs_edit(
+    http_request: Request, session_id: str, request: FsEditRequest, api_key: str = Depends(get_api_key)
+) -> FsEditResponse:
+    try:
+        _validate_sandbox_path(request.path, allowed_roots=_SCRATCH_ROOTS)
+    except ValueError as exc:
+        return FsEditResponse(error=str(exc))
+    async with _scratch_executor(http_request, session_id) as cmd:
+        try:
+            count = await asyncio.to_thread(
+                cmd.edit_file, request.path, request.old, request.new, request.replace_all, allowed_roots=_SCRATCH_ROOTS
+            )
+        except FileNotFoundError:
+            return FsEditResponse(error="file_not_found")
+        except UnicodeDecodeError:
+            return FsEditResponse(error="not_a_text_file")
+        except ValueError as exc:
+            return FsEditResponse(error=str(exc))
+        return FsEditResponse(occurrences=count)
+
+
+@app.post("/session/{session_id}/fs/delete", responses=common_responses, name="Delete a scratch file")
+async def fs_delete(
+    http_request: Request, session_id: str, request: FsDeleteRequest, api_key: str = Depends(get_api_key)
+) -> FsDeleteResponse:
+    try:
+        _validate_sandbox_path(request.path, allowed_roots=_SCRATCH_ROOTS)
+    except ValueError as exc:
+        return FsDeleteResponse(ok=False, error=str(exc))
+    async with _scratch_executor(http_request, session_id) as cmd:
+        try:
+            await asyncio.to_thread(cmd.delete_file, request.path)
+        except Exception as exc:
+            logger.exception("fs_delete failed for %s", request.path)
+            return FsDeleteResponse(ok=False, error=str(exc))
+        return FsDeleteResponse(ok=True)
 
 
 if __name__ == "__main__":
