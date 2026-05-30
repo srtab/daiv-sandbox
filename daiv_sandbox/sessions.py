@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import io
 import logging
 import tarfile
@@ -7,7 +8,7 @@ import tempfile
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path, PurePosixPath
-from typing import IO, TYPE_CHECKING, BinaryIO
+from typing import IO, TYPE_CHECKING, BinaryIO, NamedTuple
 
 from docker import DockerClient, from_env
 from docker.errors import ImageNotFound, NotFound
@@ -27,6 +28,22 @@ WORKDIR_ROOT = "/workdir"
 SANDBOX_HOME = "/home/daiv-sandbox"
 SKILLS_ROOT = "/skills"
 SCRATCH_ROOT = "/scratch"
+
+
+class DirEntry(NamedTuple):
+    """A single filesystem entry returned by ``list_dir``/``find_paths``."""
+
+    path: str
+    is_dir: bool
+
+
+class GrepHit(NamedTuple):
+    """A single ``grep`` match: absolute path, 1-indexed line number, and the matching line text."""
+
+    path: str
+    line: int
+    text: str
+
 
 # Portable pipefail wrapper: uses bash when available (dash lacks pipefail support),
 # otherwise falls back to ash/sh which accept `-o pipefail` as a CLI flag.
@@ -540,10 +557,17 @@ class SandboxDockerSession(Session):
             self.copy_to_container(tar_stream, dest=parent_dir, clear_before_copy=False)
 
     def read_file_bytes(self, path: str) -> bytes:
-        """Return the raw bytes of a single file via the Docker archive API."""
-        bits, stat = self.container.get_archive(path)
-        if stat["size"] == 0:
-            raise FileNotFoundError(path)
+        """Return the raw bytes of a single file via the Docker archive API.
+
+        Raises FileNotFoundError when the path does not exist. A genuinely empty file
+        returns ``b""`` (it is not treated as missing).
+        """
+        try:
+            bits, _stat = self.container.get_archive(path)
+        except NotFound as exc:
+            # get_archive raises docker.errors.NotFound for a missing path (it is NOT a
+            # FileNotFoundError); translate so endpoints' FileNotFoundError handling works.
+            raise FileNotFoundError(path) from exc
         raw = b"".join(bits)
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tf:
             members = [m for m in tf.getmembers() if m.isfile()]
@@ -554,10 +578,16 @@ class SandboxDockerSession(Session):
                 raise FileNotFoundError(path)
             return extracted.read()
 
-    def list_dir(self, path: str) -> list[tuple[str, bool]]:
-        """List one directory level. Uses `ls -1Ap` (portable; dirs get a trailing '/')."""
-        result = self.execute_command(f"ls -1Ap -- {_sh_quote(path)} 2>/dev/null || true")
-        entries: list[tuple[str, bool]] = []
+    def list_dir(self, path: str) -> list[DirEntry]:
+        """List one directory level. Uses `ls -1Ap` (portable; dirs get a trailing '/').
+
+        Raises RuntimeError if the listing fails (e.g. missing path / permission denied),
+        so callers can distinguish a real error from a genuinely empty directory.
+        """
+        result = self.execute_command(f"ls -1Ap -- {_sh_quote(path)} 2>/dev/null")
+        if result.exit_code != 0:
+            raise RuntimeError(f"ls failed (exit {result.exit_code}) for {path!r}")
+        entries: list[DirEntry] = []
         base = path.rstrip("/")
         for line in result.output.splitlines():
             name = line.rstrip("\n")
@@ -565,38 +595,50 @@ class SandboxDockerSession(Session):
                 continue
             is_dir = name.endswith("/")
             clean = name[:-1] if is_dir else name
-            entries.append((f"{base}/{clean}", is_dir))
+            entries.append(DirEntry(f"{base}/{clean}", is_dir))
         return entries
 
-    def grep(self, pattern: str, path: str, glob: str | None) -> list[tuple[str, int, str]]:
-        """Literal recursive search via `grep -rHnF`. Returns (path, line, text)."""
-        include = f"--include={_sh_quote(glob)} " if glob else ""
-        cmd = f"grep -rHnF {include}-e {_sh_quote(pattern)} -- {_sh_quote(path)} 2>/dev/null || true"
+    def grep(self, pattern: str, path: str, glob: str | None) -> list[GrepHit]:
+        """Literal recursive search via `grep -rHnF`. Returns GrepHit(path, line, text).
+
+        `glob`, when given, restricts results to files whose basename matches it. The
+        filtering is applied host-side (busybox `grep` on minimal images like alpine has
+        no `--include`). grep exit code 1 means "no matches" (returns []); exit >= 2 is a
+        real error and raises RuntimeError.
+        """
+        cmd = f"grep -rHnF -e {_sh_quote(pattern)} -- {_sh_quote(path)} 2>/dev/null"
         result = self.execute_command(cmd)
-        matches: list[tuple[str, int, str]] = []
+        if result.exit_code >= 2:
+            raise RuntimeError(f"grep failed (exit {result.exit_code}) for {path!r}")
+        matches: list[GrepHit] = []
         for line in result.output.splitlines():
             parts = line.split(":", 2)
             if len(parts) == 3 and parts[1].isdigit():
-                matches.append((parts[0], int(parts[1]), parts[2]))
+                file_path, line_no, text = parts[0], int(parts[1]), parts[2]
+                if glob is None or fnmatch.fnmatchcase(PurePosixPath(file_path).name, glob):
+                    matches.append(GrepHit(file_path, line_no, text))
         return matches
 
-    def find_paths(self, path: str) -> list[tuple[str, bool]]:
+    def find_paths(self, path: str) -> list[DirEntry]:
         """Recursively enumerate entries under `path` via POSIX `find` (for glob matching).
 
         Uses a busybox-safe type-marker scheme (GNU `find -printf` is unavailable on
         images like alpine): directories are suffixed with ``/D`` and files with ``/F``.
+        Raises RuntimeError if the traversal fails (e.g. missing path).
         """
         cmd = (
             f"{{ find {_sh_quote(path)} -mindepth 1 -type d 2>/dev/null | sed 's/$/\\/D/'; "
-            f"find {_sh_quote(path)} -mindepth 1 ! -type d 2>/dev/null | sed 's/$/\\/F/'; }} || true"
+            f"find {_sh_quote(path)} -mindepth 1 ! -type d 2>/dev/null | sed 's/$/\\/F/'; }}"
         )
         result = self.execute_command(cmd)
-        out: list[tuple[str, bool]] = []
+        if result.exit_code != 0:
+            raise RuntimeError(f"find failed (exit {result.exit_code}) for {path!r}")
+        out: list[DirEntry] = []
         for line in result.output.splitlines():
             if line.endswith("/D"):
-                out.append((line[:-2], True))
+                out.append(DirEntry(line[:-2], True))
             elif line.endswith("/F"):
-                out.append((line[:-2], False))
+                out.append(DirEntry(line[:-2], False))
         return out
 
     def edit_file(self, path: str, old: str, new: str, replace_all: bool, *, allowed_roots: tuple[str, ...]) -> int:

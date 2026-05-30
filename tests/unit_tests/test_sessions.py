@@ -603,3 +603,107 @@ def test_delete_file_runs_rm():
     s.delete_file("/scratch/x")
     s.execute_command.assert_called_once()
     assert "rm -f" in s.execute_command.call_args.args[0]
+
+
+def test_read_file_bytes_missing_path_raises_file_not_found():
+    """docker get_archive raises NotFound for a missing path; surface it as FileNotFoundError."""
+    s = _session_with_container()
+    s.container.get_archive.side_effect = NotFound("no such path")
+    with pytest.raises(FileNotFoundError):
+        s.read_file_bytes("/scratch/missing.txt")
+
+
+def test_read_file_bytes_empty_file_returns_empty_bytes():
+    """A genuinely empty file must return b'' (not be reported as missing)."""
+    s = _session_with_container()
+    s.container.get_archive.return_value = (iter([_tar_of("empty.txt", b"")]), {"size": 0})
+    assert s.read_file_bytes("/scratch/empty.txt") == b""
+
+
+def test_grep_filters_by_basename_glob():
+    """grep with a glob filters results host-side by basename (busybox grep has no --include)."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="/scratch/a.py:1:hit\n/scratch/sub/b.txt:2:hit\n"))
+    matches = s.grep("hit", "/scratch", glob="*.py")
+    assert matches == [("/scratch/a.py", 1, "hit")]
+    # --include must NOT be used (busybox lacks it).
+    assert "--include" not in s.execute_command.call_args.args[0]
+
+
+def test_grep_raises_on_real_error_exit():
+    """grep exit code >= 2 is a real error (not 'no matches'), so surface it."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="grep: bad things"))
+    with pytest.raises(RuntimeError):
+        s.grep("x", "/scratch", glob=None)
+
+
+def test_grep_no_matches_exit_1_is_ok():
+    """grep exit code 1 means 'no matches' and must return an empty list, not raise."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=1, output=""))
+    assert s.grep("x", "/scratch", glob=None) == []
+
+
+def test_list_dir_raises_on_error_exit():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="ls: cannot access"))
+    with pytest.raises(RuntimeError):
+        s.list_dir("/scratch/missing")
+
+
+def test_find_paths_parses_type_markers():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="/scratch/sub/D\n/scratch/f.py/F\n"))
+    entries = s.find_paths("/scratch")
+    assert ("/scratch/sub", True) in entries
+    assert ("/scratch/f.py", False) in entries
+
+
+def test_find_paths_raises_on_error_exit():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=1, output="find: not found"))
+    with pytest.raises(RuntimeError):
+        s.find_paths("/scratch/missing")
+
+
+def _edit_session(initial: bytes):
+    s = _session_with_container()
+    s.read_file_bytes = Mock(return_value=initial)
+    s.write_file = Mock()
+    return s
+
+
+def test_edit_file_single_replacement():
+    s = _edit_session(b"hello world\n")
+    assert s.edit_file("/scratch/a.txt", "world", "there", replace_all=False, allowed_roots=("/scratch",)) == 1
+    written = s.write_file.call_args.args[1]
+    assert written == b"hello there\n"
+
+
+def test_edit_file_string_not_found():
+    s = _edit_session(b"hello\n")
+    with pytest.raises(ValueError, match="string_not_found"):
+        s.edit_file("/scratch/a.txt", "absent", "x", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_multiple_occurrences_without_replace_all():
+    s = _edit_session(b"x x x\n")
+    with pytest.raises(ValueError, match="multiple_occurrences"):
+        s.edit_file("/scratch/a.txt", "x", "y", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_replace_all_counts_all():
+    s = _edit_session(b"x x x\n")
+    assert s.edit_file("/scratch/a.txt", "x", "y", replace_all=True, allowed_roots=("/scratch",)) == 3
+    assert s.write_file.call_args.args[1] == b"y y y\n"
+
+
+def test_edit_file_matches_lf_old_against_crlf_file():
+    """An LF-supplied `old` should match a CRLF file and write back CRLF-preserving content."""
+    s = _edit_session(b"a\r\nb\r\n")
+    count = s.edit_file("/scratch/a.txt", "a\nb", "a\nB", replace_all=False, allowed_roots=("/scratch",))
+    assert count == 1
+    assert s.write_file.call_args.args[1] == b"a\r\nB\r\n"
