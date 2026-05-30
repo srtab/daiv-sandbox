@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Reserved a `/scratch` root at session start (`mkdir -p` + `chown`) for a per-run scratchpad that bash also sees and that is never included in extracted patches (it lives outside the `/repo` volume the patch-extractor diffs).
+- `POST /session/{id}/fs/{op}` — Python-free file operations confined to `/scratch`: `ls`, `read`, `grep`, `glob`, `write`, `edit`, and `delete`. Content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work on images without a Python interpreter (e.g. `alpine`). None of these endpoints touch the patch-extractor, so `/scratch` is structurally invisible to commits.
+- `scripts/dump_schemas.py` now also exports the new `Fs*` request/response schemas for downstream `daiv` consumers.
+
 ### Fixed
 
 - `POST /session/{id}/seed/` now initialises the patch-extractor meta repo whenever the session was started with `extract_patch=True`, even when only `skills_archive` is provided (no `repo_archive`). Without this, the first `apply_file_mutations` or `run` call in a repoless flow failed with HTTP 500 because `/workdir/meta` was missing.
