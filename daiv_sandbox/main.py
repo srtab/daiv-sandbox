@@ -3,7 +3,6 @@ import base64
 import logging
 import re
 from contextlib import asynccontextmanager
-from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import sentry_sdk
@@ -523,23 +522,24 @@ _SCRATCH_ROOTS = (SCRATCH_ROOT,)
 def _validate_scratch_dir(path: str) -> None:
     """Validate a directory/file path for ls/grep/glob: the scratch root itself or anything under it.
 
-    Unlike ``_validate_sandbox_path`` (which forbids the bare root), these ops accept the root.
-    Critically, this still rejects ``..`` traversal, NUL, and newlines — otherwise the kernel would
-    resolve ``/scratch/../repo`` and the search would escape SCRATCH_ROOT.
+    Thin HTTP wrapper over ``_validate_sandbox_path(..., allow_root=True)``: unlike the file ops
+    (which forbid the bare root), ls/grep/glob legitimately target ``/scratch`` itself. The shared
+    validator still rejects ``..`` traversal, NUL, and newlines — otherwise the kernel would resolve
+    ``/scratch/../repo`` and the search would escape SCRATCH_ROOT.
     """
-    detail = f"path must be an absolute path under {SCRATCH_ROOT!r} without '..' segments"
-    if "\x00" in path or "\n" in path or "\r" in path:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-    p = PurePosixPath(path)
-    if not p.is_absolute() or ".." in p.parts:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-    norm = str(p)
-    if norm != SCRATCH_ROOT and not norm.startswith(f"{SCRATCH_ROOT}/"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    try:
+        _validate_sandbox_path(path, allowed_roots=_SCRATCH_ROOTS, allow_root=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
-    """Translate a glob (supporting **, *, ?, [..]) to a compiled regex anchored to a relative path."""
+    """Translate a glob (supporting **, *, ?, [..]) to a compiled regex anchored to a relative path.
+
+    This engine is path-aware (``*`` does not cross ``/``, ``**`` does). It is intentionally NOT the
+    same as the optional ``glob`` filter on ``fs_grep``, which uses ``fnmatch`` for a basename-only
+    match — the two have deliberately different semantics, so don't try to merge them.
+    """
     i, n, out = 0, len(pattern), []
     while i < n:
         c = pattern[i]
@@ -557,14 +557,15 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
             i += 1
         elif c == "[":
             j = i + 1
-            if j < n and pattern[j] in "!^":
+            negate = j < n and pattern[j] in "!^"
+            if negate:
                 j += 1
-            if j < n and pattern[j] == "]":
+            if j < n and pattern[j] == "]":  # a leading ']' is a literal class member, not the closer
                 j += 1
             while j < n and pattern[j] != "]":
                 j += 1
-            cls = pattern[i + 1 : j].replace("!", "^", 1) if pattern[i + 1 : i + 2] in "!^" else pattern[i + 1 : j]
-            out.append(f"[{cls}]")
+            body = pattern[i + 1 + (1 if negate else 0) : j]
+            out.append(f"[{'^' if negate else ''}{body}]")
             i = j + 1
         else:
             out.append(re.escape(c))
@@ -637,7 +638,7 @@ async def fs_ls(
             entries = await asyncio.to_thread(cmd.list_dir, request.path)
         except Exception as exc:
             logger.exception("fs_ls failed for %s", request.path)
-            return FsLsResponse(entries=[], error=str(exc))
+            return FsLsResponse(error=str(exc))
         return FsLsResponse(entries=[FsEntry(path=p, is_dir=d) for p, d in entries])
 
 
@@ -651,7 +652,7 @@ async def fs_grep(
             matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob)
         except Exception as exc:
             logger.exception("fs_grep failed for %s", request.path)
-            return FsGrepResponse(matches=[], error=str(exc))
+            return FsGrepResponse(error=str(exc))
         return FsGrepResponse(matches=[FsGrepMatch(path=p, line=n, text=t) for p, n, t in matches])
 
 
@@ -670,7 +671,7 @@ async def fs_glob(
             all_entries = await asyncio.to_thread(cmd.find_paths, request.path)
         except Exception as exc:
             logger.exception("fs_glob failed for %s", request.path)
-            return FsGlobResponse(matches=[], error=str(exc))
+            return FsGlobResponse(error=str(exc))
         base = request.path.rstrip("/")
         # Match the base-relative portion of each absolute entry under base.
         matched = [

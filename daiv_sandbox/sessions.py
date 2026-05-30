@@ -62,11 +62,14 @@ def _sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-def _validate_sandbox_path(path: str, allowed_roots: tuple[str, ...]) -> str:
+def _validate_sandbox_path(path: str, allowed_roots: tuple[str, ...], *, allow_root: bool = False) -> str:
     """
     Lexically validate that *path* is a safe absolute path under one of *allowed_roots*.
 
     Returns the canonicalised absolute path. Raises ValueError on any rejection.
+
+    By default the bare root itself is rejected (callers want a file/dir *inside* a root). Pass
+    ``allow_root=True`` for directory ops (ls/grep/glob) that legitimately target the root itself.
     """
     if "\x00" in path or "\n" in path or "\r" in path:
         raise ValueError(f"path must not contain NUL or newline characters: {path!r}")
@@ -79,6 +82,8 @@ def _validate_sandbox_path(path: str, allowed_roots: tuple[str, ...]) -> str:
     for root in allowed_roots:
         root_norm = root.rstrip("/") or "/"
         if canonical == root_norm:
+            if allow_root:
+                return canonical
             raise ValueError(f"path must not equal a reserved root: {path!r}")
         if canonical.startswith(f"{root_norm}/"):
             return canonical
