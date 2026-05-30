@@ -12,6 +12,7 @@ from daiv_sandbox.sessions import (
     PIPEFAIL_WRAPPER,
     SANDBOX_HOME,
     SANDBOX_ROOT,
+    SCRATCH_ROOT,
     SKILLS_ROOT,
     WORKDIR_ROOT,
     SandboxDockerSession,
@@ -102,7 +103,7 @@ def test__start_container(mock_docker_client):
     assert session.session_id == mock_docker_client.containers.run.return_value.id
     # Should create sandbox directories and chown them
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
+        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
     )
     mock_container.exec_run.assert_any_call(
         [
@@ -113,6 +114,7 @@ def test__start_container(mock_docker_client):
             WORKDIR_ROOT,
             SANDBOX_HOME,
             SKILLS_ROOT,
+            SCRATCH_ROOT,
         ],
         user="root",
     )
@@ -482,7 +484,7 @@ def test_start_container_creates_skills_root(mock_docker_client):
 
     # mkdir -p was called including SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
+        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
     )
     # chown was called for SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
@@ -494,6 +496,7 @@ def test_start_container_creates_skills_root(mock_docker_client):
             WORKDIR_ROOT,
             SANDBOX_HOME,
             SKILLS_ROOT,
+            SCRATCH_ROOT,
         ],
         user="root",
     )
@@ -541,3 +544,16 @@ def test_sanitize_archive_stream_raises_on_traversal_member():
     out_buf = io.BytesIO()
     with pytest.raises(ValueError, match="traversal"):
         _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+
+
+def test_start_container_creates_scratch_root(mock_docker_client):
+    """The container bootstrap must mkdir + chown /scratch alongside the other roots."""
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session._start_container("img:latest")
+
+    mkdir_calls = [c for c in mock_container.exec_run.call_args_list if c.args and c.args[0][0] == "mkdir"]
+    assert any(SCRATCH_ROOT in c.args[0] for c in mkdir_calls), "scratch root not created"
+    chown_calls = [c for c in mock_container.exec_run.call_args_list if c.args and c.args[0][0] == "chown"]
+    assert any(SCRATCH_ROOT in c.args[0] for c in chown_calls), "scratch root not chowned"

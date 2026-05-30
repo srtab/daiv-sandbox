@@ -26,6 +26,7 @@ SANDBOX_ROOT = "/repo"
 WORKDIR_ROOT = "/workdir"
 SANDBOX_HOME = "/home/daiv-sandbox"
 SKILLS_ROOT = "/skills"
+SCRATCH_ROOT = "/scratch"
 
 # Portable pipefail wrapper: uses bash when available (dash lacks pipefail support),
 # otherwise falls back to ash/sh which accept `-o pipefail` as a CLI flag.
@@ -346,7 +347,7 @@ class SandboxDockerSession(Session):
 
         # Ensure the sandbox directories exist and are writable by the sandbox user.
         mkdir_result = container.exec_run(
-            ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
+            ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
         )
         if mkdir_result.exit_code != 0:
             raise RuntimeError(
@@ -355,7 +356,8 @@ class SandboxDockerSession(Session):
             )
 
         chown_result = container.exec_run(
-            ["chown", self._get_user(), "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
+            ["chown", self._get_user(), "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
+            user="root",
         )
         if chown_result.exit_code != 0:
             raise RuntimeError(
@@ -423,13 +425,15 @@ class SandboxDockerSession(Session):
             raise ValueError("Refusing to extract an archive into the container root directory")
 
         if not (
-            to_dir_norm in (SANDBOX_ROOT, WORKDIR_ROOT, SKILLS_ROOT)
+            to_dir_norm in (SANDBOX_ROOT, WORKDIR_ROOT, SKILLS_ROOT, SCRATCH_ROOT)
             or to_dir_norm.startswith(f"{SANDBOX_ROOT}/")
             or to_dir_norm.startswith(f"{WORKDIR_ROOT}/")
             or to_dir_norm.startswith(f"{SKILLS_ROOT}/")
+            or to_dir_norm.startswith(f"{SCRATCH_ROOT}/")
         ):
             raise ValueError(
-                f"Refusing to extract an archive outside of {SANDBOX_ROOT!r}, {WORKDIR_ROOT!r}, or {SKILLS_ROOT!r}"
+                f"Refusing to extract an archive outside of {SANDBOX_ROOT!r}, {WORKDIR_ROOT!r}, "
+                f"{SKILLS_ROOT!r}, or {SCRATCH_ROOT!r}"
             )
 
         if clear_before_copy:
