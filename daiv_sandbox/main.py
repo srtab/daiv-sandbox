@@ -3,6 +3,7 @@ import base64
 import logging
 import re
 from contextlib import asynccontextmanager
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import sentry_sdk
@@ -520,10 +521,21 @@ _SCRATCH_ROOTS = (SCRATCH_ROOT,)
 
 
 def _validate_scratch_dir(path: str) -> None:
-    """Allow the scratch root itself or any path under it (ls/grep/glob accept the root)."""
-    norm = path.rstrip("/") or "/"
+    """Validate a directory/file path for ls/grep/glob: the scratch root itself or anything under it.
+
+    Unlike ``_validate_sandbox_path`` (which forbids the bare root), these ops accept the root.
+    Critically, this still rejects ``..`` traversal, NUL, and newlines — otherwise the kernel would
+    resolve ``/scratch/../repo`` and the search would escape SCRATCH_ROOT.
+    """
+    detail = f"path must be an absolute path under {SCRATCH_ROOT!r} without '..' segments"
+    if "\x00" in path or "\n" in path or "\r" in path:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    p = PurePosixPath(path)
+    if not p.is_absolute() or ".." in p.parts:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    norm = str(p)
     if norm != SCRATCH_ROOT and not norm.startswith(f"{SCRATCH_ROOT}/"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"path must be under {SCRATCH_ROOT!r}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
 
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
@@ -621,7 +633,11 @@ async def fs_ls(
 ) -> FsLsResponse:
     _validate_scratch_dir(request.path)
     async with _scratch_executor(http_request, session_id) as cmd:
-        entries = await asyncio.to_thread(cmd.list_dir, request.path)
+        try:
+            entries = await asyncio.to_thread(cmd.list_dir, request.path)
+        except Exception as exc:
+            logger.exception("fs_ls failed for %s", request.path)
+            return FsLsResponse(entries=[], error=str(exc))
         return FsLsResponse(entries=[FsEntry(path=p, is_dir=d) for p, d in entries])
 
 
@@ -631,7 +647,11 @@ async def fs_grep(
 ) -> FsGrepResponse:
     _validate_scratch_dir(request.path)
     async with _scratch_executor(http_request, session_id) as cmd:
-        matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob)
+        try:
+            matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob)
+        except Exception as exc:
+            logger.exception("fs_grep failed for %s", request.path)
+            return FsGrepResponse(matches=[], error=str(exc))
         return FsGrepResponse(matches=[FsGrepMatch(path=p, line=n, text=t) for p, n, t in matches])
 
 
@@ -640,11 +660,19 @@ async def fs_glob(
     http_request: Request, session_id: str, request: FsGlobRequest, api_key: str = Depends(get_api_key)
 ) -> FsGlobResponse:
     _validate_scratch_dir(request.path)
-    async with _scratch_executor(http_request, session_id) as cmd:
-        all_entries = await asyncio.to_thread(cmd.find_paths, request.path)
-        base = request.path.rstrip("/")
-        # Translate the glob (relative to base) and match the absolute entries under base.
+    # Translate the glob up front so a malformed pattern is a clean 400, not a 500.
+    try:
         regex = _glob_to_regex(request.pattern)
+    except re.error as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"invalid glob pattern: {exc}") from exc
+    async with _scratch_executor(http_request, session_id) as cmd:
+        try:
+            all_entries = await asyncio.to_thread(cmd.find_paths, request.path)
+        except Exception as exc:
+            logger.exception("fs_glob failed for %s", request.path)
+            return FsGlobResponse(matches=[], error=str(exc))
+        base = request.path.rstrip("/")
+        # Match the base-relative portion of each absolute entry under base.
         matched = [
             FsEntry(path=p, is_dir=d)
             for (p, d) in all_entries

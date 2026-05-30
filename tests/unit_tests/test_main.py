@@ -782,3 +782,138 @@ def test_fs_ls_returns_entries(mock_session, client):
     resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/scratch"})
     assert resp.status_code == 200, resp.text
     assert {"path": "/scratch/sub", "is_dir": True} in resp.json()["entries"]
+
+
+@pytest.mark.parametrize("op", ["ls", "grep", "glob"])
+def test_fs_dir_endpoints_reject_traversal(mock_session, client, op):
+    """ls/grep/glob must reject `..` traversal (defeats /scratch confinement otherwise)."""
+    payload = {"path": "/scratch/../repo"}
+    if op in ("grep", "glob"):
+        payload["pattern"] = "x"
+    resp = client.post(f"/session/{mock_session.session_id}/fs/{op}", json=payload)
+    assert resp.status_code == 400, resp.text
+
+
+def test_fs_ls_surfaces_command_error(mock_session, client):
+    mock_session.list_dir.side_effect = RuntimeError("ls failed (exit 2) for '/scratch/x'")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/scratch/x"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["entries"] == []
+    assert body["error"] is not None
+
+
+def test_fs_grep_surfaces_command_error(mock_session, client):
+    mock_session.grep.side_effect = RuntimeError("grep failed (exit 2)")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/grep", json={"path": "/scratch", "pattern": "x"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["matches"] == []
+    assert body["error"] is not None
+
+
+def test_fs_glob_invalid_pattern_returns_400(mock_session, client):
+    resp = client.post(f"/session/{mock_session.session_id}/fs/glob", json={"path": "/scratch", "pattern": "["})
+    assert resp.status_code == 400, resp.text
+
+
+def test_fs_glob_filters_by_pattern(mock_session, client):
+    from daiv_sandbox.sessions import DirEntry
+
+    mock_session.find_paths.return_value = [
+        DirEntry("/scratch/a.py", False),
+        DirEntry("/scratch/b.txt", False),
+        DirEntry("/scratch/sub", True),
+    ]
+    resp = client.post(f"/session/{mock_session.session_id}/fs/glob", json={"path": "/scratch", "pattern": "*.py"})
+    assert resp.status_code == 200, resp.text
+    assert [e["path"] for e in resp.json()["matches"]] == ["/scratch/a.py"]
+
+
+def test_fs_glob_surfaces_find_error(mock_session, client):
+    mock_session.find_paths.side_effect = RuntimeError("find failed")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/glob", json={"path": "/scratch/x", "pattern": "*"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"] is not None
+
+
+def test_fs_read_missing_file(mock_session, client):
+    mock_session.read_file_bytes.side_effect = FileNotFoundError("/scratch/x")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/scratch/x"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"] == "file_not_found"
+
+
+def test_fs_read_empty_file(mock_session, client):
+    mock_session.read_file_bytes.return_value = b""
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/scratch/e.txt"})
+    body = resp.json()
+    assert body["encoding"] == "utf-8"
+    assert "empty" in body["content"].lower()
+
+
+def test_fs_read_binary_falls_back_to_base64(mock_session, client):
+    mock_session.read_file_bytes.return_value = b"\xff\xfe\x00"
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/scratch/b.bin"})
+    body = resp.json()
+    assert body["encoding"] == "base64"
+    assert base64.b64decode(body["content"]) == b"\xff\xfe\x00"
+
+
+def test_fs_read_offset_beyond_eof(mock_session, client):
+    mock_session.read_file_bytes.return_value = b"one\ntwo\n"
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/read", json={"path": "/scratch/a.txt", "offset": 50, "limit": 10}
+    )
+    assert "offset" in resp.json()["error"].lower()
+
+
+def test_fs_edit_multiple_occurrences(mock_session, client):
+    mock_session.edit_file.side_effect = ValueError("multiple_occurrences")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/edit",
+        json={"path": "/scratch/a.txt", "old": "x", "new": "y", "replace_all": False},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"] == "multiple_occurrences"
+
+
+def test_fs_edit_not_a_text_file(mock_session, client):
+    mock_session.edit_file.side_effect = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/edit", json={"path": "/scratch/a.txt", "old": "x", "new": "y"}
+    )
+    assert resp.json()["error"] == "not_a_text_file"
+
+
+def test_fs_edit_success_returns_count(mock_session, client):
+    mock_session.edit_file.return_value = 2
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/edit",
+        json={"path": "/scratch/a.txt", "old": "x", "new": "y", "replace_all": True},
+    )
+    assert resp.json()["occurrences"] == 2
+
+
+def test_fs_endpoints_404_when_container_missing(mock_session, client):
+    mock_session.container = None
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/scratch/a.txt"})
+    assert resp.status_code == 404, resp.text
+
+
+def test_glob_to_regex_table():
+    from daiv_sandbox.main import _glob_to_regex
+
+    cases = [
+        ("*.py", "a.py", True),
+        ("*.py", "a.txt", False),
+        ("*.py", "sub/a.py", False),  # * does not cross '/'
+        ("**/*.py", "x/y/a.py", True),
+        ("**/*.py", "a.py", True),
+        ("a?c", "abc", True),
+        ("a?c", "ac", False),
+        ("[!x]file", "yfile", True),
+        ("[!x]file", "xfile", False),
+    ]
+    for pat, s, expected in cases:
+        assert bool(_glob_to_regex(pat).match(s)) is expected, (pat, s)

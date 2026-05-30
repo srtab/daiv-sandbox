@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import Base64Bytes, BaseModel, Field
 
 
@@ -87,7 +89,8 @@ class FsEntry(BaseModel):
 
 
 class FsLsResponse(BaseModel):
-    entries: list[FsEntry]
+    entries: list[FsEntry] = Field(default_factory=list, description="Directory entries (empty on error).")
+    error: str | None = Field(default=None, description="Error message when the listing failed.")
 
 
 class FsReadRequest(BaseModel):
@@ -97,8 +100,16 @@ class FsReadRequest(BaseModel):
 
 
 class FsReadResponse(BaseModel):
-    content: str | None = Field(default=None, description="File content (utf-8 text or base64 binary).")
-    encoding: str | None = Field(default=None, description='"utf-8" or "base64".')
+    content: str | None = Field(
+        default=None,
+        description=(
+            "File content (utf-8 text or base64 binary). For an empty file this is a human-readable "
+            "sentinel string (with encoding 'utf-8'), not the file's bytes."
+        ),
+    )
+    encoding: Literal["utf-8", "base64"] | None = Field(
+        default=None, description="Encoding of `content`: 'utf-8' for text, 'base64' for binary."
+    )
     error: str | None = Field(default=None, description="Error message when the read failed.")
 
 
@@ -109,13 +120,14 @@ class FsGrepRequest(BaseModel):
 
 
 class FsGrepMatch(BaseModel):
-    path: str
-    line: int
-    text: str
+    path: str = Field(description="Absolute path of the matching file.")
+    line: int = Field(description="1-indexed line number of the match.")
+    text: str = Field(description="Text of the matching line.")
 
 
 class FsGrepResponse(BaseModel):
-    matches: list[FsGrepMatch]
+    matches: list[FsGrepMatch] = Field(default_factory=list, description="Matches found (empty on error).")
+    error: str | None = Field(default=None, description="Error message when the search failed.")
 
 
 class FsGlobRequest(BaseModel):
@@ -124,7 +136,8 @@ class FsGlobRequest(BaseModel):
 
 
 class FsGlobResponse(BaseModel):
-    matches: list[FsEntry]
+    matches: list[FsEntry] = Field(default_factory=list, description="Matching entries (empty on error).")
+    error: str | None = Field(default=None, description="Error message when the glob failed.")
 
 
 class FsWriteRequest(BaseModel):
