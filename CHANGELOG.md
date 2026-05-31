@@ -9,9 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Reserved a `/scratch` root at session start (`mkdir -p` + `chown`) for a per-run scratchpad that bash also sees and that is never included in extracted patches (it lives outside the `/repo` volume the patch-extractor diffs).
-- `POST /session/{id}/fs/{op}` — Python-free file operations confined to `/scratch`: `ls`, `read`, `grep`, `glob`, `write`, `edit`, and `delete`. Content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work on images without a Python interpreter (e.g. `alpine`). None of these endpoints touch the patch-extractor, so `/scratch` is structurally invisible to commits.
+- Reserved a `/workspace/tmp` scratchpad root at session start (`mkdir -p` + `chown`) that bash also sees and that is never included in extracted patches (it lives outside the `/workspace/repo` volume the patch-extractor diffs).
+- `POST /session/{id}/fs/{op}` — Python-free file operations across the session workspace (`/workspace`): `ls`, `read`, `grep`, `glob`, `write`, `edit`, and `delete`. Content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work on images without a Python interpreter (e.g. `alpine`). The endpoints never invoke the patch-extractor directly; edits under `repo/` land on the diffed volume and surface in the next patch, while `skills/` and `tmp/` stay container-local.
 - `scripts/dump_schemas.py` now also exports the new `Fs*` request/response schemas for downstream `daiv` consumers.
+
+### Changed
+
+- Session container layout unified under `/workspace/{repo,skills,tmp}` (was `/repo`, `/skills`, `/scratch`); `fs/*` endpoints now operate across the whole `/workspace`. **Breaking:** requires the matching daiv release.
 
 ### Fixed
 
