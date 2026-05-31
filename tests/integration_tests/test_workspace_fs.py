@@ -8,10 +8,9 @@ from .utils import make_tar_gz
 @pytest.fixture
 def workspace_session(client, sandbox_session):
     # alpine has sh/grep/find/ls but NOT python3 — proves the ops are Python-free.
-    sid = sandbox_session(base_image="alpine:latest", extract_patch=True)
-    # extract_patch sessions need their meta repo initialised before the run endpoint
-    # computes per-turn diffs; seeding a minimal repo does that. /workspace/tmp is created at
-    # container bootstrap and lives outside the repo volume, so it stays diff-invisible.
+    sid = sandbox_session(base_image="alpine:latest")
+    # Seed a minimal repo so /workspace/repo has content to read/edit; /workspace/{repo,skills,tmp}
+    # all exist from container bootstrap regardless.
     seed = client.post(
         f"/session/{sid}/seed/",
         files={"repo_archive": ("repo.tar.gz", make_tar_gz({"README.md": b"# workspace test\n"}), "application/gzip")},
@@ -45,17 +44,6 @@ def test_bash_write_then_agent_read_and_grep(client, workspace_session):
 
     g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None})
     assert any(m["text"].strip() == "NEEDLE here" for m in g.json()["matches"]), g.text
-
-
-def test_tmp_changes_never_appear_in_patch(client, workspace_session):
-    sid = workspace_session
-    client.post(
-        f"/session/{sid}/fs/write",
-        json={"path": "/workspace/tmp/ephemeral.txt", "content": base64.b64encode(b"junk\n").decode(), "mode": 0o644},
-    )
-    run = client.post(f"/session/{sid}/", json={"commands": ["echo more >> /workspace/tmp/ephemeral.txt"]})
-    # /workspace/tmp is not on the repo volume the patch-extractor diffs → patch stays empty.
-    assert run.json()["patch"] is None, run.text
 
 
 def test_grep_with_glob_filters_on_busybox(client, workspace_session):
@@ -144,9 +132,17 @@ def test_fs_ops_span_repo_skills_tmp(client, workspace_session):
         )
         assert w.status_code == 200 and w.json()["ok"] is True, (path, w.text)
 
-    # read one back
-    r = client.post(f"/session/{sid}/fs/read", json={"path": "/workspace/repo/app.py", "offset": 0, "limit": 2000})
-    assert r.status_code == 200 and "print('hi')" in r.json()["content"], r.text
+    # Read each back by its own path: the three writes must land in distinct subtrees with their own
+    # content (guards against a mis-rooted write or one subdir clobbering another now that repo/skills/
+    # tmp are sibling dirs on one filesystem rather than separate volumes).
+    for path, needle in [
+        ("/workspace/repo/app.py", "print('hi')"),
+        ("/workspace/skills/s.md", "# skill"),
+        ("/workspace/tmp/scratch.txt", "NEEDLE"),
+    ]:
+        r = client.post(f"/session/{sid}/fs/read", json={"path": path, "offset": 0, "limit": 2000})
+        assert r.status_code == 200, (path, r.text)
+        assert needle in r.json()["content"], (path, r.json())
 
     # grep across the whole workspace finds the tmp match
     g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace", "glob": None})
@@ -157,43 +153,3 @@ def test_traversal_above_workspace_is_rejected(client, workspace_session):
     sid = workspace_session
     resp = client.post(f"/session/{sid}/fs/ls", json={"path": "/workspace/../etc"})
     assert resp.status_code == 400, resp.text
-
-
-def test_repo_edits_patch_but_tmp_does_not(client, workspace_session):
-    sid = workspace_session
-    run = client.post(
-        f"/session/{sid}/",
-        json={"commands": ["echo changed >> /workspace/repo/README.md", "echo junk > /workspace/tmp/junk.txt"]},
-    )
-    assert run.status_code == 200, run.text
-    patch = run.json()["patch"]
-    assert patch is not None, "repo change must produce a patch"
-    decoded = base64.b64decode(patch).decode()
-    assert "README.md" in decoded
-    assert "junk.txt" not in decoded  # tmp is not on the diffed volume
-
-
-def test_skills_edits_do_not_appear_in_patch(client, workspace_session):
-    sid = workspace_session
-    # skills/ lives under /workspace but off the repo volume the patch-extractor diffs, so it should
-    # behave like tmp/: never surface in a patch. Seed a skills file via the fs endpoint first.
-    w = client.post(
-        f"/session/{sid}/fs/write",
-        json={
-            "path": "/workspace/skills/helper.md",
-            "content": base64.b64encode(b"# helper\n").decode(),
-            "mode": 0o644,
-        },
-    )
-    assert w.status_code == 200 and w.json()["ok"] is True, w.text
-    # A repo edit in the same turn forces a patch; the skills edit must not appear in it.
-    run = client.post(
-        f"/session/{sid}/",
-        json={"commands": ["echo changed >> /workspace/repo/README.md", "echo more >> /workspace/skills/helper.md"]},
-    )
-    assert run.status_code == 200, run.text
-    patch = run.json()["patch"]
-    assert patch is not None, "repo change must produce a patch"
-    decoded = base64.b64decode(patch).decode()
-    assert "README.md" in decoded
-    assert "helper.md" not in decoded  # skills/ is not on the diffed repo volume

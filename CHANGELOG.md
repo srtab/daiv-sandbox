@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Reserved a `/workspace/tmp` scratchpad root at session start (`mkdir -p` + `chown`) that bash also sees and that is never included in extracted patches (it lives outside the `/workspace/repo` volume the patch-extractor diffs).
-- `POST /session/{id}/fs/{op}` — Python-free file operations across the session workspace (`/workspace`): `ls`, `read`, `grep`, `glob`, `write`, `edit`, and `delete`. Content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work on images without a Python interpreter (e.g. `alpine`). The endpoints never invoke the patch-extractor directly; edits under `repo/` land on the diffed volume and surface in the next patch, while `skills/` and `tmp/` stay container-local.
+- Reserved a `/workspace/tmp` scratchpad root at session start (`mkdir -p` + `chown`) that bash also sees and that stays container-local (it lives outside `/workspace/repo`).
+- `POST /session/{id}/fs/{op}` — Python-free file operations across the session workspace (`/workspace`): `ls`, `read`, `grep`, `glob`, `write`, `edit`, and `delete`. Content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work on images without a Python interpreter (e.g. `alpine`). Edits under `repo/` land directly on the container workspace, while `skills/` and `tmp/` stay container-local.
 - `scripts/dump_schemas.py` now also exports the new `Fs*` request/response schemas for downstream `daiv` consumers.
 
 ### Changed
@@ -20,11 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- `POST /session/{id}/files/` (`apply_file_mutations`) and its `PutMutation` / `ApplyMutationsRequest` / `MutationResult` / `ApplyMutationsResponse` schemas. The endpoint existed to keep a client-side file mirror in sync with the sandbox; the sandbox is now the single source of truth, so write files through the `fs/*` endpoints (or bash) instead — edits under `/workspace/repo` surface in the next run's patch. **Breaking:** requires the matching daiv release.
-
-### Fixed
-
-- `POST /session/{id}/seed/` now initialises the patch-extractor meta repo whenever the session was started with `extract_patch=True`, even when only `skills_archive` is provided (no `repo_archive`). Without this, the first `run` call in a repoless flow failed with HTTP 500 because `/workdir/meta` was missing.
+- The patch-extractor: the `alpine/git` sidecar container, the shared `/workspace/repo` Docker volume, and the meta-repo turn-diff machinery. With the sandbox as the single source of truth and the seeded repo being a real git repository, callers recover changes by running git inside `/workspace/repo` (`git diff` / `git status`) instead of consuming a server-computed patch. This drops the `extract_patch` field from `StartSessionRequest`, the `patch` field from the run response, and the `DAIV_SANDBOX_GIT_IMAGE` setting. **Breaking:** requires the matching daiv release.
+- `POST /session/{id}/files/` (`apply_file_mutations`) and its `PutMutation` / `ApplyMutationsRequest` / `MutationResult` / `ApplyMutationsResponse` schemas. The endpoint existed to keep a client-side file mirror in sync with the sandbox; the sandbox is now the single source of truth, so write files through the `fs/*` endpoints (or bash) instead — edits under `/workspace/repo` mutate the container workspace in place. **Breaking:** requires the matching daiv release.
 
 ## [0.5.0] - 2026-05-04
 

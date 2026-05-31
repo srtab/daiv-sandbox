@@ -55,26 +55,24 @@ flowchart LR
     Client -->|DELETE /session/{id}/| FastAPI
     FastAPI --> SandboxDockerSession
     SandboxDockerSession -->|create / exec / copy archive| Container
-    SandboxDockerSession -->|turn diff| PatchExtractor
-    FastAPI -->|results + patch| Client
+    FastAPI -->|results| Client
 ```
 
-The application is session-based. A session owns a long-lived `cmd_executor` container and, when
-`extract_patch=True`, a `patch_extractor` sidecar that shares the `/workspace/repo` volume:
+The application is session-based. A session owns a single long-lived `cmd_executor` container:
 
 - **`POST /session/`** — start a session from a `base_image`; returns a `session_id`.
 - **`POST /session/{id}/seed/`** — one-shot: extract `repo_archive` into `/workspace/repo` and/or
-  `skills_archive` into `/workspace/skills`, and initialise the patch-extractor meta repo.
+  `skills_archive` into `/workspace/skills`.
 - **`POST /session/{id}/fs/{op}`** — Python-free file operations (`ls`, `read`, `grep`, `glob`,
   `write`, `edit`, `delete`) anywhere under `/workspace`.
 - **`POST /session/{id}/`** — run commands sequentially in `/workspace/repo`; returns each command's
-  output plus a base64 patch of that turn's changes (`HEAD~1..HEAD` against the meta repo).
-- **`DELETE /session/{id}/`** — tear down the container(s) and the shared volume.
+  output. The container workspace is mutated in place; recover changes by running git (`git diff`,
+  `git status`) inside `/workspace/repo` through the same endpoint.
+- **`DELETE /session/{id}/`** — tear down the container.
 
 The container filesystem is unified under `/workspace` (`repo/`, `skills/`, `tmp/`). The sandbox is the
-single source of truth: edits under `/workspace/repo` (via bash or `fs/*`) land on the volume the
-patch-extractor diffs and surface in the next run's patch, while `skills/` and `tmp/` stay
-container-local.
+single source of truth: edits under `/workspace/repo` (via bash or `fs/*`) land directly on the
+container's workspace, while `skills/` and `tmp/` stay container-local.
 
 `SandboxDockerSession` (in `sessions.py`) pulls the image, creates the container as a non-root user,
 copies sanitised archives in (`copy_to_container`), executes commands (`execute_command`), and exposes

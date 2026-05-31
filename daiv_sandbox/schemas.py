@@ -5,9 +5,6 @@ from pydantic import Base64Bytes, BaseModel, Field
 
 class StartSessionRequest(BaseModel):
     base_image: str = Field(description="Docker image to be used as the base image for the sandbox.")
-    extract_patch: bool = Field(
-        default=False, description="Whether to extract a patch with the changes made by the executed commands."
-    )
     network_enabled: bool = Field(default=False, description="Whether to enable network for the sandbox.")
     environment: dict[str, str] | None = Field(
         default=None, description="Environment variables to set in the container at startup."
@@ -49,7 +46,6 @@ class RunResult(BaseModel):
 
 class RunResponse(BaseModel):
     results: list[RunResult] = Field(description="List of results of each command.")
-    patch: str | None = Field(description="Base64-encoded patch with the changes.")
 
 
 class ErrorMessage(BaseModel):

@@ -19,8 +19,6 @@ def mock_session():
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session:
         mock_session = mock_session(session_id=str(uuid.uuid4()))
         mock_session._get_container.return_value = Mock(status="running")
-        # By default, no patch extraction (no label set)
-        mock_session.get_label.return_value = None
         yield mock_session
 
 
@@ -96,7 +94,6 @@ def test_run_commands_success(mock_session, client):  # noqa: N803
     assert response.status_code == 200, response.text
     response_data = response.json()
     assert "results" in response_data
-    assert "patch" in response_data
     assert response_data["results"][0]["output"] == "success"
     assert response_data["results"][0]["exit_code"] == 0
 
@@ -122,7 +119,6 @@ def test_run_commands_failure(mock_session, client):  # noqa: N803
     assert response.status_code == 200, response.text
     response_data = response.json()
     assert "results" in response_data
-    assert "patch" in response_data
     assert response_data["results"][0]["output"] == "error"
     assert response_data["results"][0]["exit_code"] == 1
 
@@ -148,7 +144,6 @@ def test_run_commands_with_workdir(mock_session, client):  # noqa: N803
     assert response.status_code == 200, response.text
     response_data = response.json()
     assert "results" in response_data
-    assert "patch" in response_data
     assert response_data["results"][0]["output"] == "success"
     assert response_data["results"][0]["exit_code"] == 0
 
@@ -294,133 +289,39 @@ def test_version(client):
     assert response.json() == {"version": __version__}
 
 
-def test_start_session_with_extract_patch_creates_volume(client):
-    """Test that starting a session with extract_patch=true creates a volume and mounts it correctly."""
+def test_start_session_starts_single_container(client):
+    """A session start creates exactly one cmd-executor container — no sidecar, no volume."""
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
-        mock_patch_extractor = Mock()
-        mock_patch_extractor.session_id = "patch-extractor-id"
-
         mock_cmd_executor = Mock()
         mock_cmd_executor.session_id = "cmd-executor-id"
-        mock_session_class.start.side_effect = [mock_patch_extractor, mock_cmd_executor]
+        mock_session_class.start.return_value = mock_cmd_executor
 
-        # Make the request
-        response = client.post("/session/", json={"base_image": "python:3.11", "extract_patch": True})
+        response = client.post("/session/", json={"base_image": "python:3.11"})
 
         assert response.status_code == 200
         assert response.json() == {"session_id": "cmd-executor-id"}
 
-        # Verify volume was created
-        mock_session_class.create_named_volume.assert_called_once()
-        call_kwargs = mock_session_class.create_named_volume.call_args[1]
-        assert "daiv-sandbox-workdir-" in call_kwargs["name"]
-        assert call_kwargs["labels"] == {"daiv.sandbox.managed": "1"}
-
-        # Verify both containers were started with correct volume mounts
-        assert mock_session_class.start.call_count == 2
-
-        # First call should be patch extractor with ro mount
-        patch_call = mock_session_class.start.call_args_list[0]
-        assert "volumes" in patch_call[1]
-        volume_name = list(patch_call[1]["volumes"].keys())[0]
-        assert patch_call[1]["volumes"][volume_name] == {"bind": "/workdir/new", "mode": "ro"}
-
-        # Second call should be cmd executor with rw mount
-        cmd_call = mock_session_class.start.call_args_list[1]
-        assert "volumes" in cmd_call[1]
-        volume_name = list(cmd_call[1]["volumes"].keys())[0]
-        assert cmd_call[1]["volumes"][volume_name] == {"bind": "/workspace/repo", "mode": "rw"}
+        # Exactly one container started, with no volume mount and no sidecar.
+        mock_session_class.start.assert_called_once()
+        assert "volumes" not in mock_session_class.start.call_args.kwargs
+        # No shared volume is created (the sidecar/volume path is gone).
+        mock_session_class.create_named_volume.assert_not_called()
 
 
-def test_close_session_removes_volume(client):
-    """Test that closing a session removes the associated volume."""
-    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL, DAIV_SANDBOX_WORKDIR_VOLUME_LABEL
-
+def test_close_session_removes_container(client):
+    """Closing a session removes the cmd-executor container (no sidecar / volume teardown)."""
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
-        # Mock the cmd executor
         mock_cmd_executor = Mock()
         mock_cmd_executor.session_id = "cmd-executor-id"
         mock_cmd_executor.container = Mock()
-
-        # Mock the patch extractor
-        mock_patch_extractor = Mock()
-        mock_patch_extractor.session_id = "patch-extractor-id"
-
-        # Mock the volume
-        mock_volume = Mock()
-        mock_docker_client = Mock()
-        mock_docker_client.volumes.get.return_value = mock_volume
-
-        mock_cmd_executor.client = mock_docker_client
-
-        # Setup get_label to return volume name and patch extractor ID
-        def get_label_side_effect(label):
-            if label == DAIV_SANDBOX_WORKDIR_VOLUME_LABEL:
-                return "test-volume-name"
-            elif label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL:
-                return "patch-extractor-id"
-            return None
-
-        mock_cmd_executor.get_label.side_effect = get_label_side_effect
-
-        # Setup the mock to return instances
-        mock_session_class.side_effect = [mock_cmd_executor, mock_patch_extractor]
-
-        # Make the request
-        response = client.delete("/session/cmd-executor-id/")
-
-        assert response.status_code == 204
-
-        # Verify volume was retrieved and removed
-        mock_docker_client.volumes.get.assert_called_once_with("test-volume-name")
-        mock_volume.remove.assert_called_once_with(force=False)
-
-        # Verify both containers were removed
-        mock_patch_extractor.remove_container.assert_called_once()
-        mock_cmd_executor.remove_container.assert_called_once()
-
-
-def test_close_session_handles_missing_volume(client):
-    """Test that closing a session handles missing volumes gracefully."""
-    from docker.errors import NotFound
-
-    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL, DAIV_SANDBOX_WORKDIR_VOLUME_LABEL
-
-    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
-        # Mock the cmd executor
-        mock_cmd_executor = Mock()
-        mock_cmd_executor.session_id = "cmd-executor-id"
-        mock_cmd_executor.container = Mock()
-
-        # Mock the docker client
-        mock_docker_client = Mock()
-        mock_docker_client.volumes.get.side_effect = NotFound("Volume not found")
-
-        mock_cmd_executor.client = mock_docker_client
-
-        # Setup get_label to return volume name but no patch extractor
-        def get_label_side_effect(label):
-            if label == DAIV_SANDBOX_WORKDIR_VOLUME_LABEL:
-                return "test-volume-name"
-            elif label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL:
-                return None
-            return None
-
-        mock_cmd_executor.get_label.side_effect = get_label_side_effect
-
-        # Setup the mock to return instance
         mock_session_class.return_value = mock_cmd_executor
 
-        # Make the request - should succeed even though volume is not found
         response = client.delete("/session/cmd-executor-id/")
 
         assert response.status_code == 204
-
-        # Verify we tried to get the volume
-        mock_docker_client.volumes.get.assert_called_once_with("test-volume-name")
-
-        # Verify container was still removed
         mock_cmd_executor.remove_container.assert_called_once()
+        # No volume lookup/removal happens anymore.
+        mock_cmd_executor.client.volumes.get.assert_not_called()
 
 
 def test_close_session_returns_conflict_when_session_is_locked(mock_session, client, monkeypatch):
@@ -490,7 +391,7 @@ def test_seed_session_rejects_double_seed(mock_session, client):
 
 
 def test_seed_session_extracts_skills_archive_only(mock_session, client):
-    """skills_archive only, no patch-extractor linked: copy_to_container hits /skills, meta init skipped."""
+    """skills_archive only: copy_to_container hits /skills; seed runs no in-container commands."""
     from docker.models.containers import ExecResult
 
     from daiv_sandbox.sessions import SKILLS_ROOT
@@ -507,48 +408,8 @@ def test_seed_session_extracts_skills_archive_only(mock_session, client):
     assert resp.status_code == 204, resp.text
     mock_session.copy_to_container.assert_called_once()
     assert mock_session.copy_to_container.call_args.kwargs.get("dest") == SKILLS_ROOT
-    # No patch-extractor session label → no meta init runs.
+    # Seeding only copies archives + writes the marker (via exec_run); never execute_command.
     mock_session.execute_command.assert_not_called()
-
-
-def test_seed_session_meta_init_runs_on_skills_archive_only(client):
-    """Repoless seed (skills_archive only) still inits meta when patch-extractor is linked.
-
-    Without this, the first ``run`` call in a repoless run would 500 on HEAD-advance
-    because ``/workdir/meta`` was never initialised.
-    """
-    from docker.models.containers import ExecResult
-
-    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
-
-    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_cls:
-        mock_cmd_executor = Mock()
-        mock_cmd_executor.container = Mock()
-        mock_cmd_executor.container.exec_run.side_effect = [
-            ExecResult(exit_code=1, output=b""),  # seeded check → not seeded
-            ExecResult(exit_code=0, output=b""),  # marker write
-        ]
-        mock_cmd_executor.get_label.side_effect = lambda label: (
-            "patch-extractor-id" if label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL else None
-        )
-
-        mock_patch_extractor = Mock()
-        mock_patch_extractor.execute_command.return_value = RunResult(
-            command="init", output="", exit_code=0, workdir="/workdir"
-        )
-
-        mock_cls.side_effect = [mock_cmd_executor, mock_patch_extractor]
-
-        resp = client.post(
-            "/session/test-session/seed/",
-            files={
-                "skills_archive": ("skills.tar", _minimal_archive_bytes("intro.md", b"# hi\n"), "application/x-tar")
-            },
-        )
-
-    assert resp.status_code == 204, resp.text
-    mock_cmd_executor.copy_to_container.assert_called_once()
-    mock_patch_extractor.execute_command.assert_called_once()
 
 
 def test_seed_session_extracts_both_archives(mock_session, client):
@@ -610,70 +471,6 @@ def test_seed_session_invalid_skills_archive_returns_422(mock_session, client):
     )
     assert resp.status_code == 422
     assert "skills_archive" in resp.json()["detail"].lower()
-
-
-def test_seed_session_meta_init_runs_on_repo_archive(client):
-    """When a patch extractor is linked, CMD_INIT_META_SCRIPT is executed after /workspace/repo is copied."""
-    from docker.models.containers import ExecResult
-
-    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
-
-    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_cls:
-        mock_cmd_executor = Mock()
-        mock_cmd_executor.container = Mock()
-        mock_cmd_executor.container.exec_run.side_effect = [
-            ExecResult(exit_code=1, output=b""),  # seeded check → not seeded
-            ExecResult(exit_code=0, output=b""),  # marker write
-        ]
-        mock_cmd_executor.get_label.side_effect = lambda label: (
-            "patch-extractor-id" if label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL else None
-        )
-
-        mock_patch_extractor = Mock()
-        mock_patch_extractor.execute_command.return_value = RunResult(
-            command="init", output="", exit_code=0, workdir="/workdir"
-        )
-
-        mock_cls.side_effect = [mock_cmd_executor, mock_patch_extractor]
-
-        resp = client.post(
-            "/session/test-session/seed/",
-            files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
-        )
-
-    assert resp.status_code == 204, resp.text
-    mock_cmd_executor.copy_to_container.assert_called_once()
-    mock_patch_extractor.execute_command.assert_called_once()
-
-
-def test_seed_session_meta_init_failure_returns_500(client):
-    """If CMD_INIT_META_SCRIPT exits non-zero, seed returns 500."""
-    from docker.models.containers import ExecResult
-
-    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
-
-    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_cls:
-        mock_cmd_executor = Mock()
-        mock_cmd_executor.container = Mock()
-        mock_cmd_executor.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
-        mock_cmd_executor.get_label.side_effect = lambda label: (
-            "patch-extractor-id" if label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL else None
-        )
-
-        mock_patch_extractor = Mock()
-        mock_patch_extractor.execute_command.return_value = RunResult(
-            command="init", output="fatal: not a git repo", exit_code=128, workdir="/workdir"
-        )
-
-        mock_cls.side_effect = [mock_cmd_executor, mock_patch_extractor]
-
-        resp = client.post(
-            "/session/test-session/seed/",
-            files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
-        )
-
-    assert resp.status_code == 500
-    assert "patch-extractor" in resp.json()["detail"].lower()
 
 
 def test_seed_session_marker_write_failure_returns_500(mock_session, client):

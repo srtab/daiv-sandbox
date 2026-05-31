@@ -17,7 +17,6 @@ from daiv_sandbox.schemas import RunResult
 
 if TYPE_CHECKING:
     from docker.models.containers import Container
-    from docker.models.volumes import Volume
 
 logger = logging.getLogger("daiv_sandbox")
 
@@ -268,24 +267,6 @@ class SandboxDockerSession:
         instance._start_container(image, **kwargs)
         return instance
 
-    @classmethod
-    def create_named_volume(
-        cls, name: str, labels: dict[str, str] | None = None, client: DockerClient | None = None
-    ) -> Volume:
-        """
-        Create a named volume with the given name and labels.
-
-        Args:
-            name (str): The name of the volume to create.
-            labels (dict[str, str] | None): The labels to add to the volume.
-            client (DockerClient | None): Docker client, if not provided, the shared client will be reused.
-
-        Returns:
-            Volume: The created volume.
-        """
-        instance = cls(client=client)
-        return instance.client.volumes.create(name=name, labels=labels or {})
-
     def _ping(self) -> bool:
         """
         Ping the Docker client.
@@ -333,36 +314,31 @@ class SandboxDockerSession:
 
         logger.info("Container '%s' started (status: %s)", container.short_id, container.status)
 
-        # Ensure the sandbox directories exist and are writable by the sandbox user.
-        mkdir_result = container.exec_run(
-            ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
-            user="root",
-        )
-        if mkdir_result.exit_code != 0:
-            raise RuntimeError(
-                f"Failed to create sandbox directories in {container.short_id}: "
-                f"(exit_code: {mkdir_result.exit_code}) -> {mkdir_result.output}"
-            )
+        # Bootstrap the directory layout. The container runs `sleep 3600`, so it stays alive on
+        # failure and `remove=True` won't reap it — force-remove on any bootstrap error so a failed
+        # start() leaves nothing behind (no leaked container holding its runtime/cpu/memory reservations).
+        sandbox_dirs = [WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT]
+        try:
+            # Ensure the sandbox directories exist and are writable by the sandbox user.
+            mkdir_result = container.exec_run(["mkdir", "-p", "--", *sandbox_dirs], user="root")
+            if mkdir_result.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to create sandbox directories in {container.short_id}: "
+                    f"(exit_code: {mkdir_result.exit_code}) -> {mkdir_result.output}"
+                )
 
-        chown_result = container.exec_run(
-            [
-                "chown",
-                self._get_user(),
-                "--",
-                WORKSPACE_ROOT,
-                SANDBOX_ROOT,
-                WORKDIR_ROOT,
-                SANDBOX_HOME,
-                SKILLS_ROOT,
-                SCRATCH_ROOT,
-            ],
-            user="root",
-        )
-        if chown_result.exit_code != 0:
-            raise RuntimeError(
-                f"Failed to chown sandbox directories in {container.short_id}: "
-                f"(exit_code: {chown_result.exit_code}) -> {chown_result.output}"
-            )
+            chown_result = container.exec_run(["chown", self._get_user(), "--", *sandbox_dirs], user="root")
+            if chown_result.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to chown sandbox directories in {container.short_id}: "
+                    f"(exit_code: {chown_result.exit_code}) -> {chown_result.output}"
+                )
+        except Exception:
+            try:
+                container.remove(force=True)
+            except Exception:
+                logger.warning("Failed to remove container %s after bootstrap failure", container.short_id)
+            raise
 
     def remove_container(self):
         """
@@ -398,16 +374,15 @@ class SandboxDockerSession:
             raise ValueError("Refusing to extract an archive into the container root directory")
 
         # Confine the destination to WORKSPACE_ROOT (SANDBOX_ROOT/SKILLS_ROOT/SCRATCH_ROOT all live
-        # under it, so the single /workspace prefix subsumes them) or WORKDIR_ROOT (where the
-        # patch-extractor's meta-repo machinery lives). Validate lexically through the shared validator
-        # so a `..`/NUL/newline in `dest` is rejected at this boundary rather than relying on every
-        # caller pre-validating. allow_root=True permits a bare-root dest.
+        # under it, so the single /workspace prefix subsumes them). Validate lexically through the
+        # shared validator so a `..`/NUL/newline in `dest` is rejected at this boundary rather than
+        # relying on every caller pre-validating. allow_root=True permits a bare-root dest.
+        # (/workdir is container-local control plane — the seed marker is written there via exec, not
+        # copied — so it is intentionally NOT an allowed archive destination.)
         try:
-            _validate_sandbox_path(to_dir_norm, allowed_roots=(WORKSPACE_ROOT, WORKDIR_ROOT), allow_root=True)
+            _validate_sandbox_path(to_dir_norm, allowed_roots=(WORKSPACE_ROOT,), allow_root=True)
         except ValueError as exc:
-            raise ValueError(
-                f"Refusing to extract an archive outside of {WORKSPACE_ROOT!r} or {WORKDIR_ROOT!r}: {exc}"
-            ) from exc
+            raise ValueError(f"Refusing to extract an archive outside of {WORKSPACE_ROOT!r}: {exc}") from exc
 
         if clear_before_copy:
             q = _sh_quote(to_dir_norm)
@@ -685,15 +660,3 @@ class SandboxDockerSession:
                 return None
 
         return container
-
-    def get_label(self, label: str) -> str | None:
-        """
-        Get a label from the container.
-
-        Args:
-            label (str): The label to get.
-
-        Returns:
-            str | None: The value of the label, or None if the label is not set.
-        """
-        return self.container.attrs["Config"].get("Labels", {}).get(label)

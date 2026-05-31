@@ -124,6 +124,22 @@ def test__start_container(mock_docker_client):
     )
 
 
+def test_start_container_force_removes_on_bootstrap_failure(mock_docker_client):
+    """If mkdir/chown fails after the container starts, force-remove it.
+
+    The container runs `sleep 3600`, so it stays alive on failure and `remove=True` won't reap it;
+    `_start_container` must force-remove it so a failed start() leaks nothing.
+    """
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=1, output=b"boom")
+
+    with pytest.raises(RuntimeError):
+        session._start_container("img:latest")
+
+    mock_container.remove.assert_called_once_with(force=True)
+
+
 def test_remove_container(mock_docker_client):
     session = SandboxDockerSession(session_id="test-session-id")
     session.remove_container()
@@ -459,24 +475,21 @@ def test_copy_to_container_rejects_non_reserved_root(mock_docker_client):
         session.copy_to_container(buf, dest="/etc/passwd", clear_before_copy=False)
 
 
-def test_copy_to_container_allows_workdir_root(mock_docker_client):
-    """copy_to_container accepts /workdir (and subdirs) — the patch-extractor meta volume."""
+def test_copy_to_container_rejects_workdir_root(mock_docker_client):
+    """copy_to_container refuses /workdir: it is container-local control plane (the seed marker is
+    written there via exec, not copied), so it sits outside the archive-extraction boundary."""
     session = SandboxDockerSession()
     session.container = MagicMock()
-    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
-    session.container.put_archive.return_value = True
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:
         info = tarfile.TarInfo(name="meta.txt")
         info.size = 0
         tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
 
-    # Bare /workdir and a subpath under it are both accepted.
-    buf.seek(0)
-    session.copy_to_container(buf, dest=WORKDIR_ROOT, clear_before_copy=False)
-    buf.seek(0)
-    session.copy_to_container(buf, dest=f"{WORKDIR_ROOT}/sub", clear_before_copy=False)
+    with pytest.raises(ValueError, match="Refusing to extract"):
+        session.copy_to_container(buf, dest=WORKDIR_ROOT, clear_before_copy=False)
 
 
 def test_copy_to_container_allows_bare_workspace_root(mock_docker_client):

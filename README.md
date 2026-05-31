@@ -65,7 +65,6 @@ All settings are configurable via environment variables. The available settings 
 | **DAIV_SANDBOX_SESSION_LOCK_TTL_SECONDS**     | TTL (seconds) of the per-session lock when Redis-backed.                                                 | Default: 900                                                                |
 | **DAIV_SANDBOX_SESSION_LOCK_WAIT_SECONDS**    | Max time (seconds) a request waits to acquire a busy session lock before returning `409`.                | Default: 1.0                                                                |
 | **DAIV_SANDBOX_SESSION_LOCK_REFRESH_SECONDS** | Interval (seconds) at which a held session lock is refreshed.                                            | Default: 30.0                                                               |
-| **DAIV_SANDBOX_GIT_IMAGE**                    | Image used to extract patches.                                                                           | Default: "alpine/git:2.52.0"                                                |
 | **DAIV_SANDBOX_HOST**                         | The host to bind the service to.                                                                         | Default: "0.0.0.0"                                                          |
 | **DAIV_SANDBOX_PORT**                         | The port to bind the service to.                                                                         | Default: 8000                                                               |
 | **DAIV_SANDBOX_LOG_LEVEL**                    | The log level to use.                                                                                    | Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`<br>Default: "INFO" |
@@ -86,7 +85,7 @@ All settings are configurable via environment variables. The available settings 
 
 To start a sandbox session, you need to call the `POST /session/` endpoint. A Docker image is pulled from the registry and used to create the sandbox container.
 
-After image is pulled or built, the container will be created and started, along with an helper container that will be used to extract the patch of the changed files.
+After the image is pulled, the container is created and started.
 
 Here is an example using `curl`:
 
@@ -108,14 +107,13 @@ The response will be a JSON object with the following structure containing the s
 
 The following table describes the parameters for the `session/` endpoint:
 
-| Parameter         | Description                                                     | Required | Valid Values                         |
-| ----------------- | --------------------------------------------------------------- | -------- | ------------------------------------ |
-| `base_image`      | The base image to use for the container.                        | Yes      | Any valid Docker image               |
-| `extract_patch`   | Extract a patch with the changes made by the executed commands. | No       | `true` or `false` (default: `false`) |
-| `network_enabled` | Enable network access inside the container.                     | No       | `true` or `false` (default: `false`) |
-| `environment`     | Environment variables to set at container start.                | No       | Object of string pairs               |
-| `memory_bytes`    | Memory limit for the container (bytes).                         | No       | Integer (bytes)                      |
-| `cpus`            | CPU quota for the container.                                    | No       | Float (e.g. `0.5`, `1.0`)            |
+| Parameter         | Description                                      | Required | Valid Values                         |
+| ----------------- | ------------------------------------------------ | -------- | ------------------------------------ |
+| `base_image`      | The base image to use for the container.         | Yes      | Any valid Docker image               |
+| `network_enabled` | Enable network access inside the container.      | No       | `true` or `false` (default: `false`) |
+| `environment`     | Environment variables to set at container start. | No       | Object of string pairs               |
+| `memory_bytes`    | Memory limit for the container (bytes).          | No       | Integer (bytes)                      |
+| `cpus`            | CPU quota for the container.                     | No       | Float (e.g. `0.5`, `1.0`)            |
 
 > [!NOTE]
 > For security reasons, building images from arbitrary Dockerfiles is not supported by this service. Provide a `base_image`.
@@ -140,7 +138,7 @@ print(resp["session_id"])
 
 ### Seeding a Session
 
-A freshly-started session has empty `/workspace/repo` and `/workspace/skills` directories. Before running commands or operating on files, seed the workspace by calling `POST /session/{session_id}/seed/` with one or both archives as `multipart/form-data` fields. `repo_archive` is extracted into `/workspace/repo` (e.g. a repository snapshot) and `skills_archive` is extracted into `/workspace/skills` (auxiliary tooling, prompts, etc.). When `extract_patch` was enabled at session start and `repo_archive` is provided, the patch-extractor's meta repo is initialised against this state.
+A freshly-started session has empty `/workspace/repo` and `/workspace/skills` directories. Before running commands or operating on files, seed the workspace by calling `POST /session/{session_id}/seed/` with one or both archives as `multipart/form-data` fields. `repo_archive` is extracted into `/workspace/repo` (e.g. a repository snapshot) and `skills_archive` is extracted into `/workspace/skills` (auxiliary tooling, prompts, etc.).
 
 Both fields are optional individually, but **at least one must be provided** — a request with neither returns `422`. Seeding is **one-shot per session** — a second call returns `409 Conflict`.
 
@@ -176,7 +174,7 @@ To inspect or modify files without spawning a shell, use the `POST /session/{ses
 | `edit`   | `{path, old, new, replace_all?}` | `{occurrences, error?}`     |
 | `delete` | `{path}`                         | `{ok, error?}`              |
 
-`path` must be absolute and under `/workspace`; the file ops (`write`/`edit`/`read`/`delete`) target a file, while the directory ops (`ls`/`grep`/`glob`) may also target the `/workspace` root itself. `content` is base64-encoded. Every response also carries an `error` field, set when the operation fails (e.g. invalid path, missing file). `read` additionally returns a human-readable sentinel string for an empty file (with `encoding: "utf-8"`), and an `error` when `offset` exceeds the file length. The sandbox is the single source of truth: edits under `/workspace/repo` land on the volume the patch-extractor diffs and therefore surface in the next run's patch, while `skills/` and `tmp/` stay container-local.
+`path` must be absolute and under `/workspace`; the file ops (`write`/`edit`/`read`/`delete`) target a file, while the directory ops (`ls`/`grep`/`glob`) may also target the `/workspace` root itself. `content` is base64-encoded. Every response also carries an `error` field, set when the operation fails (e.g. invalid path, missing file). `read` additionally returns a human-readable sentinel string for an empty file (with `encoding: "utf-8"`), and an `error` when `offset` exceeds the file length. The sandbox is the single source of truth: edits under `/workspace/repo` (via bash or `fs/*`) land directly on the container's workspace, while `skills/` and `tmp/` stay container-local.
 
 ```sh
 $ curl -X POST \
@@ -198,7 +196,7 @@ By default, all commands are executed sequentially regardless of their exit code
 
 Set `timeout` (seconds) to cap each command's wall-clock time. A command that exceeds the timeout is terminated with exit code `124` and any remaining commands in the request are skipped. Omitting `timeout` falls back to the server default (`DAIV_SANDBOX_COMMAND_TIMEOUT`, `0` = no timeout).
 
-When `extract_patch` was enabled on session creation, the `patch` field in the response is a base64-encoded unified diff covering the changes since the previous turn (`HEAD~1..HEAD` against the meta repo). It is `null` when no changes were detected.
+Commands mutate the container workspace in place. To recover the changes made during a session, run git (or any diff tool) inside `/workspace/repo` — e.g. `git diff` / `git status` — through this same endpoint; the workspace is the single source of truth.
 
 | Parameter   | Description                                                                                 | Required | Valid Values                         |
 | ----------- | ------------------------------------------------------------------------------------------- | -------- | ------------------------------------ |
@@ -226,15 +224,13 @@ The response will be a JSON object with the following structure:
       "output": "total 12\ndrwxr-xr-x 3 root root 4096 Nov 20 20:28 .\ndrwxrwxrwt 1 root root 4096 Nov 20 20:28 ..\ndrwxrwxr-x 3 root root 4096 Nov 14 14:39 django-webhooks-master\n",
       "exit_code": 0
     }
-  ],
-  "patch": null // Base64-encoded diff; null when no changes were detected
+  ]
 }
 ```
 
 Here is an example using `python` that seeds a session and then runs commands:
 
 ```python
-import base64
 import io
 import tarfile
 
@@ -243,10 +239,10 @@ import httpx
 API = "http://localhost:8000/api/v1"
 HEADERS = {"X-API-Key": "notsosecret"}
 
-# 1. Start a session with extract_patch enabled.
+# 1. Start a session.
 session_id = (
     httpx
-    .post(f"{API}/session/", headers=HEADERS, json={"base_image": "python:3.12", "extract_patch": True})
+    .post(f"{API}/session/", headers=HEADERS, json={"base_image": "python:3.12"})
     .raise_for_status()
     .json()["session_id"]
 )
@@ -263,7 +259,7 @@ httpx.post(
     files={"repo_archive": ("repo.tar.gz", tarstream, "application/gzip")},
 ).raise_for_status()
 
-# 3. Run commands. Returns a patch covering this turn's changes.
+# 3. Run commands. Changes mutate the container workspace in place.
 resp = (
     httpx
     .post(
@@ -274,19 +270,10 @@ resp = (
 )
 
 print(resp["results"][0]["output"])
-if resp["patch"]:
-    print(base64.b64decode(resp["patch"]).decode())
 ```
 
 > [!NOTE]
 > When `DAIV_SANDBOX_REDIS_URL` is set, requests against the same session are serialised across replicas. A request that cannot acquire the per-session lock within `DAIV_SANDBOX_SESSION_LOCK_WAIT_SECONDS` returns `409 Conflict`.
-
-> [!TIP]
-> To apply the patch to the original repository/directory, you can use the `git apply` command. Don't need to be a git repository, it can be any directory.
->
-> ```sh
-> $ git apply --whitespace=nowarn --reject < patch.diff
-> ```
 
 ### Closing a Sandbox Session
 
