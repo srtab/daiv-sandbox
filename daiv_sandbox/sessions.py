@@ -458,14 +458,17 @@ class SandboxDockerSession(Session):
         if to_dir_norm in {"", "/"}:
             raise ValueError("Refusing to extract an archive into the container root directory")
 
-        # SANDBOX_ROOT/SKILLS_ROOT/SCRATCH_ROOT all live under WORKSPACE_ROOT, so the single
-        # /workspace prefix subsumes them; /workdir (the patch-extractor meta volume) stays separate.
-        if not (
-            to_dir_norm in (WORKSPACE_ROOT, WORKDIR_ROOT)
-            or to_dir_norm.startswith(f"{WORKSPACE_ROOT}/")
-            or to_dir_norm.startswith(f"{WORKDIR_ROOT}/")
-        ):
-            raise ValueError(f"Refusing to extract an archive outside of {WORKSPACE_ROOT!r} or {WORKDIR_ROOT!r}")
+        # Confine the destination to WORKSPACE_ROOT (SANDBOX_ROOT/SKILLS_ROOT/SCRATCH_ROOT all live
+        # under it, so the single /workspace prefix subsumes them) or WORKDIR_ROOT (where the
+        # patch-extractor's meta-repo machinery lives). Validate lexically through the shared validator
+        # so a `..`/NUL/newline in `dest` is rejected at this boundary rather than relying on every
+        # caller pre-validating. allow_root=True permits a bare-root dest.
+        try:
+            _validate_sandbox_path(to_dir_norm, allowed_roots=(WORKSPACE_ROOT, WORKDIR_ROOT), allow_root=True)
+        except ValueError as exc:
+            raise ValueError(
+                f"Refusing to extract an archive outside of {WORKSPACE_ROOT!r} or {WORKDIR_ROOT!r}: {exc}"
+            ) from exc
 
         if clear_before_copy:
             q = _sh_quote(to_dir_norm)

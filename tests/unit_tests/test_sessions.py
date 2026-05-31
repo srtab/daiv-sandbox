@@ -479,6 +479,59 @@ def test_copy_to_container_rejects_non_reserved_root(mock_docker_client):
         session.copy_to_container(buf, dest="/etc/passwd", clear_before_copy=False)
 
 
+def test_copy_to_container_allows_workdir_root(mock_docker_client):
+    """copy_to_container accepts /workdir (and subdirs) — the patch-extractor meta volume."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session.container.put_archive.return_value = True
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="meta.txt")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+
+    # Bare /workdir and a subpath under it are both accepted.
+    buf.seek(0)
+    session.copy_to_container(buf, dest=WORKDIR_ROOT, clear_before_copy=False)
+    buf.seek(0)
+    session.copy_to_container(buf, dest=f"{WORKDIR_ROOT}/sub", clear_before_copy=False)
+
+
+def test_copy_to_container_allows_bare_workspace_root(mock_docker_client):
+    """A bare /workspace dest is accepted (its subdirs repo/skills/tmp all live under it)."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session.container.put_archive.return_value = True
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="x")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
+
+    session.copy_to_container(buf, dest=WORKSPACE_ROOT, clear_before_copy=False)
+
+
+def test_copy_to_container_rejects_dest_traversal(mock_docker_client):
+    """A `..` in an absolute dest is rejected at the boundary (defense-in-depth, not caller-dependent)."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="x")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
+
+    with pytest.raises(ValueError, match="Refusing to extract"):
+        session.copy_to_container(buf, dest=f"{WORKSPACE_ROOT}/../etc", clear_before_copy=False)
+
+
 def test_start_container_creates_skills_root(mock_docker_client):
     """A freshly-started container has /skills owned by the sandbox user."""
     session = SandboxDockerSession()
