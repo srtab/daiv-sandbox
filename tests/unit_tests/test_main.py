@@ -797,6 +797,17 @@ def test_fs_write_rejects_outside_workspace(mock_session, client):
     mock_session.write_file.assert_not_called()
 
 
+def test_fs_write_rejects_bare_workspace_root(mock_session, client):
+    """File ops forbid the bare /workspace root (allow_root=False); only ls/grep/glob may target it."""
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/write",
+        json={"path": "/workspace", "content": base64.b64encode(b"x").decode(), "mode": 0o644},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is False
+    mock_session.write_file.assert_not_called()
+
+
 def test_fs_write_rejects_path_outside_workspace_repo_sibling(mock_session, client):
     """A pre-reparent path like /repo (now outside /workspace) is rejected."""
     sid = mock_session.session_id

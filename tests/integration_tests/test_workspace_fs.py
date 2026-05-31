@@ -171,3 +171,29 @@ def test_repo_edits_patch_but_tmp_does_not(client, workspace_session):
     decoded = base64.b64decode(patch).decode()
     assert "README.md" in decoded
     assert "junk.txt" not in decoded  # tmp is not on the diffed volume
+
+
+def test_skills_edits_do_not_appear_in_patch(client, workspace_session):
+    sid = workspace_session
+    # skills/ lives under /workspace but off the repo volume the patch-extractor diffs, so it should
+    # behave like tmp/: never surface in a patch. Seed a skills file via the fs endpoint first.
+    w = client.post(
+        f"/session/{sid}/fs/write",
+        json={
+            "path": "/workspace/skills/helper.md",
+            "content": base64.b64encode(b"# helper\n").decode(),
+            "mode": 0o644,
+        },
+    )
+    assert w.status_code == 200 and w.json()["ok"] is True, w.text
+    # A repo edit in the same turn forces a patch; the skills edit must not appear in it.
+    run = client.post(
+        f"/session/{sid}/",
+        json={"commands": ["echo changed >> /workspace/repo/README.md", "echo more >> /workspace/skills/helper.md"]},
+    )
+    assert run.status_code == 200, run.text
+    patch = run.json()["patch"]
+    assert patch is not None, "repo change must produce a patch"
+    decoded = base64.b64decode(patch).decode()
+    assert "README.md" in decoded
+    assert "helper.md" not in decoded  # skills/ is not on the diffed repo volume
