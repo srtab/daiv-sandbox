@@ -6,9 +6,8 @@ import logging
 import tarfile
 import tempfile
 import threading
-from abc import ABC, abstractmethod
 from pathlib import Path, PurePosixPath
-from typing import IO, TYPE_CHECKING, BinaryIO, NamedTuple
+from typing import IO, TYPE_CHECKING, NamedTuple
 
 from docker import DockerClient, from_env
 from docker.errors import ImageNotFound, NotFound
@@ -210,41 +209,7 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
         raise ValueError(f"Invalid or truncated archive: {e}") from e
 
 
-class Session(ABC):
-    @classmethod
-    @abstractmethod
-    def ping(cls, client: DockerClient | None = None) -> bool:
-        """
-        Ping the Docker client.
-        """
-
-    @classmethod
-    @abstractmethod
-    def start(cls, client: DockerClient | None = None):
-        """
-        Start a new session.
-        """
-
-    @abstractmethod
-    def copy_from_container(self, host_dir: str) -> BinaryIO:
-        """
-        Copy a file or directory from the container to the host.
-        """
-
-    @abstractmethod
-    def copy_to_container(self, data: IO[bytes], dest: str | None = None):
-        """
-        Copy a file or directory to the container.
-        """
-
-    @abstractmethod
-    def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
-        """
-        Execute a command in the container.
-        """
-
-
-class SandboxDockerSession(Session):
+class SandboxDockerSession:
     """
     A session is a Docker container that is used to execute commands.
     """
@@ -410,32 +375,6 @@ class SandboxDockerSession(Session):
             logger.warning("Container '%s' not found", self.session_id)
         else:
             logger.info("Container '%s' removed", self.session_id)
-
-    def copy_from_container(self, host_dir: str) -> BinaryIO:
-        """
-        Copy a file or directory from the container to the host.
-
-        Args:
-            host_dir (str): The path to the file or directory to copy from the container.
-
-        Returns:
-            BinaryIO: The copied archive.
-        """
-        if Path(host_dir).is_absolute():
-            from_dir = host_dir
-        elif host_dir in {"", "."}:
-            # Special case: when copying the sandbox root itself ("."), request SANDBOX_ROOT + "/." so the archive
-            # contains the *contents* rather than a top-level "sandbox-root/" directory.
-            from_dir = f"{SANDBOX_ROOT}/."
-        else:
-            from_dir = (Path(SANDBOX_ROOT) / host_dir).as_posix()
-
-        bits, stat = self.container.get_archive(from_dir)
-
-        if stat["size"] == 0:
-            raise FileNotFoundError(f"File {from_dir} not found in the container {self.container.short_id}")
-
-        return io.BytesIO(b"".join(bits))
 
     def copy_to_container(self, tardata: IO[bytes], dest: str | None = None, clear_before_copy: bool = True):
         """

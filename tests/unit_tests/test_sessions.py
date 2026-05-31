@@ -166,16 +166,6 @@ def test_copy_to_runtime_creates_directory(mock_docker_client):
     )
 
 
-def test_copy_from_runtime_raises_error_if_file_not_found(mock_docker_client):
-    session = SandboxDockerSession()
-    session.container = MagicMock()
-    session.container.get_archive.return_value = ([], {"size": 0})
-    with pytest.raises(FileNotFoundError):
-        session.copy_from_container("/path/to/src")
-    # Absolute paths should be used as-is
-    session.container.get_archive.assert_called_once_with("/path/to/src")
-
-
 def test_execute_command(mock_docker_client):
     session = SandboxDockerSession(session_id="test-session-id")
     session.container = MagicMock()
@@ -235,16 +225,6 @@ def test_copy_to_container_with_relative_dest(mock_docker_client):
     session.container.exec_run.assert_any_call(
         ["chown", "-R", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", expected_path], user="root"
     )
-
-
-def test_copy_from_container_with_relative_path(mock_docker_client):
-    """Test that relative paths are resolved under SANDBOX_ROOT"""
-    session = SandboxDockerSession()
-    session.container = MagicMock()
-    session.container.get_archive.return_value = ([b"data"], {"size": 100})
-    session.copy_from_container("subdir")
-    expected_path = f"{SANDBOX_ROOT}/subdir"
-    session.container.get_archive.assert_called_once_with(expected_path)
 
 
 def test_execute_command_with_relative_workdir(mock_docker_client):

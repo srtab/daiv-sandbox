@@ -476,70 +476,6 @@ def test_seed_session_rejects_unknown_session(client):
         assert resp.status_code == 404
 
 
-def test_apply_mutations_creates_file(mock_session, client):
-    """Happy path: a single put returns ok=True for that path."""
-    payload = {
-        "mutations": [
-            {
-                "path": "/workspace/repo/new_file.py",
-                "content": base64.b64encode(b"print('hi')\n").decode(),
-                "mode": 0o644,
-            }
-        ]
-    }
-    resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["results"] == [{"path": "/workspace/repo/new_file.py", "ok": True, "error": None}]
-    mock_session.write_file.assert_called_once()
-
-
-def test_apply_mutations_rejects_path_outside_repo(mock_session, client):
-    """Per-item rejection for workspace siblings, /etc, traversal — not 4xx.
-
-    apply_file_mutations stays confined to /workspace/repo even though the fs/* endpoints
-    were widened to the whole /workspace; skills/ and tmp/ are not mutable via this endpoint.
-    """
-    bad_paths = ["/workspace/skills/foo.md", "/workspace/tmp/x", "/etc/passwd", "/workspace/repo/../etc/passwd"]
-    for path in bad_paths:
-        payload = {"mutations": [{"path": path, "content": base64.b64encode(b"x").decode(), "mode": 0o644}]}
-        resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
-        assert resp.status_code == 200, f"path={path}: status={resp.status_code}"
-        result = resp.json()["results"][0]
-        assert result["ok"] is False, f"expected rejection for {path}, got {result}"
-        assert result["error"] is not None
-
-
-def test_apply_mutations_unknown_session_returns_404(client):
-    """When the session has no container, return 404."""
-    with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
-        instance = cls.return_value
-        instance.container = None
-        payload = {
-            "mutations": [{"path": "/workspace/repo/x", "content": base64.b64encode(b"x").decode(), "mode": 0o644}]
-        }
-        resp = client.post("/session/no-such-id/files/", json=payload)
-        assert resp.status_code == 404
-
-
-def test_apply_mutations_empty_batch_rejected(mock_session, client):
-    """Schema-level rejection of empty mutations list → 422."""
-    resp = client.post(f"/session/{mock_session.session_id}/files/", json={"mutations": []})
-    assert resp.status_code == 422
-
-
-def test_apply_mutations_oversized_batch_rejected(mock_session, client):
-    """More than 64 mutations → 422."""
-    payload = {
-        "mutations": [
-            {"path": f"/workspace/repo/f{i}.py", "content": base64.b64encode(b"").decode(), "mode": 0o644}
-            for i in range(65)
-        ]
-    }
-    resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
-    assert resp.status_code == 422
-
-
 def test_seed_session_rejects_double_seed(mock_session, client):
     """A second seed attempt on an already-seeded session returns 409."""
     from docker.models.containers import ExecResult
@@ -578,8 +514,8 @@ def test_seed_session_extracts_skills_archive_only(mock_session, client):
 def test_seed_session_meta_init_runs_on_skills_archive_only(client):
     """Repoless seed (skills_archive only) still inits meta when patch-extractor is linked.
 
-    Without this, the first ``apply_file_mutations`` / ``run`` call in a repoless run
-    would 500 on HEAD-advance because ``/workdir/meta`` was never initialised.
+    Without this, the first ``run`` call in a repoless run would 500 on HEAD-advance
+    because ``/workdir/meta`` was never initialised.
     """
     from docker.models.containers import ExecResult
 
@@ -856,9 +792,18 @@ def test_fs_grep_surfaces_command_error(mock_session, client):
     assert body["error"] is not None
 
 
-def test_fs_glob_invalid_pattern_returns_400(mock_session, client):
+def test_fs_glob_unbalanced_bracket_is_literal(mock_session, client):
+    """An unbalanced '[' is treated as a literal (shell-like), not rejected as a 400.
+
+    glob.translate never raises on malformed bracket classes, so the pattern compiles and matches a
+    file literally named '[' rather than producing an error.
+    """
+    from daiv_sandbox.sessions import DirEntry
+
+    mock_session.find_paths.return_value = [DirEntry("/workspace/tmp/[", False), DirEntry("/workspace/tmp/a.py", False)]
     resp = client.post(f"/session/{mock_session.session_id}/fs/glob", json={"path": "/workspace/tmp", "pattern": "["})
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 200, resp.text
+    assert [e["path"] for e in resp.json()["matches"]] == ["/workspace/tmp/["]
 
 
 def test_fs_glob_filters_by_pattern(mock_session, client):
@@ -874,6 +819,33 @@ def test_fs_glob_filters_by_pattern(mock_session, client):
     )
     assert resp.status_code == 200, resp.text
     assert [e["path"] for e in resp.json()["matches"]] == ["/workspace/tmp/a.py"]
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected"),
+    [
+        ("[ab].py", ["/workspace/tmp/a.py", "/workspace/tmp/b.py"]),  # class membership
+        ("[!a]*.py", ["/workspace/tmp/b.py", "/workspace/tmp/c.py"]),  # negated class
+    ],
+)
+def test_fs_glob_char_classes(mock_session, client, pattern, expected):
+    """Bracket classes work end-to-end through glob.translate: `[abc]` membership and `[!x]` negation.
+
+    Guards the semantics that changed when `_glob_to_regex` moved off the hand-rolled engine, so a
+    future swap back to e.g. fnmatch can't silently alter char-class matching.
+    """
+    from daiv_sandbox.sessions import DirEntry
+
+    mock_session.find_paths.return_value = [
+        DirEntry("/workspace/tmp/a.py", False),
+        DirEntry("/workspace/tmp/b.py", False),
+        DirEntry("/workspace/tmp/c.py", False),
+    ]
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/glob", json={"path": "/workspace/tmp", "pattern": pattern}
+    )
+    assert resp.status_code == 200, resp.text
+    assert sorted(e["path"] for e in resp.json()["matches"]) == sorted(expected)
 
 
 def test_fs_glob_surfaces_find_error(mock_session, client):

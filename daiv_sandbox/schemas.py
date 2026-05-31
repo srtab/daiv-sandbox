@@ -52,26 +52,6 @@ class RunResponse(BaseModel):
     patch: str | None = Field(description="Base64-encoded patch with the changes.")
 
 
-class PutMutation(BaseModel):
-    path: str = Field(description="Absolute path inside the sandbox, must be under /workspace/repo.")
-    content: Base64Bytes = Field(description="Base64-encoded full file content.")
-    mode: int = Field(ge=0, le=0o7777, description="POSIX mode bits to set on the file.")
-
-
-class ApplyMutationsRequest(BaseModel):
-    mutations: list[PutMutation] = Field(min_length=1, max_length=64)
-
-
-class MutationResult(BaseModel):
-    path: str = Field(description="The path the mutation targeted.")
-    ok: bool = Field(description="Whether the mutation was applied successfully.")
-    error: str | None = Field(default=None, description="Per-item error message when ok=False.")
-
-
-class ApplyMutationsResponse(BaseModel):
-    results: list[MutationResult]
-
-
 class ErrorMessage(BaseModel):
     detail: str = Field(description="Error message.")
 

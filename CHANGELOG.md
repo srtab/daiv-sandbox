@@ -16,10 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Session container layout unified under `/workspace/{repo,skills,tmp}` (was `/repo`, `/skills`, `/scratch`); `fs/*` endpoints now operate across the whole `/workspace`. **Breaking:** requires the matching daiv release.
+- `fs/glob` now delegates to the stdlib `glob.translate`; a malformed bracket class (e.g. a lone `[`) is treated as a literal (shell-like) instead of returning `400`.
+
+### Removed
+
+- `POST /session/{id}/files/` (`apply_file_mutations`) and its `PutMutation` / `ApplyMutationsRequest` / `MutationResult` / `ApplyMutationsResponse` schemas. The endpoint existed to keep a client-side file mirror in sync with the sandbox; the sandbox is now the single source of truth, so write files through the `fs/*` endpoints (or bash) instead — edits under `/workspace/repo` surface in the next run's patch. **Breaking:** requires the matching daiv release.
 
 ### Fixed
 
-- `POST /session/{id}/seed/` now initialises the patch-extractor meta repo whenever the session was started with `extract_patch=True`, even when only `skills_archive` is provided (no `repo_archive`). Without this, the first `apply_file_mutations` or `run` call in a repoless flow failed with HTTP 500 because `/workdir/meta` was missing.
+- `POST /session/{id}/seed/` now initialises the patch-extractor meta repo whenever the session was started with `extract_patch=True`, even when only `skills_archive` is provided (no `repo_archive`). Without this, the first `run` call in a repoless flow failed with HTTP 500 because `/workdir/meta` was missing.
 
 ## [0.5.0] - 2026-05-04
 

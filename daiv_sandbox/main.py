@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import glob
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -16,8 +17,6 @@ from daiv_sandbox.config import settings
 from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, SessionBusyError
 from daiv_sandbox.logs import LOGGING_CONFIG
 from daiv_sandbox.schemas import (
-    ApplyMutationsRequest,
-    ApplyMutationsResponse,
     ErrorMessage,
     FsDeleteRequest,
     FsDeleteResponse,
@@ -35,7 +34,6 @@ from daiv_sandbox.schemas import (
     FsReadResponse,
     FsWriteRequest,
     FsWriteResponse,
-    MutationResult,
     RunRequest,
     RunResponse,
     RunResult,
@@ -306,7 +304,7 @@ async def seed_session(
 
         # Meta init whenever a patch-extractor is linked (extract_patch=True at session start).
         # Even with no repo_archive (repoless runs or skills-only seeds) the agent will mutate
-        # /workspace/repo via apply_file_mutations / bash; both endpoints run HEAD-advance and require
+        # /workspace/repo via bash or the fs/* endpoints; the run endpoint's HEAD-advance requires
         # /workdir/meta to exist. The init script's seed commit is `--allow-empty`, so an empty
         # /workdir/new is fine.
         if extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
@@ -332,60 +330,6 @@ async def seed_session(
             )
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-@app.post("/session/{session_id}/files/", responses=common_responses, name="Apply file mutations to a session")
-async def apply_file_mutations(
-    http_request: Request,
-    session_id: Annotated[str, FastAPIPath(title="The ID of the session to mutate.")],
-    request: ApplyMutationsRequest,
-    api_key: str = Depends(get_api_key),
-) -> ApplyMutationsResponse:
-    """
-    Apply a batch of file mutations to /workspace/repo and advance the patch-extractor's meta HEAD.
-
-    Per-item validation: each mutation that fails returns a MutationResult(ok=False, error=...).
-    Request-level errors (4xx) are reserved for auth, schema, body-size, and unknown-session.
-    """
-    async with http_request.app.state.session_lock_manager.acquire(session_id):
-        cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
-
-        if not cmd_executor.container:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
-
-        results: list[MutationResult] = []
-        any_succeeded = False
-
-        for mutation in request.mutations:
-            try:
-                _validate_sandbox_path(mutation.path, allowed_roots=(SANDBOX_ROOT,))
-            except ValueError as exc:
-                results.append(MutationResult(path=mutation.path, ok=False, error=str(exc)))
-                continue
-
-            try:
-                await asyncio.to_thread(cmd_executor.write_file, mutation.path, mutation.content, mode=mutation.mode)
-            except Exception as exc:
-                logger.exception("apply_mutations: write failed for %s", mutation.path)
-                results.append(MutationResult(path=mutation.path, ok=False, error=str(exc)))
-                continue
-
-            results.append(MutationResult(path=mutation.path, ok=True, error=None))
-            any_succeeded = True
-
-        if any_succeeded and (
-            extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
-        ):
-            patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=extract_patch_session_id)
-            advance = await asyncio.to_thread(patch_extractor.execute_command, CMD_TURN_DIFF_SCRIPT, workdir="/workdir")
-            if advance.exit_code != 0:
-                logger.error("HEAD-advance failed: [%s] %s", advance.exit_code, advance.output)
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Patch-extractor HEAD-advance failed; session may be inconsistent.",
-                )
-
-        return ApplyMutationsResponse(results=results)
 
 
 @app.post("/session/{session_id}/", responses=common_responses, name="Run commands on a session")
@@ -542,43 +486,15 @@ def _validate_workspace_dir(path: str) -> None:
 
 
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
-    """Translate a glob (supporting **, *, ?, [..]) to a compiled regex anchored to a relative path.
+    """Compile a path-aware glob (``**``, ``*``, ``?``, ``[..]``) to a regex for a base-relative path.
 
-    This engine is path-aware (``*`` does not cross ``/``, ``**`` does). It is intentionally NOT the
-    same as the optional ``glob`` filter on ``fs_grep``, which uses ``fnmatch`` for a basename-only
-    match — the two have deliberately different semantics, so don't try to merge them.
+    Delegates to stdlib ``glob.translate`` (added in Python 3.13): ``recursive=True`` makes ``**/`` span
+    directory boundaries while ``*`` stays within a single segment, and ``include_hidden=True`` lets
+    ``*`` match dotfiles. This is intentionally NOT the same as the optional ``glob`` filter on
+    ``fs_grep``, which uses ``fnmatch`` for a basename-only match — the two have deliberately
+    different semantics, so don't try to merge them.
     """
-    i, n, out = 0, len(pattern), []
-    while i < n:
-        c = pattern[i]
-        if pattern[i : i + 3] == "**/":
-            out.append("(?:.*/)?")
-            i += 3
-        elif pattern[i : i + 2] == "**":
-            out.append(".*")
-            i += 2
-        elif c == "*":
-            out.append("[^/]*")
-            i += 1
-        elif c == "?":
-            out.append("[^/]")
-            i += 1
-        elif c == "[":
-            j = i + 1
-            negate = j < n and pattern[j] in "!^"
-            if negate:
-                j += 1
-            if j < n and pattern[j] == "]":  # a leading ']' is a literal class member, not the closer
-                j += 1
-            while j < n and pattern[j] != "]":
-                j += 1
-            body = pattern[i + 1 + (1 if negate else 0) : j]
-            out.append(f"[{'^' if negate else ''}{body}]")
-            i = j + 1
-        else:
-            out.append(re.escape(c))
-            i += 1
-    return re.compile("^" + "".join(out) + "$")
+    return re.compile(glob.translate(pattern, recursive=True, include_hidden=True))
 
 
 @asynccontextmanager
@@ -669,11 +585,8 @@ async def fs_glob(
     http_request: Request, session_id: str, request: FsGlobRequest, api_key: str = Depends(get_api_key)
 ) -> FsGlobResponse:
     _validate_workspace_dir(request.path)
-    # Translate the glob up front so a malformed pattern is a clean 400, not a 500.
-    try:
-        regex = _glob_to_regex(request.pattern)
-    except re.error as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"invalid glob pattern: {exc}") from exc
+    # glob.translate treats malformed bracket classes as literals (shell-like), so this never raises.
+    regex = _glob_to_regex(request.pattern)
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             all_entries = await asyncio.to_thread(cmd.find_paths, request.path)
