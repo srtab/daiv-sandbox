@@ -524,7 +524,6 @@ async def version() -> dict[Literal["version"], str]:
 # on the shared workdir volume the patch-extractor diffs, so those DO surface in the next
 # patch; skills/ and tmp/ are container-local and stay diff-invisible.
 
-# File ops are confined to the whole workspace (repo/, skills/, tmp/) — one prefix check.
 _WORKSPACE_ROOTS = (WORKSPACE_ROOT,)
 
 
