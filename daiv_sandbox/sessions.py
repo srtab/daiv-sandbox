@@ -23,11 +23,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger("daiv_sandbox")
 
 # Canonical sandbox root directory inside all containers
-SANDBOX_ROOT = "/repo"
+WORKSPACE_ROOT = "/workspace"
+SANDBOX_ROOT = "/workspace/repo"
 WORKDIR_ROOT = "/workdir"
 SANDBOX_HOME = "/home/daiv-sandbox"
-SKILLS_ROOT = "/skills"
-SCRATCH_ROOT = "/scratch"
+SKILLS_ROOT = "/workspace/skills"
+SCRATCH_ROOT = "/workspace/tmp"
 
 
 class DirEntry(NamedTuple):
@@ -369,7 +370,8 @@ class SandboxDockerSession(Session):
 
         # Ensure the sandbox directories exist and are writable by the sandbox user.
         mkdir_result = container.exec_run(
-            ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
+            ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
+            user="root",
         )
         if mkdir_result.exit_code != 0:
             raise RuntimeError(
@@ -378,7 +380,17 @@ class SandboxDockerSession(Session):
             )
 
         chown_result = container.exec_run(
-            ["chown", self._get_user(), "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
+            [
+                "chown",
+                self._get_user(),
+                "--",
+                WORKSPACE_ROOT,
+                SANDBOX_ROOT,
+                WORKDIR_ROOT,
+                SANDBOX_HOME,
+                SKILLS_ROOT,
+                SCRATCH_ROOT,
+            ],
             user="root",
         )
         if chown_result.exit_code != 0:
@@ -446,17 +458,14 @@ class SandboxDockerSession(Session):
         if to_dir_norm in {"", "/"}:
             raise ValueError("Refusing to extract an archive into the container root directory")
 
+        # SANDBOX_ROOT/SKILLS_ROOT/SCRATCH_ROOT all live under WORKSPACE_ROOT, so the single
+        # /workspace prefix subsumes them; /workdir (the patch-extractor meta volume) stays separate.
         if not (
-            to_dir_norm in (SANDBOX_ROOT, WORKDIR_ROOT, SKILLS_ROOT, SCRATCH_ROOT)
-            or to_dir_norm.startswith(f"{SANDBOX_ROOT}/")
+            to_dir_norm in (WORKSPACE_ROOT, WORKDIR_ROOT)
+            or to_dir_norm.startswith(f"{WORKSPACE_ROOT}/")
             or to_dir_norm.startswith(f"{WORKDIR_ROOT}/")
-            or to_dir_norm.startswith(f"{SKILLS_ROOT}/")
-            or to_dir_norm.startswith(f"{SCRATCH_ROOT}/")
         ):
-            raise ValueError(
-                f"Refusing to extract an archive outside of {SANDBOX_ROOT!r}, {WORKDIR_ROOT!r}, "
-                f"{SKILLS_ROOT!r}, or {SCRATCH_ROOT!r}"
-            )
+            raise ValueError(f"Refusing to extract an archive outside of {WORKSPACE_ROOT!r} or {WORKDIR_ROOT!r}")
 
         if clear_before_copy:
             q = _sh_quote(to_dir_norm)

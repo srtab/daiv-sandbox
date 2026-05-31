@@ -15,9 +15,11 @@ from daiv_sandbox.sessions import (
     SCRATCH_ROOT,
     SKILLS_ROOT,
     WORKDIR_ROOT,
+    WORKSPACE_ROOT,
     SandboxDockerSession,
     _build_single_file_tar_stream,
     _sanitize_archive_stream,
+    _validate_sandbox_path,
 )
 
 EXPECTED_EXEC_ENV = {
@@ -103,13 +105,15 @@ def test__start_container(mock_docker_client):
     assert session.session_id == mock_docker_client.containers.run.return_value.id
     # Should create sandbox directories and chown them
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
+        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
+        user="root",
     )
     mock_container.exec_run.assert_any_call(
         [
             "chown",
             f"{settings.RUN_UID}:{settings.RUN_GID}",
             "--",
+            WORKSPACE_ROOT,
             SANDBOX_ROOT,
             WORKDIR_ROOT,
             SANDBOX_HOME,
@@ -484,7 +488,8 @@ def test_start_container_creates_skills_root(mock_docker_client):
 
     # mkdir -p was called including SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
+        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
+        user="root",
     )
     # chown was called for SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
@@ -492,6 +497,7 @@ def test_start_container_creates_skills_root(mock_docker_client):
             "chown",
             f"{settings.RUN_UID}:{settings.RUN_GID}",
             "--",
+            WORKSPACE_ROOT,
             SANDBOX_ROOT,
             WORKDIR_ROOT,
             SANDBOX_HOME,
@@ -707,3 +713,27 @@ def test_edit_file_matches_lf_old_against_crlf_file():
     count = s.edit_file("/scratch/a.txt", "a\nb", "a\nB", replace_all=False, allowed_roots=("/scratch",))
     assert count == 1
     assert s.write_file.call_args.args[1] == b"a\r\nB\r\n"
+
+
+def test_roots_are_under_workspace():
+    assert WORKSPACE_ROOT == "/workspace"
+    assert SANDBOX_ROOT == "/workspace/repo"
+    assert SKILLS_ROOT == "/workspace/skills"
+    assert SCRATCH_ROOT == "/workspace/tmp"
+
+
+@pytest.mark.parametrize("path", ["/workspace/repo/main.py", "/workspace/skills/x/SKILL.md", "/workspace/tmp/note.txt"])
+def test_validate_accepts_anything_under_workspace(path):
+    assert _validate_sandbox_path(path, allowed_roots=(WORKSPACE_ROOT,)) == path
+
+
+def test_validate_allows_workspace_root_only_with_allow_root():
+    assert _validate_sandbox_path("/workspace", allowed_roots=(WORKSPACE_ROOT,), allow_root=True) == "/workspace"
+    with pytest.raises(ValueError):
+        _validate_sandbox_path("/workspace", allowed_roots=(WORKSPACE_ROOT,))
+
+
+@pytest.mark.parametrize("path", ["/etc/passwd", "/workspace/../etc", "/repo/main.py", "relative/x"])
+def test_validate_rejects_outside_workspace(path):
+    with pytest.raises(ValueError):
+        _validate_sandbox_path(path, allowed_roots=(WORKSPACE_ROOT,))
