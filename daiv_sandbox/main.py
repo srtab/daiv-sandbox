@@ -306,7 +306,7 @@ async def seed_session(
 
         # Meta init whenever a patch-extractor is linked (extract_patch=True at session start).
         # Even with no repo_archive (repoless runs or skills-only seeds) the agent will mutate
-        # /repo via apply_file_mutations / bash; both endpoints run HEAD-advance and require
+        # /workspace/repo via apply_file_mutations / bash; both endpoints run HEAD-advance and require
         # /workdir/meta to exist. The init script's seed commit is `--allow-empty`, so an empty
         # /workdir/new is fine.
         if extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
