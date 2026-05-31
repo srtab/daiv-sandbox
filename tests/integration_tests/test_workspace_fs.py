@@ -157,3 +157,17 @@ def test_traversal_above_workspace_is_rejected(client, workspace_session):
     sid = workspace_session
     resp = client.post(f"/session/{sid}/fs/ls", json={"path": "/workspace/../etc"})
     assert resp.status_code == 400, resp.text
+
+
+def test_repo_edits_patch_but_tmp_does_not(client, workspace_session):
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={"commands": ["echo changed >> /workspace/repo/README.md", "echo junk > /workspace/tmp/junk.txt"]},
+    )
+    assert run.status_code == 200, run.text
+    patch = run.json()["patch"]
+    assert patch is not None, "repo change must produce a patch"
+    decoded = base64.b64decode(patch).decode()
+    assert "README.md" in decoded
+    assert "junk.txt" not in decoded  # tmp is not on the diffed volume
