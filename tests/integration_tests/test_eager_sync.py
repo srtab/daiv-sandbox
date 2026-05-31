@@ -51,14 +51,14 @@ def test_write_then_bash_reads_synced_file(client: TestClient, session_with_seed
         json={
             "mutations": [
                 {
-                    "path": "/repo/from_daiv.txt",
+                    "path": "/workspace/repo/from_daiv.txt",
                     "content": base64.b64encode(b"daiv wrote this\n").decode(),
                     "mode": 0o644,
                 }
             ]
         },
     )
-    resp = client.post(f"/session/{session_with_seed}/", json={"commands": ["cat /repo/from_daiv.txt"]})
+    resp = client.post(f"/session/{session_with_seed}/", json={"commands": ["cat /workspace/repo/from_daiv.txt"]})
     assert resp.status_code == 200
     body = resp.json()
     assert body["results"][0]["output"].strip() == "daiv wrote this"
@@ -68,7 +68,9 @@ def test_write_then_bash_reads_synced_file(client: TestClient, session_with_seed
 
 def test_bash_writes_visible_in_next_diff(client: TestClient, session_with_seed: str):
     """bash-created file shows up in the patch."""
-    resp = client.post(f"/session/{session_with_seed}/", json={"commands": ["echo hi > /repo/created_by_bash.txt"]})
+    resp = client.post(
+        f"/session/{session_with_seed}/", json={"commands": ["echo hi > /workspace/repo/created_by_bash.txt"]}
+    )
     body = resp.json()
     assert body["patch"] is not None
     decoded = base64.b64decode(body["patch"]).decode()
@@ -79,10 +81,12 @@ def test_bash_delete_visible_in_next_diff(client: TestClient, session_with_seed:
     client.post(
         f"/session/{session_with_seed}/files/",
         json={
-            "mutations": [{"path": "/repo/to_delete.txt", "content": base64.b64encode(b"x").decode(), "mode": 0o644}]
+            "mutations": [
+                {"path": "/workspace/repo/to_delete.txt", "content": base64.b64encode(b"x").decode(), "mode": 0o644}
+            ]
         },
     )
-    resp = client.post(f"/session/{session_with_seed}/", json={"commands": ["rm /repo/to_delete.txt"]})
+    resp = client.post(f"/session/{session_with_seed}/", json={"commands": ["rm /workspace/repo/to_delete.txt"]})
     decoded = base64.b64decode(resp.json()["patch"]).decode()
     assert "to_delete.txt" in decoded
     assert "deleted file" in decoded
@@ -95,14 +99,14 @@ def test_executable_mode_round_trips(client: TestClient, session_with_seed: str)
         json={
             "mutations": [
                 {
-                    "path": "/repo/script.sh",
+                    "path": "/workspace/repo/script.sh",
                     "content": base64.b64encode(b"#!/bin/sh\necho hello\n").decode(),
                     "mode": 0o755,
                 }
             ]
         },
     )
-    resp = client.post(f"/session/{session_with_seed}/", json={"commands": ["/repo/script.sh"]})
+    resp = client.post(f"/session/{session_with_seed}/", json={"commands": ["/workspace/repo/script.sh"]})
     body = resp.json()
     assert body["results"][0]["exit_code"] == 0
     assert "hello" in body["results"][0]["output"]
@@ -112,14 +116,16 @@ def test_30_alternating_writes_and_bash_stay_in_sync(client: TestClient, session
     """Long alternating sequence: final state matches between client and sandbox."""
     expected = {}
     for i in range(15):
-        path = f"/repo/file_{i}.txt"
+        path = f"/workspace/repo/file_{i}.txt"
         content = f"version-{i}\n".encode()
         client.post(
             f"/session/{session_with_seed}/files/",
             json={"mutations": [{"path": path, "content": base64.b64encode(content).decode(), "mode": 0o644}]},
         )
         expected[path] = content
-        client.post(f"/session/{session_with_seed}/", json={"commands": [f"echo bash-{i} >> /repo/sentinel.txt"]})
+        client.post(
+            f"/session/{session_with_seed}/", json={"commands": [f"echo bash-{i} >> /workspace/repo/sentinel.txt"]}
+        )
 
     for path, expected_content in expected.items():
         resp = client.post(f"/session/{session_with_seed}/", json={"commands": [f"cat {path}"]})
