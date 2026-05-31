@@ -43,7 +43,13 @@ from daiv_sandbox.schemas import (
     StartSessionResponse,
 )
 from daiv_sandbox.scripts import CMD_INIT_META_SCRIPT, CMD_TURN_DIFF_SCRIPT
-from daiv_sandbox.sessions import SANDBOX_ROOT, SCRATCH_ROOT, SKILLS_ROOT, SandboxDockerSession, _validate_sandbox_path
+from daiv_sandbox.sessions import (
+    SANDBOX_ROOT,
+    SKILLS_ROOT,
+    WORKSPACE_ROOT,
+    SandboxDockerSession,
+    _validate_sandbox_path,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -252,9 +258,9 @@ async def seed_session(
 
     Multipart fields (at least one is required):
       * ``repo_archive``    — tar (auto-detected compression: gzip, bzip2, xz, zstd, or plain)
-                              extracted into ``/repo``. When present, the patch-extractor's
+                              extracted into ``/workspace/repo``. When present, the patch-extractor's
                               meta repo is initialised.
-      * ``skills_archive``  — tar (same compression options) extracted into ``/skills``.
+      * ``skills_archive``  — tar (same compression options) extracted into ``/workspace/skills``.
 
     One-shot per session: subsequent calls return 409.
     """
@@ -336,7 +342,7 @@ async def apply_file_mutations(
     api_key: str = Depends(get_api_key),
 ) -> ApplyMutationsResponse:
     """
-    Apply a batch of file mutations to /repo and advance the patch-extractor's meta HEAD.
+    Apply a batch of file mutations to /workspace/repo and advance the patch-extractor's meta HEAD.
 
     Per-item validation: each mutation that fails returns a MutationResult(ok=False, error=...).
     Request-level errors (4xx) are reserved for auth, schema, body-size, and unknown-session.
@@ -509,26 +515,29 @@ async def version() -> dict[Literal["version"], str]:
     return {"version": __version__}
 
 
-# --- /scratch file-op endpoints --------------------------------------------
+# --- /workspace file-op endpoints -------------------------------------------
 #
-# These read/write a per-run scratchpad confined to SCRATCH_ROOT. They are
-# Python-free (content via the Docker archive API, search/listing via POSIX
-# grep/find/ls/rm) and NEVER touch the patch-extractor, so scratch is
-# structurally invisible to commits.
+# These read/write/search files anywhere under WORKSPACE_ROOT (repo/, skills/, tmp/).
+# They are Python-free (content via the Docker archive API, search/listing via POSIX
+# grep/find/ls/rm), so they work on images without a Python interpreter (e.g. alpine).
+# The endpoints never invoke the patch-extractor themselves, but edits under repo/ land
+# on the shared workdir volume the patch-extractor diffs, so those DO surface in the next
+# patch; skills/ and tmp/ are container-local and stay diff-invisible.
 
-_SCRATCH_ROOTS = (SCRATCH_ROOT,)
+# File ops are confined to the whole workspace (repo/, skills/, tmp/) — one prefix check.
+_WORKSPACE_ROOTS = (WORKSPACE_ROOT,)
 
 
-def _validate_scratch_dir(path: str) -> None:
-    """Validate a directory/file path for ls/grep/glob: the scratch root itself or anything under it.
+def _validate_workspace_dir(path: str) -> None:
+    """Validate a directory/file path for ls/grep/glob: the workspace root itself or anything under it.
 
     Thin HTTP wrapper over ``_validate_sandbox_path(..., allow_root=True)``: unlike the file ops
-    (which forbid the bare root), ls/grep/glob legitimately target ``/scratch`` itself. The shared
+    (which forbid the bare root), ls/grep/glob legitimately target ``/workspace`` itself. The shared
     validator still rejects ``..`` traversal, NUL, and newlines — otherwise the kernel would resolve
-    ``/scratch/../repo`` and the search would escape SCRATCH_ROOT.
+    ``/workspace/../etc`` and the search would escape WORKSPACE_ROOT.
     """
     try:
-        _validate_sandbox_path(path, allowed_roots=_SCRATCH_ROOTS, allow_root=True)
+        _validate_sandbox_path(path, allowed_roots=_WORKSPACE_ROOTS, allow_root=True)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -574,7 +583,7 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
 
 
 @asynccontextmanager
-async def _scratch_executor(http_request: Request, session_id: str) -> AsyncIterator[SandboxDockerSession]:
+async def _workspace_executor(http_request: Request, session_id: str) -> AsyncIterator[SandboxDockerSession]:
     """Acquire the session lock and yield a live cmd_executor, or 404."""
     async with http_request.app.state.session_lock_manager.acquire(session_id):
         cmd = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
@@ -583,18 +592,18 @@ async def _scratch_executor(http_request: Request, session_id: str) -> AsyncIter
         yield cmd
 
 
-@app.post("/session/{session_id}/fs/write", responses=common_responses, name="Write a scratch file")
+@app.post("/session/{session_id}/fs/write", responses=common_responses, name="Write a workspace file")
 async def fs_write(
     http_request: Request, session_id: str, request: FsWriteRequest, api_key: str = Depends(get_api_key)
 ) -> FsWriteResponse:
     try:
-        _validate_sandbox_path(request.path, allowed_roots=_SCRATCH_ROOTS)
+        _validate_sandbox_path(request.path, allowed_roots=_WORKSPACE_ROOTS)
     except ValueError as exc:
         return FsWriteResponse(ok=False, error=str(exc))
-    async with _scratch_executor(http_request, session_id) as cmd:
+    async with _workspace_executor(http_request, session_id) as cmd:
         try:
             await asyncio.to_thread(
-                cmd.write_file, request.path, request.content, mode=request.mode, allowed_roots=_SCRATCH_ROOTS
+                cmd.write_file, request.path, request.content, mode=request.mode, allowed_roots=_WORKSPACE_ROOTS
             )
         except Exception as exc:
             logger.exception("fs_write failed for %s", request.path)
@@ -602,15 +611,15 @@ async def fs_write(
         return FsWriteResponse(ok=True)
 
 
-@app.post("/session/{session_id}/fs/read", responses=common_responses, name="Read a scratch file")
+@app.post("/session/{session_id}/fs/read", responses=common_responses, name="Read a workspace file")
 async def fs_read(
     http_request: Request, session_id: str, request: FsReadRequest, api_key: str = Depends(get_api_key)
 ) -> FsReadResponse:
     try:
-        _validate_sandbox_path(request.path, allowed_roots=_SCRATCH_ROOTS)
+        _validate_sandbox_path(request.path, allowed_roots=_WORKSPACE_ROOTS)
     except ValueError as exc:
         return FsReadResponse(error=str(exc))
-    async with _scratch_executor(http_request, session_id) as cmd:
+    async with _workspace_executor(http_request, session_id) as cmd:
         try:
             raw = await asyncio.to_thread(cmd.read_file_bytes, request.path)
         except FileNotFoundError:
@@ -628,12 +637,12 @@ async def fs_read(
         return FsReadResponse(content="\n".join(page), encoding="utf-8")
 
 
-@app.post("/session/{session_id}/fs/ls", responses=common_responses, name="List a scratch directory")
+@app.post("/session/{session_id}/fs/ls", responses=common_responses, name="List a workspace directory")
 async def fs_ls(
     http_request: Request, session_id: str, request: FsLsRequest, api_key: str = Depends(get_api_key)
 ) -> FsLsResponse:
-    _validate_scratch_dir(request.path)
-    async with _scratch_executor(http_request, session_id) as cmd:
+    _validate_workspace_dir(request.path)
+    async with _workspace_executor(http_request, session_id) as cmd:
         try:
             entries = await asyncio.to_thread(cmd.list_dir, request.path)
         except Exception as exc:
@@ -642,12 +651,12 @@ async def fs_ls(
         return FsLsResponse(entries=[FsEntry(path=p, is_dir=d) for p, d in entries])
 
 
-@app.post("/session/{session_id}/fs/grep", responses=common_responses, name="Grep scratch files")
+@app.post("/session/{session_id}/fs/grep", responses=common_responses, name="Grep workspace files")
 async def fs_grep(
     http_request: Request, session_id: str, request: FsGrepRequest, api_key: str = Depends(get_api_key)
 ) -> FsGrepResponse:
-    _validate_scratch_dir(request.path)
-    async with _scratch_executor(http_request, session_id) as cmd:
+    _validate_workspace_dir(request.path)
+    async with _workspace_executor(http_request, session_id) as cmd:
         try:
             matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob)
         except Exception as exc:
@@ -656,17 +665,17 @@ async def fs_grep(
         return FsGrepResponse(matches=[FsGrepMatch(path=p, line=n, text=t) for p, n, t in matches])
 
 
-@app.post("/session/{session_id}/fs/glob", responses=common_responses, name="Glob scratch files")
+@app.post("/session/{session_id}/fs/glob", responses=common_responses, name="Glob workspace files")
 async def fs_glob(
     http_request: Request, session_id: str, request: FsGlobRequest, api_key: str = Depends(get_api_key)
 ) -> FsGlobResponse:
-    _validate_scratch_dir(request.path)
+    _validate_workspace_dir(request.path)
     # Translate the glob up front so a malformed pattern is a clean 400, not a 500.
     try:
         regex = _glob_to_regex(request.pattern)
     except re.error as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"invalid glob pattern: {exc}") from exc
-    async with _scratch_executor(http_request, session_id) as cmd:
+    async with _workspace_executor(http_request, session_id) as cmd:
         try:
             all_entries = await asyncio.to_thread(cmd.find_paths, request.path)
         except Exception as exc:
@@ -682,18 +691,23 @@ async def fs_glob(
         return FsGlobResponse(matches=matched)
 
 
-@app.post("/session/{session_id}/fs/edit", responses=common_responses, name="Edit a scratch file")
+@app.post("/session/{session_id}/fs/edit", responses=common_responses, name="Edit a workspace file")
 async def fs_edit(
     http_request: Request, session_id: str, request: FsEditRequest, api_key: str = Depends(get_api_key)
 ) -> FsEditResponse:
     try:
-        _validate_sandbox_path(request.path, allowed_roots=_SCRATCH_ROOTS)
+        _validate_sandbox_path(request.path, allowed_roots=_WORKSPACE_ROOTS)
     except ValueError as exc:
         return FsEditResponse(error=str(exc))
-    async with _scratch_executor(http_request, session_id) as cmd:
+    async with _workspace_executor(http_request, session_id) as cmd:
         try:
             count = await asyncio.to_thread(
-                cmd.edit_file, request.path, request.old, request.new, request.replace_all, allowed_roots=_SCRATCH_ROOTS
+                cmd.edit_file,
+                request.path,
+                request.old,
+                request.new,
+                request.replace_all,
+                allowed_roots=_WORKSPACE_ROOTS,
             )
         except FileNotFoundError:
             return FsEditResponse(error="file_not_found")
@@ -704,15 +718,15 @@ async def fs_edit(
         return FsEditResponse(occurrences=count)
 
 
-@app.post("/session/{session_id}/fs/delete", responses=common_responses, name="Delete a scratch file")
+@app.post("/session/{session_id}/fs/delete", responses=common_responses, name="Delete a workspace file")
 async def fs_delete(
     http_request: Request, session_id: str, request: FsDeleteRequest, api_key: str = Depends(get_api_key)
 ) -> FsDeleteResponse:
     try:
-        _validate_sandbox_path(request.path, allowed_roots=_SCRATCH_ROOTS)
+        _validate_sandbox_path(request.path, allowed_roots=_WORKSPACE_ROOTS)
     except ValueError as exc:
         return FsDeleteResponse(ok=False, error=str(exc))
-    async with _scratch_executor(http_request, session_id) as cmd:
+    async with _workspace_executor(http_request, session_id) as cmd:
         try:
             await asyncio.to_thread(cmd.delete_file, request.path)
         except Exception as exc:
