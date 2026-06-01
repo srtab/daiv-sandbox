@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock
 
+from docker.errors import APIError, NotFound
+
 from daiv_sandbox.locks import NoopSessionLockManager, SessionBusyError
 from daiv_sandbox.reaper import _list_stopped_sandbox_containers, _parse_docker_timestamp, _reap_once, _remove_guarded
 from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, TYPE_CMD_EXECUTOR
@@ -78,6 +80,38 @@ async def test_remove_guarded_skips_when_busy():
     c.remove.assert_not_called()
 
 
+async def test_remove_guarded_skips_when_running_again():
+    """A container warmed (restarted) between listing and removal must not be reaped: the re-read
+    under the lock sees status=running and skips it (closes the list-then-restart TOCTOU)."""
+    c = _stopped_container("a", "2026-06-01T00:00:00Z")
+
+    def _warm():
+        c.status = "running"
+
+    c.reload.side_effect = _warm
+    removed = await _remove_guarded(c, NoopSessionLockManager())
+    assert removed is False
+    c.remove.assert_not_called()
+
+
+async def test_remove_guarded_treats_vanished_as_removed():
+    """A container that vanished between listing and the under-lock reload counts as reaped."""
+    c = _stopped_container("a", "2026-06-01T00:00:00Z")
+    c.reload.side_effect = NotFound("gone")
+    removed = await _remove_guarded(c, NoopSessionLockManager())
+    assert removed is True
+    c.remove.assert_not_called()
+
+
+async def test_remove_guarded_swallows_docker_error():
+    """A Docker error during removal is logged and swallowed (returns False) so one bad container
+    can't abort the rest of the sweep."""
+    c = _stopped_container("a", "2026-06-01T00:00:00Z")
+    c.remove.side_effect = APIError("boom")
+    removed = await _remove_guarded(c, NoopSessionLockManager())
+    assert removed is False
+
+
 async def test_reap_once_removes_only_aged_out():
     old = _stopped_container("old", "2026-05-31T00:00:00Z")  # >12h before NOW
     fresh = _stopped_container("fresh", "2026-06-01T11:59:00Z")  # 1m before NOW
@@ -103,6 +137,19 @@ async def test_reap_once_lru_evicts_oldest_beyond_cap():
     c1.remove.assert_called_once_with(force=True)
     c2.remove.assert_called_once_with(force=True)
     c3.remove.assert_not_called()
+
+
+async def test_reap_once_max_stopped_zero_evicts_all():
+    """max_stopped=0 means retain none: every within-grace survivor is LRU-evicted."""
+    c1 = _stopped_container("c1", "2026-06-01T11:00:00Z")  # within grace
+    c2 = _stopped_container("c2", "2026-06-01T11:30:00Z")  # within grace
+    client = Mock()
+    client.containers.list.return_value = [c1, c2]
+
+    await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=0)
+
+    c1.remove.assert_called_once_with(force=True)
+    c2.remove.assert_called_once_with(force=True)
 
 
 async def test_maybe_reap_runs_directly_without_redis():

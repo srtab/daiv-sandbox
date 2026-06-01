@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `fs/ls`, `fs/glob`, and `fs/grep` on a path that does not exist now return an empty result (`{"entries"/"matches": [], "error": null}`) instead of a populated `error` field plus an ERROR-level traceback in the server logs. The underlying primitives (`list_dir`/`find_paths`/`grep`) distinguish a genuinely absent path (reported as `FileNotFoundError` via an explicit existence probe, because the tools' own exit codes are ambiguous between "missing" and "permission denied") from a real failure, which still surfaces an error. This silences the log noise from callers probing optional directories most repos lack (e.g. `.claude/skills`, `.cursor/skills`, `.agents/skills`).
+- Reaper no longer removes a session that was warmed (restarted via `GET`/`run`/`fs`) between the sweep's listing and the removal: it re-reads the container state under the per-session lock and skips a container that is running again, closing a time-of-check/time-of-use race that could reap a session mid-use.
+- `GET`/`run`/`seed`/`fs` on a session whose container exists but fails to **restart** now returns `503` (a retryable infrastructure fault) instead of masking the Docker error as a `404 "not found"` — which previously led clients to spin up new containers against a degraded daemon. A genuinely missing (or not-yet-warmable) container still returns `404`.
+- `DELETE /session/{id}/` now returns `503` when the Docker daemon fails to stop the container (previously a bare `500` with a stack trace), so clients can tell the session may still be running. A container that vanished before the stop is treated as already-stopped.
+- `copy_to_container` checks the `chmod` result before running `chown`, so a permission-normalization failure is attributed to the step that actually failed instead of running `chown` against a still-mis-permissioned tree and reporting the wrong error.
+- The `fs/*` endpoints no longer swallow unexpected exceptions into a `200` response with an error string: only the expected operational failures (`RuntimeError`, and the create-only `FileExistsError` for `write`) are reported in-body, while programming errors and Docker transport faults now propagate to a real `500` so they surface in metrics/Sentry.
 
 ## [0.5.0] - 2026-05-04
 

@@ -49,6 +49,7 @@ from daiv_sandbox.sessions import (
     TYPE_CMD_EXECUTOR,
     WORKSPACE_ROOT,
     SandboxDockerSession,
+    SessionUnavailableError,
     _validate_sandbox_path,
 )
 
@@ -151,6 +152,16 @@ async def _handle_session_busy(request: Request, exc: SessionBusyError) -> Respo
     return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": "Session is busy"})
 
 
+@app.exception_handler(SessionUnavailableError)
+async def _handle_session_unavailable(request: Request, exc: SessionUnavailableError) -> Response:
+    # The container exists but a Docker fault prevented restarting/stopping it. This is an
+    # infrastructure problem, not a missing session, so report 503 (retryable) rather than masking
+    # it as a 404 or surfacing a bare 500.
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"detail": str(exc)})
+
+
 api_key_header = APIKeyHeader(
     name=HEADER_API_KEY_NAME,
     auto_error=False,
@@ -179,6 +190,10 @@ common_responses = {
     },
     status.HTTP_409_CONFLICT: {
         "content": {"application/json": {"example": {"detail": "Session is busy"}}},
+        "model": ErrorMessage,
+    },
+    status.HTTP_503_SERVICE_UNAVAILABLE: {
+        "content": {"application/json": {"example": {"detail": "Session could not be restarted"}}},
         "model": ErrorMessage,
     },
 }
@@ -462,7 +477,10 @@ async def fs_write(
         except FileExistsError as exc:
             # Expected create-only conflict: surface it quietly (no ERROR-level traceback).
             return FsWriteResponse(ok=False, error=str(exc))
-        except Exception as exc:
+        except RuntimeError as exc:
+            # Expected operational failure (copy/probe). Anything else (programming error, Docker
+            # transport fault) propagates to a real 500 so it surfaces in metrics/Sentry rather than
+            # hiding behind a 200 with an error string.
             logger.exception("fs_write failed for %s", request.path)
             return FsWriteResponse(ok=False, error=str(exc))
         return FsWriteResponse(ok=True)
@@ -517,7 +535,8 @@ async def fs_ls(
             # A missing directory is not an error for a listing probe (e.g. callers checking
             # optional skills dirs most repos lack); return an empty listing quietly.
             return FsLsResponse(entries=[])
-        except Exception as exc:
+        except RuntimeError as exc:
+            # Expected listing failure (e.g. permission denied). Unexpected errors propagate to 500.
             logger.exception("fs_ls failed for %s", request.path)
             return FsLsResponse(error=str(exc))
         return FsLsResponse(entries=[FsEntry(path=p, is_dir=d) for p, d in entries])
@@ -534,7 +553,8 @@ async def fs_grep(
         except FileNotFoundError:
             # A missing search path is not an error for a probe; return no matches quietly.
             return FsGrepResponse(matches=[])
-        except Exception as exc:
+        except RuntimeError as exc:
+            # Expected search failure (e.g. grep exit >= 2). Unexpected errors propagate to 500.
             logger.exception("fs_grep failed for %s", request.path)
             return FsGrepResponse(error=str(exc))
         return FsGrepResponse(matches=[FsGrepMatch(path=p, line=n, text=t) for p, n, t in matches])
@@ -553,7 +573,8 @@ async def fs_glob(
         except FileNotFoundError:
             # A missing base directory is not an error for a probe; return no matches quietly.
             return FsGlobResponse(matches=[])
-        except Exception as exc:
+        except RuntimeError as exc:
+            # Expected traversal failure (e.g. find exit != 0). Unexpected errors propagate to 500.
             logger.exception("fs_glob failed for %s", request.path)
             return FsGlobResponse(error=str(exc))
         base = request.path.rstrip("/")
@@ -606,7 +627,9 @@ async def fs_delete(
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             await asyncio.to_thread(cmd.delete_file, request.path)
-        except Exception as exc:
+        except RuntimeError as exc:
+            # Expected rm failure (e.g. target is a non-empty directory). Unexpected errors propagate
+            # to a real 500 rather than hiding behind a 200 with an error string.
             logger.exception("fs_delete failed for %s", request.path)
             return FsDeleteResponse(ok=False, error=str(exc))
         return FsDeleteResponse(ok=True)

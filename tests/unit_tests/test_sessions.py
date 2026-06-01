@@ -3,7 +3,7 @@ import tarfile
 from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
-from docker.errors import ImageNotFound, NotFound
+from docker.errors import APIError, ImageNotFound, NotFound
 from docker.models.containers import ExecResult
 from docker.models.images import Image
 
@@ -17,6 +17,7 @@ from daiv_sandbox.sessions import (
     SKILLS_ROOT,
     WORKSPACE_ROOT,
     SandboxDockerSession,
+    SessionUnavailableError,
     _build_single_file_tar_stream,
     _sanitize_archive_stream,
     _validate_sandbox_path,
@@ -173,6 +174,91 @@ def test_stop_container_with_container_not_found(mock_docker_client):
     mock_docker_client.containers.get.side_effect = NotFound(session.session_id)
     session.stop_container()  # must not raise
     mock_docker_client.containers.get.return_value.stop.assert_not_called()
+
+
+def test_stop_container_vanished_before_stop_is_noop(mock_docker_client):
+    """A container removed between the lookup and the stop counts as already-stopped (no raise)."""
+    session = SandboxDockerSession(session_id="test-session-id")
+    mock_docker_client.containers.get.return_value.stop.side_effect = NotFound("gone")
+    session.stop_container()  # must not raise
+
+
+def test_stop_container_raises_session_unavailable_on_api_error(mock_docker_client):
+    """A Docker API fault on stop surfaces as SessionUnavailableError (mapped to 503), not a bare
+    500 — the session may still be running and the client must be able to tell."""
+    session = SandboxDockerSession(session_id="test-session-id")
+    mock_docker_client.containers.get.return_value.stop.side_effect = APIError("daemon busy")
+    with pytest.raises(SessionUnavailableError):
+        session.stop_container()
+
+
+def _bare_session(client):
+    """A session whose __init__ is bypassed so _get_container can be driven against *client*."""
+    s = SandboxDockerSession.__new__(SandboxDockerSession)
+    s.client = client
+    s.session_id = "sid"
+    s.container = None
+    return s
+
+
+def test_get_container_returns_running_container():
+    container = Mock(status="running")
+    client = Mock()
+    client.containers.get.return_value = container
+    assert _bare_session(client)._get_container("sid") is container
+    container.restart.assert_not_called()
+
+
+def test_get_container_restarts_stopped_container():
+    """A stopped container is restarted and reloaded; once running it is returned (warm reuse)."""
+    container = Mock(status="exited")
+
+    def _warm():
+        container.status = "running"
+
+    container.reload.side_effect = _warm
+    client = Mock()
+    client.containers.get.return_value = container
+
+    result = _bare_session(client)._get_container("sid")
+
+    container.restart.assert_called_once()
+    container.reload.assert_called_once()
+    assert result is container
+
+
+def test_get_container_returns_none_when_missing():
+    client = Mock()
+    client.containers.get.side_effect = NotFound("nope")
+    assert _bare_session(client)._get_container("sid") is None
+
+
+def test_get_container_returns_none_when_restart_does_not_take():
+    """A restart that does not raise but leaves the container not-running is a benign 404, not a
+    503 — keep returning None."""
+    container = Mock(status="exited")  # reload leaves it stopped
+    client = Mock()
+    client.containers.get.return_value = container
+    assert _bare_session(client)._get_container("sid") is None
+
+
+def test_get_container_returns_none_when_vanishes_during_restart():
+    container = Mock(status="exited")
+    container.restart.side_effect = NotFound("gone")
+    client = Mock()
+    client.containers.get.return_value = container
+    assert _bare_session(client)._get_container("sid") is None
+
+
+def test_get_container_raises_session_unavailable_on_restart_fault():
+    """A Docker fault while restarting is infrastructure, not a missing session: raise so the
+    endpoint returns 503 instead of masking it as a 404."""
+    container = Mock(status="exited")
+    container.restart.side_effect = APIError("daemon down")
+    client = Mock()
+    client.containers.get.return_value = container
+    with pytest.raises(SessionUnavailableError):
+        _bare_session(client)._get_container("sid")
 
 
 def test_copy_to_runtime_creates_directory(mock_docker_client):
@@ -559,6 +645,32 @@ def test_copy_to_container_allows_bare_workspace_root(mock_docker_client):
     buf.seek(0)
 
     session.copy_to_container(buf, dest=WORKSPACE_ROOT, clear_before_copy=False)
+
+
+def test_copy_to_container_chmod_failure_skips_chown(mock_docker_client):
+    """A failed chmod is raised before chown runs, so the error is attributed correctly and chown
+    is not run against a still-mis-permissioned tree."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.container.put_archive.return_value = True
+    session.container.exec_run.side_effect = [
+        ExecResult(exit_code=0, output=b""),  # rm (clear_before_copy default)
+        ExecResult(exit_code=0, output=b""),  # mkdir
+        ExecResult(exit_code=1, output=b"chmod: boom"),  # chmod fails
+    ]
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="a.txt")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
+
+    with pytest.raises(RuntimeError, match="normalize permissions"):
+        session.copy_to_container(buf)
+
+    chown_calls = [c for c in session.container.exec_run.call_args_list if c.args and c.args[0][0] == "chown"]
+    assert chown_calls == []
 
 
 def test_copy_to_container_rejects_dest_traversal(mock_docker_client):

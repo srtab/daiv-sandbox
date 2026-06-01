@@ -48,12 +48,22 @@ def _list_stopped_sandbox_containers(client) -> list:
 async def _remove_guarded(container, lock_manager) -> bool:
     """Force-remove *container* while holding its per-session lock.
 
-    Returns True if removal was attempted, False if the session was busy (a request — e.g. a
-    restart-on-access — is in flight, so we skip and let the next sweep retry). Tolerates a
-    container that vanished between listing and removal.
+    Re-reads the container state under the lock before removing it: a request (e.g. a GET/run
+    restart-on-access) may have warmed the container between the sweep's listing and now, which
+    makes the list-time ``FinishedAt`` decision stale (a TOCTOU). The per-session lock serializes
+    against in-flight requests, but it does not by itself prevent removing a container that was
+    restarted just before the lock was acquired — so we re-check ``status`` and skip a session that
+    is running again.
+
+    Returns True if the container was removed (or had already vanished), False if the session was
+    busy or is back in use (skip and let a later sweep retry).
     """
     try:
         async with lock_manager.acquire(container.id):
+            await asyncio.to_thread(container.reload)
+            if getattr(container, "status", None) == "running":
+                logger.info("Reaper: container %s is running again; skipping removal", container.id)
+                return False
             await asyncio.to_thread(container.remove, force=True)
     except SessionBusyError:
         logger.info("Reaper: session %s busy; skipping this tick", container.id)

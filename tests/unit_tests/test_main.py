@@ -265,6 +265,67 @@ def test_run_commands_single_command_fail_fast_true(mock_session, client):  # no
     assert mock_session.execute_command.call_count == 1
 
 
+def test_run_commands_timeout_returns_124(mock_session, client):
+    """A command that exceeds its timeout is reported with exit code 124 and a 'timed out' message.
+
+    `execute_command` raising TimeoutError stands in for the wall-clock timeout: asyncio.wait_for
+    propagates it into the same handler that a real timeout hits."""
+    mock_session.execute_command.side_effect = TimeoutError
+    resp = client.post(f"/session/{mock_session.session_id}/", json={"commands": ["sleep 99"], "timeout": 5})
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert len(results) == 1
+    assert results[0]["exit_code"] == 124
+    assert "timed out after 5s" in results[0]["output"].lower()
+
+
+def test_run_commands_timeout_stops_remaining_commands(mock_session, client):
+    """A timeout terminates the sequence: later commands in the same request are not executed."""
+    mock_session.execute_command.side_effect = [
+        TimeoutError,
+        RunResult(command="cmd2", output="should not run", exit_code=0, workdir="/workspace/repo"),
+    ]
+    resp = client.post(f"/session/{mock_session.session_id}/", json={"commands": ["cmd1", "cmd2"], "timeout": 3})
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert len(results) == 1
+    assert results[0]["exit_code"] == 124
+    assert mock_session.execute_command.call_count == 1
+
+
+def test_run_commands_request_timeout_overrides_server_default(mock_session, client, monkeypatch):
+    """The request `timeout` wins over the server default (DAIV_SANDBOX_COMMAND_TIMEOUT)."""
+    monkeypatch.setattr(settings, "COMMAND_TIMEOUT", 99)
+    mock_session.execute_command.side_effect = TimeoutError
+    resp = client.post(f"/session/{mock_session.session_id}/", json={"commands": ["x"], "timeout": 5})
+    assert resp.status_code == 200, resp.text
+    assert "timed out after 5s" in resp.json()["results"][0]["output"].lower()
+
+
+def test_run_commands_uses_server_default_timeout_when_unset(mock_session, client, monkeypatch):
+    """Omitting `timeout` falls back to the server default."""
+    monkeypatch.setattr(settings, "COMMAND_TIMEOUT", 7)
+    mock_session.execute_command.side_effect = TimeoutError
+    resp = client.post(f"/session/{mock_session.session_id}/", json={"commands": ["x"]})
+    assert resp.status_code == 200, resp.text
+    assert "timed out after 7s" in resp.json()["results"][0]["output"].lower()
+
+
+def test_run_commands_zero_timeout_disables_timeout(mock_session, client, monkeypatch):
+    """timeout=0 (and a 0 server default) means no timeout is enforced: a normal command succeeds
+    rather than every command being killed."""
+    monkeypatch.setattr(settings, "COMMAND_TIMEOUT", 0)
+    mock_session.execute_command.return_value = RunResult(
+        command="echo", output="ok", exit_code=0, workdir="/workspace/repo"
+    )
+    resp = client.post(f"/session/{mock_session.session_id}/", json={"commands": ["echo"], "timeout": 0})
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert len(results) == 1
+    assert results[0]["exit_code"] == 0
+    assert results[0]["output"] == "ok"
+
+
 def test_run_commands_returns_conflict_when_session_is_locked(mock_session, client, monkeypatch):
     monkeypatch.setattr(app.state, "session_lock_manager", BusySessionLockManager())
 
@@ -311,6 +372,47 @@ def test_start_session_starts_single_container(client):
         assert "volumes" not in mock_session_class.start.call_args.kwargs
         # No shared volume is created (the sidecar/volume path is gone).
         mock_session_class.create_named_volume.assert_not_called()
+
+
+def test_start_session_isolates_network_by_default(client):
+    """Without network_enabled, the container is started with network_mode='none' (a security
+    control): a regression that silently enabled the network would be caught here."""
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.session_id = "id"
+        mock_session_class.start.return_value = mock_cmd_executor
+
+        response = client.post("/session/", json={"base_image": "python:3.12"})
+
+        assert response.status_code == 200, response.text
+        assert mock_session_class.start.call_args.kwargs["network_mode"] == "none"
+
+
+def test_start_session_passes_resource_limits(client):
+    """memory_bytes/cpus/environment map onto the container start; network_enabled drops the
+    network_mode isolation."""
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.session_id = "id"
+        mock_session_class.start.return_value = mock_cmd_executor
+
+        response = client.post(
+            "/session/",
+            json={
+                "base_image": "python:3.12",
+                "network_enabled": True,
+                "memory_bytes": 1024,
+                "cpus": 1.5,
+                "environment": {"FOO": "bar"},
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        kwargs = mock_session_class.start.call_args.kwargs
+        assert kwargs["mem_limit"] == 1024
+        assert kwargs["cpus"] == 1.5
+        assert kwargs["environment"] == {"FOO": "bar"}
+        assert "network_mode" not in kwargs  # network_enabled=True -> no isolation
 
 
 def test_close_session_stops_container_by_default(client):
@@ -921,6 +1023,40 @@ def test_fs_edit_success_returns_count(mock_session, client):
         json={"path": "/workspace/tmp/a.txt", "old": "x", "new": "y", "replace_all": True},
     )
     assert resp.json()["occurrences"] == 2
+
+
+def test_fs_delete_success(mock_session, client):
+    mock_session.delete_file.return_value = None
+    resp = client.post(f"/session/{mock_session.session_id}/fs/delete", json={"path": "/workspace/tmp/a.txt"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"ok": True, "error": None}
+    mock_session.delete_file.assert_called_once()
+
+
+def test_fs_delete_rejects_outside_workspace(mock_session, client):
+    """A path outside /workspace is rejected (ok=False) and never reaches the destructive rm."""
+    resp = client.post(f"/session/{mock_session.session_id}/fs/delete", json={"path": "/etc/evil"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is False
+    mock_session.delete_file.assert_not_called()
+
+
+def test_fs_delete_rejects_bare_workspace_root(mock_session, client):
+    """The bare /workspace root cannot be deleted (file ops forbid the bare root)."""
+    resp = client.post(f"/session/{mock_session.session_id}/fs/delete", json={"path": "/workspace"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is False
+    mock_session.delete_file.assert_not_called()
+
+
+def test_fs_delete_surfaces_runtime_error(mock_session, client):
+    """A genuine rm failure (e.g. target is a directory) is surfaced as ok=False with an error."""
+    mock_session.delete_file.side_effect = RuntimeError("rm failed: is a directory")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/delete", json={"path": "/workspace/tmp/d"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["error"] is not None
 
 
 def test_fs_endpoints_404_when_container_missing(mock_session, client):

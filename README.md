@@ -148,13 +148,13 @@ A freshly-started session has empty `/workspace/repo` and `/workspace/skills` di
 
 Both fields are optional individually, but **at least one must be provided** — a request with neither returns `422`. Seeding is **one-shot per session** — a second call returns `409 Conflict`.
 
-Archives may be plain `tar` or gzip-compressed (`tar.gz`); they are sanitised and streamed into the container without being fully buffered in memory.
+Archives may be plain `tar` or compressed with gzip, bzip2, xz, or zstd; the compression is auto-detected. They are sanitised and streamed into the container without being fully buffered in memory.
 
-| Parameter        | Description                                                        | Required          | Valid Values               |
-| ---------------- | ------------------------------------------------------------------ | ----------------- | -------------------------- |
-| `repo_archive`   | Tar archive that becomes the initial state of `/workspace/repo`.   | At least one of   | `tar` or `tar.gz` (binary) |
-| `skills_archive` | Tar archive that becomes the initial state of `/workspace/skills`. | `repo_archive` or | `tar` or `tar.gz` (binary) |
-|                  |                                                                    | `skills_archive`  |                            |
+| Parameter        | Description                                                        | Required          | Valid Values                     |
+| ---------------- | ------------------------------------------------------------------ | ----------------- | -------------------------------- |
+| `repo_archive`   | Tar archive that becomes the initial state of `/workspace/repo`.   | At least one of   | `tar` (optionally gz/bz2/xz/zst) |
+| `skills_archive` | Tar archive that becomes the initial state of `/workspace/skills`. | `repo_archive` or | `tar` (optionally gz/bz2/xz/zst) |
+|                  |                                                                    | `skills_archive`  |                                  |
 
 ```sh
 $ curl -X POST \
@@ -180,7 +180,13 @@ To inspect or modify files without spawning a shell, use the `POST /session/{ses
 | `edit`   | `{path, old, new, replace_all?}` | `{occurrences, error?}`     |
 | `delete` | `{path}`                         | `{ok, error?}`              |
 
-`path` must be absolute and under `/workspace`; the file ops (`write`/`edit`/`read`/`delete`) target a file, while the directory ops (`ls`/`grep`/`glob`) may also target the `/workspace` root itself. `content` is base64-encoded. Every response also carries an `error` field, set when the operation fails (e.g. invalid path, missing file). `read` additionally returns a human-readable sentinel string for an empty file (with `encoding: "utf-8"`), and an `error` when `offset` exceeds the file length. The sandbox is the single source of truth: edits under `/workspace/repo` (via bash or `fs/*`) land directly on the container's workspace, while `skills/` and `tmp/` stay container-local.
+`path` must be absolute and under `/workspace`; the file ops (`write`/`edit`/`read`/`delete`) target a file, while the directory ops (`ls`/`grep`/`glob`) may also target the `/workspace` root itself. `content` is base64-encoded. Every response also carries an `error` field, set when the operation fails (e.g. invalid path, missing file).
+
+`read` has a few additional behaviors: an empty file returns a human-readable sentinel string (with `encoding: "utf-8"`); an `offset` beyond the file length returns an `error`; a single response is capped at 512000 bytes — a larger text page is truncated with a marker (continue with a larger `offset`/smaller `limit`), and a binary file over the cap returns an `error` rather than a base64 blob.
+
+The sandbox is the single source of truth: edits under `/workspace/repo` (via bash or `fs/*`) land directly on the container's workspace, while `skills/` and `tmp/` stay container-local.
+
+> **Path confinement is lexical.** The `path` validator rejects `..` traversal, NUL, and newlines and requires the path to be under `/workspace`, but it does not resolve symlinks. Code executed in the container (via `POST /session/{id}/`) can create a symlink under `/workspace` pointing elsewhere, which `fs/read` would then follow. This grants no capability beyond running commands in the container — the **container** (gVisor / non-root) is the trust boundary, not the `/workspace` prefix.
 
 ```sh
 $ curl -X POST \

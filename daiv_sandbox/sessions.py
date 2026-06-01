@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import IO, TYPE_CHECKING, NamedTuple
 
 from docker import DockerClient, from_env
-from docker.errors import ImageNotFound, NotFound
+from docker.errors import APIError, ImageNotFound, NotFound
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.schemas import RunResult
@@ -30,6 +30,20 @@ SCRATCH_ROOT = "/workspace/tmp"
 # Container label identifying daiv-sandbox cmd-executor containers (used for discovery/reaping).
 DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
 TYPE_CMD_EXECUTOR = "cmd_executor"
+
+
+class SessionUnavailableError(RuntimeError):
+    """A session's container exists but could not be brought to (or left in) the desired state.
+
+    Distinct from a genuinely missing session (which maps to 404): this signals an infrastructure
+    fault (Docker daemon/runtime error) while restarting or stopping a container, and is mapped to
+    503 so clients retry/alert instead of assuming the session was legitimately gone.
+    """
+
+    def __init__(self, session_id: str, action: str):
+        super().__init__(f"Session '{session_id}' could not be {action}")
+        self.session_id = session_id
+        self.action = action
 
 
 class DirEntry(NamedTuple):
@@ -367,14 +381,27 @@ class SandboxDockerSession:
         Idempotent: a missing container is logged and ignored; an already-stopped container is a
         Docker no-op. PID 1 is ``sleep``, which ignores SIGTERM, so ``stop`` waits the (small)
         ``STOP_TIMEOUT_SECONDS`` and then SIGKILLs — the filesystem is preserved either way.
+
+        A container that vanished between the lookup and the stop counts as already-stopped. Any
+        other Docker error (daemon busy, stop conflict) is raised as ``SessionUnavailableError`` so
+        the DELETE endpoint returns 503 rather than a bare 500 — the session may still be running.
         """
         try:
             container = self.client.containers.get(self.session_id)
         except NotFound:
             logger.warning("Container '%s' not found", self.session_id)
-        else:
+            return
+
+        try:
             container.stop(timeout=settings.STOP_TIMEOUT_SECONDS)
-            logger.info("Container '%s' stopped", self.session_id)
+        except NotFound:
+            # Removed between the lookup and the stop: a stop is already satisfied.
+            logger.warning("Container '%s' vanished before it could be stopped", self.session_id)
+            return
+        except APIError as exc:
+            logger.exception("Failed to stop container '%s'", self.session_id)
+            raise SessionUnavailableError(self.session_id, "stopped") from exc
+        logger.info("Container '%s' stopped", self.session_id)
 
     def copy_to_container(self, tardata: IO[bytes], dest: str | None = None, clear_before_copy: bool = True):
         """
@@ -430,25 +457,29 @@ class SandboxDockerSession:
             sanitized.seek(0)
             put_ok = self.container.put_archive(to_dir_norm, sanitized)
 
-        if put_ok:
-            # Normalize permissions/ownership on the extracted tree.
-            #
-            # NOTE: The archive is sanitized to disallow symlinks/hardlinks, which avoids dangerous recursive
-            # chmod/chown dereferencing behavior on attacker-controlled link targets.
-            chmod_result = self.container.exec_run(["chmod", "-R", "a+rX,u+w", "--", to_dir_norm], user="root")
-            chown_result = self.container.exec_run(["chown", "-R", self._get_user(), "--", to_dir_norm], user="root")
-            if chmod_result.exit_code != 0:
-                raise RuntimeError(
-                    f"Failed to normalize permissions of {self.container.short_id}:{to_dir_norm}: "
-                    f"(exit_code: {chmod_result.exit_code}) -> {chmod_result.output}"
-                )
-            if chown_result.exit_code != 0:
-                raise RuntimeError(
-                    f"Failed to normalize ownership for {self.container.short_id}:{to_dir_norm}: "
-                    f"(exit_code: {chown_result.exit_code}) -> {chown_result.output}"
-                )
-        else:
+        if not put_ok:
             raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{to_dir_norm}")
+
+        # Normalize permissions/ownership on the extracted tree. Check chmod *before* running chown,
+        # so a failure is attributed to the step that actually failed — previously both ran
+        # unconditionally and a chmod failure was reported even though chown had already run against
+        # the same (still mis-permissioned) tree.
+        #
+        # NOTE: The archive is sanitized to disallow symlinks/hardlinks, which avoids dangerous recursive
+        # chmod/chown dereferencing behavior on attacker-controlled link targets.
+        chmod_result = self.container.exec_run(["chmod", "-R", "a+rX,u+w", "--", to_dir_norm], user="root")
+        if chmod_result.exit_code != 0:
+            raise RuntimeError(
+                f"Failed to normalize permissions of {self.container.short_id}:{to_dir_norm}: "
+                f"(exit_code: {chmod_result.exit_code}) -> {chmod_result.output}"
+            )
+
+        chown_result = self.container.exec_run(["chown", "-R", self._get_user(), "--", to_dir_norm], user="root")
+        if chown_result.exit_code != 0:
+            raise RuntimeError(
+                f"Failed to normalize ownership for {self.container.short_id}:{to_dir_norm}: "
+                f"(exit_code: {chown_result.exit_code}) -> {chown_result.output}"
+            )
 
     def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
         """
@@ -727,32 +758,40 @@ class SandboxDockerSession:
         """
         Get the container by ID. If the container is not running, attempt to restart it.
 
-        Args:
-
-        Returns:
-            Container | None: The container object if it exists and is running, None otherwise.
+        Returns the container when it exists and is running. Returns ``None`` for a genuinely missing
+        session (so the endpoint maps it to 404) — including a container that vanished mid-restart, or
+        one that does not come back up after a clean restart. Raises ``SessionUnavailableError`` when
+        the restart itself fails with a Docker fault (daemon/runtime error): that is an infrastructure
+        problem, not a missing session, so the endpoint must surface 503 rather than masking it as 404.
         """
         try:
             container = self.client.containers.get(session_id)
         except NotFound:
             return None
 
-        try:
-            if container.status != "running":
-                logger.warning(
-                    "Container '%s' is not running (status: %s). Attempting to restart...",
-                    container.short_id,
-                    container.status,
-                )
-                container.restart()
-                container.reload()
+        if container.status == "running":
+            return container
 
-        except Exception:
-            logger.exception("Failed to ensure container %s is running", container.short_id)
+        logger.warning(
+            "Container '%s' is not running (status: %s). Attempting to restart...", container.short_id, container.status
+        )
+        try:
+            container.restart()
+            container.reload()
+        except NotFound:
+            # Removed between the lookup and the restart: treat as a missing session (404).
             return None
-        else:
-            if container.status != "running":
-                logger.error("Failed to restart container %s. Current status: %s", container.short_id, container.status)
-                return None
+        except Exception as exc:
+            # A restart fault is an infrastructure error, not a missing session. Surface it so the
+            # endpoint returns 503 instead of a misleading 404 that makes clients spin up new
+            # containers against a degraded daemon.
+            logger.exception("Failed to restart container %s", container.short_id)
+            raise SessionUnavailableError(session_id, "restarted") from exc
+
+        if container.status != "running":
+            # Restart didn't raise but the container still isn't up. This is not a daemon fault, so
+            # keep the benign behavior: report it as a session that can't be warmed (404).
+            logger.error("Failed to restart container %s. Current status: %s", container.short_id, container.status)
+            return None
 
         return container
