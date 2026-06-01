@@ -554,6 +554,34 @@ def test_fs_write_rejects_path_outside_workspace_repo_sibling(mock_session, clie
     mock_session.write_file.assert_not_called()
 
 
+def test_fs_write_conflict_returns_quiet_error(mock_session, client):
+    """A create-only conflict (write_file raises FileExistsError) is surfaced as ok=False with the
+    deepagents message — not an HTTP error."""
+    mock_session.write_file.side_effect = FileExistsError(
+        "Cannot write to /workspace/tmp/a.txt because it already exists. "
+        "Read and then make an edit, or write to a new path."
+    )
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/write",
+        json={"path": "/workspace/tmp/a.txt", "content": base64.b64encode(b"x").decode(), "mode": 0o644},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is False
+    assert "already exists" in body["error"]
+
+
+def test_fs_write_passes_create_only(mock_session, client):
+    """fs/write requests create-only semantics from the session layer."""
+    mock_session.write_file.return_value = None
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/write",
+        json={"path": "/workspace/tmp/a.txt", "content": base64.b64encode(b"x").decode(), "mode": 0o644},
+    )
+    assert resp.status_code == 200, resp.text
+    assert mock_session.write_file.call_args.kwargs.get("create_only") is True
+
+
 def test_fs_ls_returns_entries(mock_session, client):
     mock_session.list_dir.return_value = [("/workspace/tmp/sub", True), ("/workspace/tmp/f.py", False)]
     resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/workspace/tmp"})

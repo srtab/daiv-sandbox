@@ -478,18 +478,39 @@ class SandboxDockerSession:
         return RunResult(command=command, output=output, exit_code=result.exit_code, workdir=command_workdir)
 
     def write_file(
-        self, path: str, content: bytes, *, mode: int, allowed_roots: tuple[str, ...] = (SANDBOX_ROOT,)
+        self,
+        path: str,
+        content: bytes,
+        *,
+        mode: int,
+        allowed_roots: tuple[str, ...] = (SANDBOX_ROOT,),
+        create_only: bool = False,
     ) -> None:
         """
         Write *content* to *path* (absolute, under one of *allowed_roots*) inside the container.
 
         The path is validated lexically. The content is shipped via a single-file tar
         through the existing copy_to_container pipeline (sanitised, mode preserved).
+
+        When *create_only* is True, refuse to overwrite an existing path (matching deepagents'
+        create-only ``write`` contract). The check probes existence with ``[ -e ]``; there is an
+        inherent TOCTOU window between the probe and the write. The default (False) overwrites,
+        which is what ``edit_file``'s write-back relies on.
         """
         canonical = _validate_sandbox_path(path, allowed_roots=allowed_roots)
         parent_dir, _, filename = canonical.rpartition("/")
         if not parent_dir or not filename:
             raise ValueError(f"path resolves to an unusable location: {path!r}")
+
+        if create_only:
+            # `|| true` keeps the exit code 0 on the common (absent) path so execute_command does not
+            # log a spurious warning; presence is signalled by the EXISTS marker on stdout.
+            probe = self.execute_command(f"[ -e {_sh_quote(canonical)} ] && printf EXISTS || true")
+            if probe.output.strip() == "EXISTS":
+                raise FileExistsError(
+                    f"Cannot write to {path} because it already exists. "
+                    "Read and then make an edit, or write to a new path."
+                )
 
         with _build_single_file_tar_stream(filename, content, mode=mode) as tar_stream:
             self.copy_to_container(tar_stream, dest=parent_dir, clear_before_copy=False)

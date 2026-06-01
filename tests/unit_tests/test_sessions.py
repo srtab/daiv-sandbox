@@ -438,6 +438,33 @@ def test_write_file_rejects_nul_in_path(mock_docker_client):
         session.write_file(f"{SANDBOX_ROOT}/foo\x00bar", b"x", mode=0o644)
 
 
+def test_write_file_create_only_rejects_existing(mock_docker_client):
+    """create_only=True refuses to overwrite: an existence probe that finds the file raises
+    FileExistsError before any archive is copied."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="EXISTS"))
+    s.copy_to_container = Mock()
+    with pytest.raises(FileExistsError, match="already exists"):
+        s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
+    s.copy_to_container.assert_not_called()
+
+
+def test_write_file_create_only_allows_new(mock_docker_client):
+    """create_only=True writes when the probe reports the path is absent."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    s.copy_to_container = Mock()
+    s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
+    s.copy_to_container.assert_called_once()
+
+
+def test_edit_file_write_back_does_not_use_create_only():
+    """edit's write-back must overwrite the file it just read (create_only must stay falsy)."""
+    s = _edit_session(b"hello world\n")
+    s.edit_file("/scratch/a.txt", "world", "there", replace_all=False, allowed_roots=("/scratch",))
+    assert not s.write_file.call_args.kwargs.get("create_only")
+
+
 def test_copy_to_container_allows_skills_root(mock_docker_client):
     """copy_to_container accepts /skills (and subdirs) as a destination."""
     session = SandboxDockerSession()

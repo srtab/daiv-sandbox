@@ -425,8 +425,16 @@ async def fs_write(
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             await asyncio.to_thread(
-                cmd.write_file, request.path, request.content, mode=request.mode, allowed_roots=_WORKSPACE_ROOTS
+                cmd.write_file,
+                request.path,
+                request.content,
+                mode=request.mode,
+                allowed_roots=_WORKSPACE_ROOTS,
+                create_only=True,
             )
+        except FileExistsError as exc:
+            # Expected create-only conflict: surface it quietly (no ERROR-level traceback).
+            return FsWriteResponse(ok=False, error=str(exc))
         except Exception as exc:
             logger.exception("fs_write failed for %s", request.path)
             return FsWriteResponse(ok=False, error=str(exc))
