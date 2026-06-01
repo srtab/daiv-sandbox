@@ -740,6 +740,40 @@ def test_fs_read_offset_beyond_eof(mock_session, client):
     assert "offset" in resp.json()["error"].lower()
 
 
+def test_fs_read_text_truncated_at_cap(mock_session, client):
+    """A text page larger than the byte-cap is truncated to the cap and ends with the marker."""
+    from daiv_sandbox.main import READ_MAX_OUTPUT_BYTES
+
+    mock_session.read_file_bytes.return_value = b"a" * (READ_MAX_OUTPUT_BYTES + 100_000)
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/big.txt"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["encoding"] == "utf-8"
+    assert "[Output truncated" in body["content"]
+    assert len(body["content"].encode("utf-8")) <= READ_MAX_OUTPUT_BYTES
+
+
+def test_fs_read_text_under_cap_has_no_marker(mock_session, client):
+    """A small text page is returned verbatim with no truncation marker."""
+    mock_session.read_file_bytes.return_value = b"hello\nworld\n"
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt"})
+    body = resp.json()
+    assert body["encoding"] == "utf-8"
+    assert body["content"] == "hello\nworld"
+    assert "Output truncated" not in body["content"]
+
+
+def test_fs_read_binary_over_cap_is_error(mock_session, client):
+    """A binary file larger than the cap returns an error rather than an unbounded base64 blob."""
+    from daiv_sandbox.main import READ_MAX_OUTPUT_BYTES
+
+    mock_session.read_file_bytes.return_value = b"\xff" * (READ_MAX_OUTPUT_BYTES + 1)
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/big.bin"})
+    body = resp.json()
+    assert body["content"] is None
+    assert "exceeds maximum preview size" in body["error"]
+
+
 def test_fs_edit_multiple_occurrences(mock_session, client):
     mock_session.edit_file.side_effect = ValueError("multiple_occurrences")
     resp = client.post(

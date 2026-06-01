@@ -61,6 +61,16 @@ TYPE_CMD_EXECUTOR = "cmd_executor"
 
 EXIT_CODE_TIMEOUT = 124  # matches timeout(1) convention
 
+# Cap on the bytes a single fs/read returns. Mirrors deepagents BaseSandbox MAX_OUTPUT_BYTES /
+# MAX_BINARY_BYTES. The full file is still read into the process (get_archive); this only bounds
+# the response payload so a page of pathologically long lines can't produce an unbounded reply.
+READ_MAX_OUTPUT_BYTES = 512_000
+
+READ_TRUNCATION_MARKER = (
+    "\n\n[Output truncated: exceeded the 512000-byte read limit. "
+    "Continue with a larger offset or smaller limit to read the rest.]"
+)
+
 
 # Configure Sentry
 
@@ -439,6 +449,10 @@ async def fs_read(
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
+            if len(raw) > READ_MAX_OUTPUT_BYTES:
+                return FsReadResponse(
+                    error=f"Binary file exceeds maximum preview size of {READ_MAX_OUTPUT_BYTES} bytes"
+                )
             return FsReadResponse(content=base64.b64encode(raw).decode("ascii"), encoding="base64")
         if not text:
             return FsReadResponse(content="System reminder: File exists but has empty contents", encoding="utf-8")
@@ -446,7 +460,14 @@ async def fs_read(
         page = lines[request.offset : request.offset + request.limit]
         if request.offset and not page:
             return FsReadResponse(error=f"Line offset {request.offset} exceeds file length ({len(lines)} lines)")
-        return FsReadResponse(content="\n".join(page), encoding="utf-8")
+        content = "\n".join(page)
+        encoded = content.encode("utf-8")
+        if len(encoded) > READ_MAX_OUTPUT_BYTES:
+            marker_bytes = len(READ_TRUNCATION_MARKER.encode("utf-8"))
+            # Reserve room for the marker so the total stays within the cap (deepagents' effective_limit).
+            truncated = encoded[: READ_MAX_OUTPUT_BYTES - marker_bytes].decode("utf-8", errors="ignore")
+            content = truncated + READ_TRUNCATION_MARKER
+        return FsReadResponse(content=content, encoding="utf-8")
 
 
 @app.post("/session/{session_id}/fs/ls", responses=common_responses, name="List a workspace directory")
