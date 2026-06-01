@@ -16,6 +16,7 @@ from daiv_sandbox import __version__
 from daiv_sandbox.config import settings
 from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, SessionBusyError
 from daiv_sandbox.logs import LOGGING_CONFIG
+from daiv_sandbox.reaper import start_reaper
 from daiv_sandbox.schemas import (
     ErrorMessage,
     FsDeleteRequest,
@@ -113,9 +114,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.redis = None
         app.state.session_lock_manager = NoopSessionLockManager()
 
+    reaper_task = start_reaper(app)
     try:
         yield
     finally:
+        if reaper_task is not None:
+            reaper_task.cancel()
         if redis_client is not None:
             await redis_client.aclose()
 

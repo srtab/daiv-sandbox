@@ -24,9 +24,14 @@ def mock_session():
 
 @pytest.fixture
 def client():
-    with TestClient(
-        app, headers={"X-API-Key": settings.API_KEY.get_secret_value()}, root_path=settings.API_V1_STR
-    ) as client:
+    # Keep the suite hermetic: lifespan starts the background reaper, which would otherwise spin up a
+    # real Docker client. Tests that exercise the reaper patch start_reaper themselves.
+    with (
+        patch("daiv_sandbox.main.start_reaper", return_value=None),
+        TestClient(
+            app, headers={"X-API-Key": settings.API_KEY.get_secret_value()}, root_path=settings.API_V1_STR
+        ) as client,
+    ):
         yield client
 
 
@@ -350,6 +355,25 @@ def test_get_session_returns_404_when_missing(client):
         instance.container = None
         response = client.get("/session/missing-id/")
         assert response.status_code == 404
+
+
+def test_lifespan_starts_and_cancels_reaper():
+    """The app lifespan schedules the reaper on startup and cancels it on shutdown."""
+    started = {}
+
+    def fake_start_reaper(app):
+        task = Mock()
+        started["task"] = task
+        return task
+
+    with (
+        patch("daiv_sandbox.main.start_reaper", side_effect=fake_start_reaper) as start_mock,
+        TestClient(app, headers={"X-API-Key": settings.API_KEY.get_secret_value()}, root_path=settings.API_V1_STR),
+    ):
+        pass  # enter+exit runs startup then shutdown
+
+    start_mock.assert_called_once()
+    started["task"].cancel.assert_called_once()
 
 
 def test_close_session_returns_conflict_when_session_is_locked(mock_session, client, monkeypatch):
