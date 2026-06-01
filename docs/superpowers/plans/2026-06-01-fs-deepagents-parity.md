@@ -73,29 +73,25 @@ Expected: FAIL — matches come back in `find_paths` order `[c.py, a.py, b.py]`,
 In `daiv_sandbox/main.py`, in `fs_glob`, find the block that builds `matched` and returns it:
 
 ```python
-        base = request.path.rstrip("/")
-        # Match the base-relative portion of each absolute entry under base.
-        matched = [
-            FsEntry(path=p, is_dir=d)
-            for (p, d) in all_entries
-            if p.startswith(f"{base}/") and regex.match(p[len(base) + 1 :])
-        ]
-        return FsGlobResponse(matches=matched)
+base = request.path.rstrip("/")
+# Match the base-relative portion of each absolute entry under base.
+matched = [
+    FsEntry(path=p, is_dir=d) for (p, d) in all_entries if p.startswith(f"{base}/") and regex.match(p[len(base) + 1 :])
+]
+return FsGlobResponse(matches=matched)
 ```
 
 Replace it with (adds one `sort` line before the return):
 
 ```python
-        base = request.path.rstrip("/")
-        # Match the base-relative portion of each absolute entry under base.
-        matched = [
-            FsEntry(path=p, is_dir=d)
-            for (p, d) in all_entries
-            if p.startswith(f"{base}/") and regex.match(p[len(base) + 1 :])
-        ]
-        # Deterministic order (matches deepagents' sorted glob) so client-side truncation is stable.
-        matched.sort(key=lambda e: e.path)
-        return FsGlobResponse(matches=matched)
+base = request.path.rstrip("/")
+# Match the base-relative portion of each absolute entry under base.
+matched = [
+    FsEntry(path=p, is_dir=d) for (p, d) in all_entries if p.startswith(f"{base}/") and regex.match(p[len(base) + 1 :])
+]
+# Deterministic order (matches deepagents' sorted glob) so client-side truncation is stable.
+matched.sort(key=lambda e: e.path)
+return FsGlobResponse(matches=matched)
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
@@ -205,28 +201,26 @@ In `daiv_sandbox/main.py`, the current `fs_read` body after acquiring `raw` is:
 Replace that block with:
 
 ```python
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            if len(raw) > READ_MAX_OUTPUT_BYTES:
-                return FsReadResponse(
-                    error=f"Binary file exceeds maximum preview size of {READ_MAX_OUTPUT_BYTES} bytes"
-                )
-            return FsReadResponse(content=base64.b64encode(raw).decode("ascii"), encoding="base64")
-        if not text:
-            return FsReadResponse(content="System reminder: File exists but has empty contents", encoding="utf-8")
-        lines = text.splitlines()
-        page = lines[request.offset : request.offset + request.limit]
-        if request.offset and not page:
-            return FsReadResponse(error=f"Line offset {request.offset} exceeds file length ({len(lines)} lines)")
-        content = "\n".join(page)
-        encoded = content.encode("utf-8")
-        if len(encoded) > READ_MAX_OUTPUT_BYTES:
-            marker_bytes = len(READ_TRUNCATION_MARKER.encode("utf-8"))
-            # Reserve room for the marker so the total stays within the cap (deepagents' effective_limit).
-            truncated = encoded[: READ_MAX_OUTPUT_BYTES - marker_bytes].decode("utf-8", errors="ignore")
-            content = truncated + READ_TRUNCATION_MARKER
-        return FsReadResponse(content=content, encoding="utf-8")
+try:
+    text = raw.decode("utf-8")
+except UnicodeDecodeError:
+    if len(raw) > READ_MAX_OUTPUT_BYTES:
+        return FsReadResponse(error=f"Binary file exceeds maximum preview size of {READ_MAX_OUTPUT_BYTES} bytes")
+    return FsReadResponse(content=base64.b64encode(raw).decode("ascii"), encoding="base64")
+if not text:
+    return FsReadResponse(content="System reminder: File exists but has empty contents", encoding="utf-8")
+lines = text.splitlines()
+page = lines[request.offset : request.offset + request.limit]
+if request.offset and not page:
+    return FsReadResponse(error=f"Line offset {request.offset} exceeds file length ({len(lines)} lines)")
+content = "\n".join(page)
+encoded = content.encode("utf-8")
+if len(encoded) > READ_MAX_OUTPUT_BYTES:
+    marker_bytes = len(READ_TRUNCATION_MARKER.encode("utf-8"))
+    # Reserve room for the marker so the total stays within the cap (deepagents' effective_limit).
+    truncated = encoded[: READ_MAX_OUTPUT_BYTES - marker_bytes].decode("utf-8", errors="ignore")
+    content = truncated + READ_TRUNCATION_MARKER
+return FsReadResponse(content=content, encoding="utf-8")
 ```
 
 - [ ] **Step 5: Run the new tests to verify they pass**
@@ -421,64 +415,61 @@ Expected: FAIL — `write_file` does not accept a `create_only` keyword yet (Typ
 In `daiv_sandbox/sessions.py`, the current `write_file` is:
 
 ```python
-    def write_file(
-        self, path: str, content: bytes, *, mode: int, allowed_roots: tuple[str, ...] = (SANDBOX_ROOT,)
-    ) -> None:
-        """
-        Write *content* to *path* (absolute, under one of *allowed_roots*) inside the container.
+def write_file(self, path: str, content: bytes, *, mode: int, allowed_roots: tuple[str, ...] = (SANDBOX_ROOT,)) -> None:
+    """
+    Write *content* to *path* (absolute, under one of *allowed_roots*) inside the container.
 
-        The path is validated lexically. The content is shipped via a single-file tar
-        through the existing copy_to_container pipeline (sanitised, mode preserved).
-        """
-        canonical = _validate_sandbox_path(path, allowed_roots=allowed_roots)
-        parent_dir, _, filename = canonical.rpartition("/")
-        if not parent_dir or not filename:
-            raise ValueError(f"path resolves to an unusable location: {path!r}")
+    The path is validated lexically. The content is shipped via a single-file tar
+    through the existing copy_to_container pipeline (sanitised, mode preserved).
+    """
+    canonical = _validate_sandbox_path(path, allowed_roots=allowed_roots)
+    parent_dir, _, filename = canonical.rpartition("/")
+    if not parent_dir or not filename:
+        raise ValueError(f"path resolves to an unusable location: {path!r}")
 
-        with _build_single_file_tar_stream(filename, content, mode=mode) as tar_stream:
-            self.copy_to_container(tar_stream, dest=parent_dir, clear_before_copy=False)
+    with _build_single_file_tar_stream(filename, content, mode=mode) as tar_stream:
+        self.copy_to_container(tar_stream, dest=parent_dir, clear_before_copy=False)
 ```
 
 Replace it with:
 
 ```python
-    def write_file(
-        self,
-        path: str,
-        content: bytes,
-        *,
-        mode: int,
-        allowed_roots: tuple[str, ...] = (SANDBOX_ROOT,),
-        create_only: bool = False,
-    ) -> None:
-        """
-        Write *content* to *path* (absolute, under one of *allowed_roots*) inside the container.
+def write_file(
+    self,
+    path: str,
+    content: bytes,
+    *,
+    mode: int,
+    allowed_roots: tuple[str, ...] = (SANDBOX_ROOT,),
+    create_only: bool = False,
+) -> None:
+    """
+    Write *content* to *path* (absolute, under one of *allowed_roots*) inside the container.
 
-        The path is validated lexically. The content is shipped via a single-file tar
-        through the existing copy_to_container pipeline (sanitised, mode preserved).
+    The path is validated lexically. The content is shipped via a single-file tar
+    through the existing copy_to_container pipeline (sanitised, mode preserved).
 
-        When *create_only* is True, refuse to overwrite an existing path (matching deepagents'
-        create-only ``write`` contract). The check probes existence with ``[ -e ]``; there is an
-        inherent TOCTOU window between the probe and the write. The default (False) overwrites,
-        which is what ``edit_file``'s write-back relies on.
-        """
-        canonical = _validate_sandbox_path(path, allowed_roots=allowed_roots)
-        parent_dir, _, filename = canonical.rpartition("/")
-        if not parent_dir or not filename:
-            raise ValueError(f"path resolves to an unusable location: {path!r}")
+    When *create_only* is True, refuse to overwrite an existing path (matching deepagents'
+    create-only ``write`` contract). The check probes existence with ``[ -e ]``; there is an
+    inherent TOCTOU window between the probe and the write. The default (False) overwrites,
+    which is what ``edit_file``'s write-back relies on.
+    """
+    canonical = _validate_sandbox_path(path, allowed_roots=allowed_roots)
+    parent_dir, _, filename = canonical.rpartition("/")
+    if not parent_dir or not filename:
+        raise ValueError(f"path resolves to an unusable location: {path!r}")
 
-        if create_only:
-            # `|| true` keeps the exit code 0 on the common (absent) path so execute_command does not
-            # log a spurious warning; presence is signalled by the EXISTS marker on stdout.
-            probe = self.execute_command(f"[ -e {_sh_quote(canonical)} ] && printf EXISTS || true")
-            if probe.output.strip() == "EXISTS":
-                raise FileExistsError(
-                    f"Cannot write to {path} because it already exists. "
-                    "Read and then make an edit, or write to a new path."
-                )
+    if create_only:
+        # `|| true` keeps the exit code 0 on the common (absent) path so execute_command does not
+        # log a spurious warning; presence is signalled by the EXISTS marker on stdout.
+        probe = self.execute_command(f"[ -e {_sh_quote(canonical)} ] && printf EXISTS || true")
+        if probe.output.strip() == "EXISTS":
+            raise FileExistsError(
+                f"Cannot write to {path} because it already exists. Read and then make an edit, or write to a new path."
+            )
 
-        with _build_single_file_tar_stream(filename, content, mode=mode) as tar_stream:
-            self.copy_to_container(tar_stream, dest=parent_dir, clear_before_copy=False)
+    with _build_single_file_tar_stream(filename, content, mode=mode) as tar_stream:
+        self.copy_to_container(tar_stream, dest=parent_dir, clear_before_copy=False)
 ```
 
 - [ ] **Step 4: Run the session-level tests to verify they pass**
