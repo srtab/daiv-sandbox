@@ -65,6 +65,11 @@ All settings are configurable via environment variables. The available settings 
 | **DAIV_SANDBOX_SESSION_LOCK_TTL_SECONDS**     | TTL (seconds) of the per-session lock when Redis-backed.                                                 | Default: 900                                                                |
 | **DAIV_SANDBOX_SESSION_LOCK_WAIT_SECONDS**    | Max time (seconds) a request waits to acquire a busy session lock before returning `409`.                | Default: 1.0                                                                |
 | **DAIV_SANDBOX_SESSION_LOCK_REFRESH_SECONDS** | Interval (seconds) at which a held session lock is refreshed.                                            | Default: 30.0                                                               |
+| **DAIV_SANDBOX_REAPER_ENABLED**               | Enable the background reaper that removes stopped session containers.                                    | Default: true                                                               |
+| **DAIV_SANDBOX_REAPER_INTERVAL_SECONDS**      | Reaper sweep cadence in seconds.                                                                         | Default: 600                                                                |
+| **DAIV_SANDBOX_SESSION_GRACE_SECONDS**        | Age (since stop) after which a stopped session container is removed.                                     | Default: 43200 (12h)                                                        |
+| **DAIV_SANDBOX_MAX_STOPPED_SESSIONS**         | LRU cap on retained stopped session containers.                                                          | Default: 50                                                                 |
+| **DAIV_SANDBOX_STOP_TIMEOUT_SECONDS**         | `docker stop` grace before SIGKILL when stopping a session.                                              | Default: 2                                                                  |
 | **DAIV_SANDBOX_HOST**                         | The host to bind the service to.                                                                         | Default: "0.0.0.0"                                                          |
 | **DAIV_SANDBOX_PORT**                         | The port to bind the service to.                                                                         | Default: 8000                                                               |
 | **DAIV_SANDBOX_LOG_LEVEL**                    | The log level to use.                                                                                    | Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`<br>Default: "INFO" |
@@ -77,7 +82,8 @@ All settings are configurable via environment variables. The available settings 
 - `POST /session/{session_id}/seed/`: Seed the initial `/workspace/repo` and/or `/workspace/skills` state from tar archives (one-shot per session).
 - `POST /session/{session_id}/fs/{op}`: Python-free file operations across `/workspace` (`ls`, `read`, `grep`, `glob`, `write`, `edit`, `delete`).
 - `POST /session/{session_id}/`: Run commands on the sandbox session.
-- `DELETE /session/{session_id}/`: Close the sandbox session.
+- `GET /session/{session_id}/`: Check session status — `204` if it exists (restarting it if stopped), else `404`.
+- `DELETE /session/{session_id}/`: Close the sandbox session (stops the container by default; `?force=true` removes it).
 - `GET /-/health/`: Healthcheck endpoint.
 - `GET /-/version/`: Current application version.
 
@@ -279,6 +285,8 @@ print(resp["results"][0]["output"])
 
 To close a sandbox session, you need to call the `DELETE /session/{session_id}/` endpoint using the session ID returned when starting the session.
 
+`DELETE /session/{id}/` stops the container (kept warm for reuse); pass `?force=true` to remove it immediately. A background reaper removes stopped containers after `DAIV_SANDBOX_SESSION_GRACE_SECONDS` (default 12h) or once the `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` LRU cap is exceeded.
+
 ```sh
 $ curl -X DELETE \
   -H "X-API-Key: notsosecret" \
@@ -288,7 +296,7 @@ $ curl -X DELETE \
 The response will be an empty body with a status code of 204.
 
 > [!TIP]
-> Why closing a sandbox session is important? Because it will remove the container from the host machine, freeing up resources.
+> Why closing a sandbox session is important? By default it stops the container so the next turn can reuse it warm; the background reaper later removes it to free resources. Pass `?force=true` to remove it right away.
 
 ## Contributing
 

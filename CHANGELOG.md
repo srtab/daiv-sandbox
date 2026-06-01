@@ -12,9 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reserved a `/workspace/tmp` scratchpad root at session start (`mkdir -p` + `chown`) that bash also sees and that stays container-local (it lives outside `/workspace/repo`).
 - `POST /session/{id}/fs/{op}` — Python-free file operations across the session workspace (`/workspace`): `ls`, `read`, `grep`, `glob`, `write`, `edit`, and `delete`. Content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work on images without a Python interpreter (e.g. `alpine`). Edits under `repo/` land directly on the container workspace, while `skills/` and `tmp/` stay container-local.
 - `scripts/dump_schemas.py` now also exports the new `Fs*` request/response schemas for downstream `daiv` consumers.
+- Background session reaper: `DELETE /session/{id}/` now _stops_ the container (preserving it for warm reuse) and a reaper removes stopped containers after `DAIV_SANDBOX_SESSION_GRACE_SECONDS` (default 12h) or when the `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` LRU cap is exceeded. New settings: `DAIV_SANDBOX_REAPER_ENABLED`, `DAIV_SANDBOX_REAPER_INTERVAL_SECONDS`, `DAIV_SANDBOX_SESSION_GRACE_SECONDS`, `DAIV_SANDBOX_MAX_STOPPED_SESSIONS`, `DAIV_SANDBOX_STOP_TIMEOUT_SECONDS`.
+- `GET /session/{id}/` — returns 204 if the session container exists (restarting it if stopped), else 404. Used by clients to validate/warm a session before reuse.
 
 ### Changed
 
+- Session containers are created with `sleep infinity` and without Docker auto-remove, so they survive a stop and can be resumed. `DELETE` stops instead of removing; `?force=true` restores the old immediate-removal behavior. **Breaking:** requires the matching daiv release for warm reuse.
 - Session container layout unified under `/workspace/{repo,skills,tmp}` (was `/repo`, `/skills`, `/scratch`); `fs/*` endpoints now operate across the whole `/workspace`. **Breaking:** requires the matching daiv release.
 - `fs/glob` now delegates to the stdlib `glob.translate`; a malformed bracket class (e.g. a lone `[`) is treated as a literal (shell-like) instead of returning `400`.
 - `fs/read` now bounds its response: a text page larger than 512000 bytes is truncated with a marker, and a binary file larger than 512000 bytes returns an error instead of an unbounded base64 blob (mirrors deepagents' read limits).

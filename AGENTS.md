@@ -52,7 +52,8 @@ flowchart LR
     Client -->|POST /session/{id}/seed/| FastAPI
     Client -->|POST /session/{id}/fs/op| FastAPI
     Client -->|POST /session/{id}/| FastAPI
-    Client -->|DELETE /session/{id}/| FastAPI
+    Client -->|GET /session/{id}/| FastAPI
+    Client -->|DELETE /session/{id}/ stop| FastAPI
     FastAPI --> SandboxDockerSession
     SandboxDockerSession -->|create / exec / copy archive| Container
     FastAPI -->|results| Client
@@ -68,7 +69,11 @@ The application is session-based. A session owns a single long-lived `cmd_execut
 - **`POST /session/{id}/`** — run commands sequentially in `/workspace/repo`; returns each command's
   output. The container workspace is mutated in place; recover changes by running git (`git diff`,
   `git status`) inside `/workspace/repo` through the same endpoint.
-- **`DELETE /session/{id}/`** — tear down the container.
+- **`DELETE /session/{id}/`** — stop the container (preserved for warm reuse); `?force=true`
+  removes it immediately. A background reaper removes stopped containers
+  `DAIV_SANDBOX_SESSION_GRACE_SECONDS` after they stopped (default 12h), with an LRU cap of
+  `DAIV_SANDBOX_MAX_STOPPED_SESSIONS`.
+- **`GET /session/{id}/`** — 204 if the session exists (restarting it if stopped), else 404.
 
 The container filesystem is unified under `/workspace` (`repo/`, `skills/`, `tmp/`). The sandbox is the
 single source of truth: edits under `/workspace/repo` (via bash or `fs/*`) land directly on the
@@ -114,7 +119,10 @@ pytest -vv
 
 - **API key authentication** via `X-API-Key` header (env var `DAIV_SANDBOX_API_KEY`)
 - **Optional gVisor (`runsc`) runtime** for enhanced container isolation
-- **Session-scoped containers** torn down on `DELETE /session/{id}/` (along with the shared volume)
+- **Session-scoped containers** _stopped_ on `DELETE /session/{id}/` and removed by a background
+  reaper after `DAIV_SANDBOX_SESSION_GRACE_SECONDS` (default 12h) or when the
+  `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` LRU cap is exceeded; `?force=true` removes immediately.
+  Untrusted artifacts therefore persist for at most the grace window after the last use.
 - **Per-command timeout** enforced via `asyncio.wait_for` (`DAIV_SANDBOX_COMMAND_TIMEOUT`, default `0` = no timeout); timed-out commands return exit code `124`
 - **Secrets** loaded from `/run/secrets` or environment variables
 - **License:** Apache 2.0
