@@ -778,8 +778,25 @@ def test_edit_file_string_not_found():
 
 def test_edit_file_multiple_occurrences_without_replace_all():
     s = _edit_session(b"x x x\n")
-    with pytest.raises(ValueError, match="multiple_occurrences"):
+    with pytest.raises(ValueError, match="appears 3 times"):
         s.edit_file("/scratch/a.txt", "x", "y", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_eof_newline_unique_hint():
+    """old ends with a newline the file lacks at EOF, and the stripped key is unique → precise hint."""
+    s = _edit_session(b"abcdefkey")
+    with pytest.raises(ValueError, match="trailing newline removed"):
+        s.edit_file("/scratch/a.txt", "key\n", "KEY\n", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_eof_newline_ambiguous_hint():
+    """old ends with a newline the file lacks at EOF, and the stripped key is ambiguous →
+    hint to drop the newline AND add surrounding context."""
+    s = _edit_session(b"abckeydefkey")
+    with pytest.raises(ValueError, match="add surrounding context"):
+        s.edit_file("/scratch/a.txt", "key\n", "KEY\n", replace_all=False, allowed_roots=("/scratch",))
     s.write_file.assert_not_called()
 
 

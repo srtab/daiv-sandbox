@@ -619,9 +619,31 @@ class SandboxDockerSession:
                 matched_old, matched_new, count = cand_old, cand_new, c
                 break
         if count == 0:
+            # EOF-newline mismatch hint (port of deepagents perform_string_replacement): the model
+            # appended a terminator `old` carries but the file lacks at EOF. Compare on LF-normalized
+            # forms so a CRLF file is handled the same way the variant loop above does.
+            text_lf = text.replace("\r\n", "\n")
+            if old_lf.endswith("\n") and len(old_lf) > 1 and text_lf.endswith(old_lf.removesuffix("\n")):
+                stripped = old_lf.removesuffix("\n")
+                stripped_count = text_lf.count(stripped)
+                if stripped_count == 1:
+                    raise ValueError(
+                        "old_string ends with a newline, but the file does not end with a newline. "
+                        "Retry with the trailing newline removed from old_string "
+                        "(and from new_string if it also ends with a newline)."
+                    )
+                raise ValueError(
+                    f"old_string ends with a newline, but the file does not end with a newline. "
+                    f"With the trailing newline removed, old_string would appear {stripped_count} "
+                    f"times in the file. Retry with the trailing newline removed and add surrounding "
+                    f"context so the match is unique."
+                )
             raise ValueError("string_not_found")
         if count > 1 and not replace_all:
-            raise ValueError("multiple_occurrences")
+            raise ValueError(
+                f"String appears {count} times in file. Use replace_all=True to replace all instances, "
+                f"or provide a more specific string with surrounding context."
+            )
         result = text.replace(matched_old, matched_new) if replace_all else text.replace(matched_old, matched_new, 1)
         self.write_file(path, result.encode("utf-8"), mode=0o644, allowed_roots=allowed_roots)
         return count
