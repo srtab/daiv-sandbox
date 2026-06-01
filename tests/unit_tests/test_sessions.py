@@ -15,9 +15,11 @@ from daiv_sandbox.sessions import (
     SCRATCH_ROOT,
     SKILLS_ROOT,
     WORKDIR_ROOT,
+    WORKSPACE_ROOT,
     SandboxDockerSession,
     _build_single_file_tar_stream,
     _sanitize_archive_stream,
+    _validate_sandbox_path,
 )
 
 EXPECTED_EXEC_ENV = {
@@ -103,13 +105,15 @@ def test__start_container(mock_docker_client):
     assert session.session_id == mock_docker_client.containers.run.return_value.id
     # Should create sandbox directories and chown them
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
+        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
+        user="root",
     )
     mock_container.exec_run.assert_any_call(
         [
             "chown",
             f"{settings.RUN_UID}:{settings.RUN_GID}",
             "--",
+            WORKSPACE_ROOT,
             SANDBOX_ROOT,
             WORKDIR_ROOT,
             SANDBOX_HOME,
@@ -160,16 +164,6 @@ def test_copy_to_runtime_creates_directory(mock_docker_client):
     session.container.exec_run.assert_any_call(
         ["chown", "-R", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", SANDBOX_ROOT], user="root"
     )
-
-
-def test_copy_from_runtime_raises_error_if_file_not_found(mock_docker_client):
-    session = SandboxDockerSession()
-    session.container = MagicMock()
-    session.container.get_archive.return_value = ([], {"size": 0})
-    with pytest.raises(FileNotFoundError):
-        session.copy_from_container("/path/to/src")
-    # Absolute paths should be used as-is
-    session.container.get_archive.assert_called_once_with("/path/to/src")
 
 
 def test_execute_command(mock_docker_client):
@@ -231,16 +225,6 @@ def test_copy_to_container_with_relative_dest(mock_docker_client):
     session.container.exec_run.assert_any_call(
         ["chown", "-R", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", expected_path], user="root"
     )
-
-
-def test_copy_from_container_with_relative_path(mock_docker_client):
-    """Test that relative paths are resolved under SANDBOX_ROOT"""
-    session = SandboxDockerSession()
-    session.container = MagicMock()
-    session.container.get_archive.return_value = ([b"data"], {"size": 100})
-    session.copy_from_container("subdir")
-    expected_path = f"{SANDBOX_ROOT}/subdir"
-    session.container.get_archive.assert_called_once_with(expected_path)
 
 
 def test_execute_command_with_relative_workdir(mock_docker_client):
@@ -475,6 +459,59 @@ def test_copy_to_container_rejects_non_reserved_root(mock_docker_client):
         session.copy_to_container(buf, dest="/etc/passwd", clear_before_copy=False)
 
 
+def test_copy_to_container_allows_workdir_root(mock_docker_client):
+    """copy_to_container accepts /workdir (and subdirs) — the patch-extractor meta volume."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session.container.put_archive.return_value = True
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="meta.txt")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+
+    # Bare /workdir and a subpath under it are both accepted.
+    buf.seek(0)
+    session.copy_to_container(buf, dest=WORKDIR_ROOT, clear_before_copy=False)
+    buf.seek(0)
+    session.copy_to_container(buf, dest=f"{WORKDIR_ROOT}/sub", clear_before_copy=False)
+
+
+def test_copy_to_container_allows_bare_workspace_root(mock_docker_client):
+    """A bare /workspace dest is accepted (its subdirs repo/skills/tmp all live under it)."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session.container.put_archive.return_value = True
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="x")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
+
+    session.copy_to_container(buf, dest=WORKSPACE_ROOT, clear_before_copy=False)
+
+
+def test_copy_to_container_rejects_dest_traversal(mock_docker_client):
+    """A `..` in an absolute dest is rejected at the boundary (defense-in-depth, not caller-dependent)."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="x")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
+
+    with pytest.raises(ValueError, match="Refusing to extract"):
+        session.copy_to_container(buf, dest=f"{WORKSPACE_ROOT}/../etc", clear_before_copy=False)
+
+
 def test_start_container_creates_skills_root(mock_docker_client):
     """A freshly-started container has /skills owned by the sandbox user."""
     session = SandboxDockerSession()
@@ -484,7 +521,8 @@ def test_start_container_creates_skills_root(mock_docker_client):
 
     # mkdir -p was called including SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
+        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
+        user="root",
     )
     # chown was called for SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
@@ -492,6 +530,7 @@ def test_start_container_creates_skills_root(mock_docker_client):
             "chown",
             f"{settings.RUN_UID}:{settings.RUN_GID}",
             "--",
+            WORKSPACE_ROOT,
             SANDBOX_ROOT,
             WORKDIR_ROOT,
             SANDBOX_HOME,
@@ -707,3 +746,27 @@ def test_edit_file_matches_lf_old_against_crlf_file():
     count = s.edit_file("/scratch/a.txt", "a\nb", "a\nB", replace_all=False, allowed_roots=("/scratch",))
     assert count == 1
     assert s.write_file.call_args.args[1] == b"a\r\nB\r\n"
+
+
+def test_roots_are_under_workspace():
+    assert WORKSPACE_ROOT == "/workspace"
+    assert SANDBOX_ROOT == "/workspace/repo"
+    assert SKILLS_ROOT == "/workspace/skills"
+    assert SCRATCH_ROOT == "/workspace/tmp"
+
+
+@pytest.mark.parametrize("path", ["/workspace/repo/main.py", "/workspace/skills/x/SKILL.md", "/workspace/tmp/note.txt"])
+def test_validate_accepts_anything_under_workspace(path):
+    assert _validate_sandbox_path(path, allowed_roots=(WORKSPACE_ROOT,)) == path
+
+
+def test_validate_allows_workspace_root_only_with_allow_root():
+    assert _validate_sandbox_path("/workspace", allowed_roots=(WORKSPACE_ROOT,), allow_root=True) == "/workspace"
+    with pytest.raises(ValueError):
+        _validate_sandbox_path("/workspace", allowed_roots=(WORKSPACE_ROOT,))
+
+
+@pytest.mark.parametrize("path", ["/etc/passwd", "/workspace/../etc", "/repo/main.py", "relative/x"])
+def test_validate_rejects_outside_workspace(path):
+    with pytest.raises(ValueError):
+        _validate_sandbox_path(path, allowed_roots=(WORKSPACE_ROOT,))

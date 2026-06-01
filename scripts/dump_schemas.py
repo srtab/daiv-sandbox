@@ -11,8 +11,6 @@ the two sides. To refresh the dump:
 import json
 
 from daiv_sandbox.schemas import (
-    ApplyMutationsRequest,
-    ApplyMutationsResponse,
     FsDeleteRequest,
     FsDeleteResponse,
     FsEditRequest,
@@ -29,8 +27,6 @@ from daiv_sandbox.schemas import (
     FsReadResponse,
     FsWriteRequest,
     FsWriteResponse,
-    MutationResult,
-    PutMutation,
     RunRequest,
     RunResponse,
     RunResult,
@@ -39,10 +35,6 @@ from daiv_sandbox.schemas import (
 )
 
 _TYPES = [
-    ApplyMutationsRequest,
-    ApplyMutationsResponse,
-    MutationResult,
-    PutMutation,
     RunRequest,
     RunResponse,
     RunResult,

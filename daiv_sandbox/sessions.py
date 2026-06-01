@@ -6,9 +6,8 @@ import logging
 import tarfile
 import tempfile
 import threading
-from abc import ABC, abstractmethod
 from pathlib import Path, PurePosixPath
-from typing import IO, TYPE_CHECKING, BinaryIO, NamedTuple
+from typing import IO, TYPE_CHECKING, NamedTuple
 
 from docker import DockerClient, from_env
 from docker.errors import ImageNotFound, NotFound
@@ -23,11 +22,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger("daiv_sandbox")
 
 # Canonical sandbox root directory inside all containers
-SANDBOX_ROOT = "/repo"
+WORKSPACE_ROOT = "/workspace"
+SANDBOX_ROOT = "/workspace/repo"
 WORKDIR_ROOT = "/workdir"
 SANDBOX_HOME = "/home/daiv-sandbox"
-SKILLS_ROOT = "/skills"
-SCRATCH_ROOT = "/scratch"
+SKILLS_ROOT = "/workspace/skills"
+SCRATCH_ROOT = "/workspace/tmp"
 
 
 class DirEntry(NamedTuple):
@@ -209,41 +209,7 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
         raise ValueError(f"Invalid or truncated archive: {e}") from e
 
 
-class Session(ABC):
-    @classmethod
-    @abstractmethod
-    def ping(cls, client: DockerClient | None = None) -> bool:
-        """
-        Ping the Docker client.
-        """
-
-    @classmethod
-    @abstractmethod
-    def start(cls, client: DockerClient | None = None):
-        """
-        Start a new session.
-        """
-
-    @abstractmethod
-    def copy_from_container(self, host_dir: str) -> BinaryIO:
-        """
-        Copy a file or directory from the container to the host.
-        """
-
-    @abstractmethod
-    def copy_to_container(self, data: IO[bytes], dest: str | None = None):
-        """
-        Copy a file or directory to the container.
-        """
-
-    @abstractmethod
-    def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
-        """
-        Execute a command in the container.
-        """
-
-
-class SandboxDockerSession(Session):
+class SandboxDockerSession:
     """
     A session is a Docker container that is used to execute commands.
     """
@@ -369,7 +335,8 @@ class SandboxDockerSession(Session):
 
         # Ensure the sandbox directories exist and are writable by the sandbox user.
         mkdir_result = container.exec_run(
-            ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
+            ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
+            user="root",
         )
         if mkdir_result.exit_code != 0:
             raise RuntimeError(
@@ -378,7 +345,17 @@ class SandboxDockerSession(Session):
             )
 
         chown_result = container.exec_run(
-            ["chown", self._get_user(), "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
+            [
+                "chown",
+                self._get_user(),
+                "--",
+                WORKSPACE_ROOT,
+                SANDBOX_ROOT,
+                WORKDIR_ROOT,
+                SANDBOX_HOME,
+                SKILLS_ROOT,
+                SCRATCH_ROOT,
+            ],
             user="root",
         )
         if chown_result.exit_code != 0:
@@ -398,32 +375,6 @@ class SandboxDockerSession(Session):
             logger.warning("Container '%s' not found", self.session_id)
         else:
             logger.info("Container '%s' removed", self.session_id)
-
-    def copy_from_container(self, host_dir: str) -> BinaryIO:
-        """
-        Copy a file or directory from the container to the host.
-
-        Args:
-            host_dir (str): The path to the file or directory to copy from the container.
-
-        Returns:
-            BinaryIO: The copied archive.
-        """
-        if Path(host_dir).is_absolute():
-            from_dir = host_dir
-        elif host_dir in {"", "."}:
-            # Special case: when copying the sandbox root itself ("."), request SANDBOX_ROOT + "/." so the archive
-            # contains the *contents* rather than a top-level "sandbox-root/" directory.
-            from_dir = f"{SANDBOX_ROOT}/."
-        else:
-            from_dir = (Path(SANDBOX_ROOT) / host_dir).as_posix()
-
-        bits, stat = self.container.get_archive(from_dir)
-
-        if stat["size"] == 0:
-            raise FileNotFoundError(f"File {from_dir} not found in the container {self.container.short_id}")
-
-        return io.BytesIO(b"".join(bits))
 
     def copy_to_container(self, tardata: IO[bytes], dest: str | None = None, clear_before_copy: bool = True):
         """
@@ -446,17 +397,17 @@ class SandboxDockerSession(Session):
         if to_dir_norm in {"", "/"}:
             raise ValueError("Refusing to extract an archive into the container root directory")
 
-        if not (
-            to_dir_norm in (SANDBOX_ROOT, WORKDIR_ROOT, SKILLS_ROOT, SCRATCH_ROOT)
-            or to_dir_norm.startswith(f"{SANDBOX_ROOT}/")
-            or to_dir_norm.startswith(f"{WORKDIR_ROOT}/")
-            or to_dir_norm.startswith(f"{SKILLS_ROOT}/")
-            or to_dir_norm.startswith(f"{SCRATCH_ROOT}/")
-        ):
+        # Confine the destination to WORKSPACE_ROOT (SANDBOX_ROOT/SKILLS_ROOT/SCRATCH_ROOT all live
+        # under it, so the single /workspace prefix subsumes them) or WORKDIR_ROOT (where the
+        # patch-extractor's meta-repo machinery lives). Validate lexically through the shared validator
+        # so a `..`/NUL/newline in `dest` is rejected at this boundary rather than relying on every
+        # caller pre-validating. allow_root=True permits a bare-root dest.
+        try:
+            _validate_sandbox_path(to_dir_norm, allowed_roots=(WORKSPACE_ROOT, WORKDIR_ROOT), allow_root=True)
+        except ValueError as exc:
             raise ValueError(
-                f"Refusing to extract an archive outside of {SANDBOX_ROOT!r}, {WORKDIR_ROOT!r}, "
-                f"{SKILLS_ROOT!r}, or {SCRATCH_ROOT!r}"
-            )
+                f"Refusing to extract an archive outside of {WORKSPACE_ROOT!r} or {WORKDIR_ROOT!r}: {exc}"
+            ) from exc
 
         if clear_before_copy:
             q = _sh_quote(to_dir_norm)

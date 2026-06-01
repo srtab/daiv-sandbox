@@ -52,35 +52,15 @@ class RunResponse(BaseModel):
     patch: str | None = Field(description="Base64-encoded patch with the changes.")
 
 
-class PutMutation(BaseModel):
-    path: str = Field(description="Absolute path inside the sandbox, must be under /repo.")
-    content: Base64Bytes = Field(description="Base64-encoded full file content.")
-    mode: int = Field(ge=0, le=0o7777, description="POSIX mode bits to set on the file.")
-
-
-class ApplyMutationsRequest(BaseModel):
-    mutations: list[PutMutation] = Field(min_length=1, max_length=64)
-
-
-class MutationResult(BaseModel):
-    path: str = Field(description="The path the mutation targeted.")
-    ok: bool = Field(description="Whether the mutation was applied successfully.")
-    error: str | None = Field(default=None, description="Per-item error message when ok=False.")
-
-
-class ApplyMutationsResponse(BaseModel):
-    results: list[MutationResult]
-
-
 class ErrorMessage(BaseModel):
     detail: str = Field(description="Error message.")
 
 
-# --- /scratch file-op wire schemas -----------------------------------------
+# --- /workspace file-op wire schemas -----------------------------------------
 
 
 class FsLsRequest(BaseModel):
-    path: str = Field(description="Absolute directory path under /scratch.")
+    path: str = Field(description="Absolute directory path under /workspace.")
 
 
 class FsEntry(BaseModel):
@@ -94,7 +74,7 @@ class FsLsResponse(BaseModel):
 
 
 class FsReadRequest(BaseModel):
-    path: str = Field(description="Absolute file path under /scratch.")
+    path: str = Field(description="Absolute file path under /workspace.")
     offset: int = Field(default=0, ge=0, description="0-indexed start line (text files only).")
     limit: int = Field(default=2000, ge=1, description="Maximum number of lines (text files only).")
 
@@ -115,7 +95,7 @@ class FsReadResponse(BaseModel):
 
 class FsGrepRequest(BaseModel):
     pattern: str = Field(description="Literal substring to search for (not a regex).")
-    path: str = Field(description="Absolute directory/file path under /scratch.")
+    path: str = Field(description="Absolute directory/file path under /workspace.")
     glob: str | None = Field(default=None, description="Optional filename glob to restrict the search.")
 
 
@@ -132,7 +112,7 @@ class FsGrepResponse(BaseModel):
 
 class FsGlobRequest(BaseModel):
     pattern: str = Field(description="Glob pattern (supports *, **, ?, [abc]).")
-    path: str = Field(description="Absolute base directory under /scratch.")
+    path: str = Field(description="Absolute base directory under /workspace.")
 
 
 class FsGlobResponse(BaseModel):
@@ -141,7 +121,7 @@ class FsGlobResponse(BaseModel):
 
 
 class FsWriteRequest(BaseModel):
-    path: str = Field(description="Absolute file path under /scratch.")
+    path: str = Field(description="Absolute file path under /workspace.")
     content: Base64Bytes = Field(description="Base64-encoded full file content.")
     mode: int = Field(default=0o644, ge=0, le=0o7777, description="POSIX mode bits to set on the file.")
 
@@ -152,7 +132,7 @@ class FsWriteResponse(BaseModel):
 
 
 class FsEditRequest(BaseModel):
-    path: str = Field(description="Absolute file path under /scratch.")
+    path: str = Field(description="Absolute file path under /workspace.")
     old: str = Field(description="Exact substring to replace.")
     new: str = Field(description="Replacement string.")
     replace_all: bool = Field(default=False, description="Replace every occurrence.")
@@ -164,7 +144,7 @@ class FsEditResponse(BaseModel):
 
 
 class FsDeleteRequest(BaseModel):
-    path: str = Field(description="Absolute file path under /scratch.")
+    path: str = Field(description="Absolute file path under /workspace.")
 
 
 class FsDeleteResponse(BaseModel):

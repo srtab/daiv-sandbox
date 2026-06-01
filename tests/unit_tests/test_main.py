@@ -329,7 +329,7 @@ def test_start_session_with_extract_patch_creates_volume(client):
         cmd_call = mock_session_class.start.call_args_list[1]
         assert "volumes" in cmd_call[1]
         volume_name = list(cmd_call[1]["volumes"].keys())[0]
-        assert cmd_call[1]["volumes"][volume_name] == {"bind": "/repo", "mode": "rw"}
+        assert cmd_call[1]["volumes"][volume_name] == {"bind": "/workspace/repo", "mode": "rw"}
 
 
 def test_close_session_removes_volume(client):
@@ -445,7 +445,7 @@ def _minimal_archive_bytes(member_name: str = "README.md", member_content: bytes
 
 
 def test_seed_session_extracts_repo_archive(mock_session, client):
-    """repo_archive only: copy_to_container is called once with /repo as dest."""
+    """repo_archive only: copy_to_container is called once with /workspace/repo as dest."""
     from docker.models.containers import ExecResult
 
     from daiv_sandbox.sessions import SANDBOX_ROOT
@@ -474,59 +474,6 @@ def test_seed_session_rejects_unknown_session(client):
             files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
         )
         assert resp.status_code == 404
-
-
-def test_apply_mutations_creates_file(mock_session, client):
-    """Happy path: a single put returns ok=True for that path."""
-    payload = {
-        "mutations": [
-            {"path": "/repo/new_file.py", "content": base64.b64encode(b"print('hi')\n").decode(), "mode": 0o644}
-        ]
-    }
-    resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["results"] == [{"path": "/repo/new_file.py", "ok": True, "error": None}]
-    mock_session.write_file.assert_called_once()
-
-
-def test_apply_mutations_rejects_path_outside_repo(mock_session, client):
-    """Per-item rejection for /skills, /workdir, /etc, traversal — not 4xx."""
-    bad_paths = ["/skills/foo.md", "/workdir/x", "/etc/passwd", "/repo/../etc/passwd"]
-    for path in bad_paths:
-        payload = {"mutations": [{"path": path, "content": base64.b64encode(b"x").decode(), "mode": 0o644}]}
-        resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
-        assert resp.status_code == 200, f"path={path}: status={resp.status_code}"
-        result = resp.json()["results"][0]
-        assert result["ok"] is False, f"expected rejection for {path}, got {result}"
-        assert result["error"] is not None
-
-
-def test_apply_mutations_unknown_session_returns_404(client):
-    """When the session has no container, return 404."""
-    with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
-        instance = cls.return_value
-        instance.container = None
-        payload = {"mutations": [{"path": "/repo/x", "content": base64.b64encode(b"x").decode(), "mode": 0o644}]}
-        resp = client.post("/session/no-such-id/files/", json=payload)
-        assert resp.status_code == 404
-
-
-def test_apply_mutations_empty_batch_rejected(mock_session, client):
-    """Schema-level rejection of empty mutations list → 422."""
-    resp = client.post(f"/session/{mock_session.session_id}/files/", json={"mutations": []})
-    assert resp.status_code == 422
-
-
-def test_apply_mutations_oversized_batch_rejected(mock_session, client):
-    """More than 64 mutations → 422."""
-    payload = {
-        "mutations": [
-            {"path": f"/repo/f{i}.py", "content": base64.b64encode(b"").decode(), "mode": 0o644} for i in range(65)
-        ]
-    }
-    resp = client.post(f"/session/{mock_session.session_id}/files/", json=payload)
-    assert resp.status_code == 422
 
 
 def test_seed_session_rejects_double_seed(mock_session, client):
@@ -567,8 +514,8 @@ def test_seed_session_extracts_skills_archive_only(mock_session, client):
 def test_seed_session_meta_init_runs_on_skills_archive_only(client):
     """Repoless seed (skills_archive only) still inits meta when patch-extractor is linked.
 
-    Without this, the first ``apply_file_mutations`` / ``run`` call in a repoless run
-    would 500 on HEAD-advance because ``/workdir/meta`` was never initialised.
+    Without this, the first ``run`` call in a repoless run would 500 on HEAD-advance
+    because ``/workdir/meta`` was never initialised.
     """
     from docker.models.containers import ExecResult
 
@@ -666,7 +613,7 @@ def test_seed_session_invalid_skills_archive_returns_422(mock_session, client):
 
 
 def test_seed_session_meta_init_runs_on_repo_archive(client):
-    """When a patch extractor is linked, CMD_INIT_META_SCRIPT is executed after /repo is copied."""
+    """When a patch extractor is linked, CMD_INIT_META_SCRIPT is executed after /workspace/repo is copied."""
     from docker.models.containers import ExecResult
 
     from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
@@ -753,19 +700,52 @@ def test_fs_write_then_read_roundtrip(mock_session, client):
 
     w = client.post(
         f"/session/{sid}/fs/write",
-        json={"path": "/scratch/a.txt", "content": base64.b64encode(b"hello\n").decode(), "mode": 0o644},
+        json={"path": "/workspace/tmp/a.txt", "content": base64.b64encode(b"hello\n").decode(), "mode": 0o644},
     )
     assert w.status_code == 200, w.text
     assert w.json() == {"ok": True, "error": None}
 
-    r = client.post(f"/session/{sid}/fs/read", json={"path": "/scratch/a.txt", "offset": 0, "limit": 2000})
+    r = client.post(f"/session/{sid}/fs/read", json={"path": "/workspace/tmp/a.txt", "offset": 0, "limit": 2000})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["encoding"] == "utf-8"
     assert "hello" in body["content"]
 
 
-def test_fs_write_rejects_path_outside_scratch(mock_session, client):
+def test_fs_write_accepts_repo_subdir(mock_session, client):
+    """A write to /workspace/repo is now accepted (fs/* spans the whole workspace)."""
+    mock_session.write_file.return_value = None
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/write",
+        json={"path": "/workspace/repo/x.txt", "content": base64.b64encode(b"hi").decode(), "mode": 0o644},
+    )
+    assert resp.status_code == 200 and resp.json()["ok"] is True, resp.text
+
+
+def test_fs_write_rejects_outside_workspace(mock_session, client):
+    """A path outside /workspace is rejected (returned as ok=False, not an HTTP error)."""
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/write",
+        json={"path": "/etc/evil", "content": base64.b64encode(b"x").decode(), "mode": 0o644},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is False
+    mock_session.write_file.assert_not_called()
+
+
+def test_fs_write_rejects_bare_workspace_root(mock_session, client):
+    """File ops forbid the bare /workspace root (allow_root=False); only ls/grep/glob may target it."""
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/write",
+        json={"path": "/workspace", "content": base64.b64encode(b"x").decode(), "mode": 0o644},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is False
+    mock_session.write_file.assert_not_called()
+
+
+def test_fs_write_rejects_path_outside_workspace_repo_sibling(mock_session, client):
+    """A pre-reparent path like /repo (now outside /workspace) is rejected."""
     sid = mock_session.session_id
     resp = client.post(
         f"/session/{sid}/fs/write",
@@ -778,16 +758,16 @@ def test_fs_write_rejects_path_outside_scratch(mock_session, client):
 
 
 def test_fs_ls_returns_entries(mock_session, client):
-    mock_session.list_dir.return_value = [("/scratch/sub", True), ("/scratch/f.py", False)]
-    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/scratch"})
+    mock_session.list_dir.return_value = [("/workspace/tmp/sub", True), ("/workspace/tmp/f.py", False)]
+    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/workspace/tmp"})
     assert resp.status_code == 200, resp.text
-    assert {"path": "/scratch/sub", "is_dir": True} in resp.json()["entries"]
+    assert {"path": "/workspace/tmp/sub", "is_dir": True} in resp.json()["entries"]
 
 
 @pytest.mark.parametrize("op", ["ls", "grep", "glob"])
 def test_fs_dir_endpoints_reject_traversal(mock_session, client, op):
-    """ls/grep/glob must reject `..` traversal (defeats /scratch confinement otherwise)."""
-    payload = {"path": "/scratch/../repo"}
+    """ls/grep/glob must reject `..` traversal (rejected lexically, before any path resolution)."""
+    payload = {"path": "/workspace/tmp/../repo"}
     if op in ("grep", "glob"):
         payload["pattern"] = "x"
     resp = client.post(f"/session/{mock_session.session_id}/fs/{op}", json=payload)
@@ -795,8 +775,8 @@ def test_fs_dir_endpoints_reject_traversal(mock_session, client, op):
 
 
 def test_fs_ls_surfaces_command_error(mock_session, client):
-    mock_session.list_dir.side_effect = RuntimeError("ls failed (exit 2) for '/scratch/x'")
-    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/scratch/x"})
+    mock_session.list_dir.side_effect = RuntimeError("ls failed (exit 2) for '/workspace/tmp/x'")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/workspace/tmp/x"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["entries"] == []
@@ -805,48 +785,86 @@ def test_fs_ls_surfaces_command_error(mock_session, client):
 
 def test_fs_grep_surfaces_command_error(mock_session, client):
     mock_session.grep.side_effect = RuntimeError("grep failed (exit 2)")
-    resp = client.post(f"/session/{mock_session.session_id}/fs/grep", json={"path": "/scratch", "pattern": "x"})
+    resp = client.post(f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/tmp", "pattern": "x"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["matches"] == []
     assert body["error"] is not None
 
 
-def test_fs_glob_invalid_pattern_returns_400(mock_session, client):
-    resp = client.post(f"/session/{mock_session.session_id}/fs/glob", json={"path": "/scratch", "pattern": "["})
-    assert resp.status_code == 400, resp.text
+def test_fs_glob_unbalanced_bracket_is_literal(mock_session, client):
+    """An unbalanced '[' is treated as a literal (shell-like), not rejected as a 400.
+
+    glob.translate never raises on malformed bracket classes, so the pattern compiles and matches a
+    file literally named '[' rather than producing an error.
+    """
+    from daiv_sandbox.sessions import DirEntry
+
+    mock_session.find_paths.return_value = [DirEntry("/workspace/tmp/[", False), DirEntry("/workspace/tmp/a.py", False)]
+    resp = client.post(f"/session/{mock_session.session_id}/fs/glob", json={"path": "/workspace/tmp", "pattern": "["})
+    assert resp.status_code == 200, resp.text
+    assert [e["path"] for e in resp.json()["matches"]] == ["/workspace/tmp/["]
 
 
 def test_fs_glob_filters_by_pattern(mock_session, client):
     from daiv_sandbox.sessions import DirEntry
 
     mock_session.find_paths.return_value = [
-        DirEntry("/scratch/a.py", False),
-        DirEntry("/scratch/b.txt", False),
-        DirEntry("/scratch/sub", True),
+        DirEntry("/workspace/tmp/a.py", False),
+        DirEntry("/workspace/tmp/b.txt", False),
+        DirEntry("/workspace/tmp/sub", True),
     ]
-    resp = client.post(f"/session/{mock_session.session_id}/fs/glob", json={"path": "/scratch", "pattern": "*.py"})
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/glob", json={"path": "/workspace/tmp", "pattern": "*.py"}
+    )
     assert resp.status_code == 200, resp.text
-    assert [e["path"] for e in resp.json()["matches"]] == ["/scratch/a.py"]
+    assert [e["path"] for e in resp.json()["matches"]] == ["/workspace/tmp/a.py"]
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected"),
+    [
+        ("[ab].py", ["/workspace/tmp/a.py", "/workspace/tmp/b.py"]),  # class membership
+        ("[!a]*.py", ["/workspace/tmp/b.py", "/workspace/tmp/c.py"]),  # negated class
+    ],
+)
+def test_fs_glob_char_classes(mock_session, client, pattern, expected):
+    """Bracket classes work end-to-end through glob.translate: `[abc]` membership and `[!x]` negation.
+
+    Guards the semantics that changed when `_glob_to_regex` moved off the hand-rolled engine, so a
+    future swap back to e.g. fnmatch can't silently alter char-class matching.
+    """
+    from daiv_sandbox.sessions import DirEntry
+
+    mock_session.find_paths.return_value = [
+        DirEntry("/workspace/tmp/a.py", False),
+        DirEntry("/workspace/tmp/b.py", False),
+        DirEntry("/workspace/tmp/c.py", False),
+    ]
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/glob", json={"path": "/workspace/tmp", "pattern": pattern}
+    )
+    assert resp.status_code == 200, resp.text
+    assert sorted(e["path"] for e in resp.json()["matches"]) == sorted(expected)
 
 
 def test_fs_glob_surfaces_find_error(mock_session, client):
     mock_session.find_paths.side_effect = RuntimeError("find failed")
-    resp = client.post(f"/session/{mock_session.session_id}/fs/glob", json={"path": "/scratch/x", "pattern": "*"})
+    resp = client.post(f"/session/{mock_session.session_id}/fs/glob", json={"path": "/workspace/tmp/x", "pattern": "*"})
     assert resp.status_code == 200, resp.text
     assert resp.json()["error"] is not None
 
 
 def test_fs_read_missing_file(mock_session, client):
-    mock_session.read_file_bytes.side_effect = FileNotFoundError("/scratch/x")
-    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/scratch/x"})
+    mock_session.read_file_bytes.side_effect = FileNotFoundError("/workspace/tmp/x")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/x"})
     assert resp.status_code == 200, resp.text
     assert resp.json()["error"] == "file_not_found"
 
 
 def test_fs_read_empty_file(mock_session, client):
     mock_session.read_file_bytes.return_value = b""
-    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/scratch/e.txt"})
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/e.txt"})
     body = resp.json()
     assert body["encoding"] == "utf-8"
     assert "empty" in body["content"].lower()
@@ -854,7 +872,7 @@ def test_fs_read_empty_file(mock_session, client):
 
 def test_fs_read_binary_falls_back_to_base64(mock_session, client):
     mock_session.read_file_bytes.return_value = b"\xff\xfe\x00"
-    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/scratch/b.bin"})
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/b.bin"})
     body = resp.json()
     assert body["encoding"] == "base64"
     assert base64.b64decode(body["content"]) == b"\xff\xfe\x00"
@@ -863,7 +881,7 @@ def test_fs_read_binary_falls_back_to_base64(mock_session, client):
 def test_fs_read_offset_beyond_eof(mock_session, client):
     mock_session.read_file_bytes.return_value = b"one\ntwo\n"
     resp = client.post(
-        f"/session/{mock_session.session_id}/fs/read", json={"path": "/scratch/a.txt", "offset": 50, "limit": 10}
+        f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt", "offset": 50, "limit": 10}
     )
     assert "offset" in resp.json()["error"].lower()
 
@@ -872,7 +890,7 @@ def test_fs_edit_multiple_occurrences(mock_session, client):
     mock_session.edit_file.side_effect = ValueError("multiple_occurrences")
     resp = client.post(
         f"/session/{mock_session.session_id}/fs/edit",
-        json={"path": "/scratch/a.txt", "old": "x", "new": "y", "replace_all": False},
+        json={"path": "/workspace/tmp/a.txt", "old": "x", "new": "y", "replace_all": False},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["error"] == "multiple_occurrences"
@@ -881,7 +899,7 @@ def test_fs_edit_multiple_occurrences(mock_session, client):
 def test_fs_edit_not_a_text_file(mock_session, client):
     mock_session.edit_file.side_effect = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
     resp = client.post(
-        f"/session/{mock_session.session_id}/fs/edit", json={"path": "/scratch/a.txt", "old": "x", "new": "y"}
+        f"/session/{mock_session.session_id}/fs/edit", json={"path": "/workspace/tmp/a.txt", "old": "x", "new": "y"}
     )
     assert resp.json()["error"] == "not_a_text_file"
 
@@ -890,14 +908,14 @@ def test_fs_edit_success_returns_count(mock_session, client):
     mock_session.edit_file.return_value = 2
     resp = client.post(
         f"/session/{mock_session.session_id}/fs/edit",
-        json={"path": "/scratch/a.txt", "old": "x", "new": "y", "replace_all": True},
+        json={"path": "/workspace/tmp/a.txt", "old": "x", "new": "y", "replace_all": True},
     )
     assert resp.json()["occurrences"] == 2
 
 
 def test_fs_endpoints_404_when_container_missing(mock_session, client):
     mock_session.container = None
-    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/scratch/a.txt"})
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt"})
     assert resp.status_code == 404, resp.text
 
 

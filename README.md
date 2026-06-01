@@ -75,8 +75,8 @@ All settings are configurable via environment variables. The available settings 
 `daiv-sandbox` provides a REST API to interact with. Here is a quick overview of the available endpoints:
 
 - `POST /session/`: Start a sandbox session.
-- `POST /session/{session_id}/seed/`: Seed the initial `/repo` and/or `/skills` state from tar archives (one-shot per session).
-- `POST /session/{session_id}/files/`: Apply a batch of file mutations to `/repo`.
+- `POST /session/{session_id}/seed/`: Seed the initial `/workspace/repo` and/or `/workspace/skills` state from tar archives (one-shot per session).
+- `POST /session/{session_id}/fs/{op}`: Python-free file operations across `/workspace` (`ls`, `read`, `grep`, `glob`, `write`, `edit`, `delete`).
 - `POST /session/{session_id}/`: Run commands on the sandbox session.
 - `DELETE /session/{session_id}/`: Close the sandbox session.
 - `GET /-/health/`: Healthcheck endpoint.
@@ -140,17 +140,17 @@ print(resp["session_id"])
 
 ### Seeding a Session
 
-A freshly-started session has empty `/repo` and `/skills` directories. Before running commands or applying file mutations, seed the workspace by calling `POST /session/{session_id}/seed/` with one or both archives as `multipart/form-data` fields. `repo_archive` is extracted into `/repo` (e.g. a repository snapshot) and `skills_archive` is extracted into `/skills` (auxiliary tooling, prompts, etc.). When `extract_patch` was enabled at session start and `repo_archive` is provided, the patch-extractor's meta repo is initialised against this state.
+A freshly-started session has empty `/workspace/repo` and `/workspace/skills` directories. Before running commands or operating on files, seed the workspace by calling `POST /session/{session_id}/seed/` with one or both archives as `multipart/form-data` fields. `repo_archive` is extracted into `/workspace/repo` (e.g. a repository snapshot) and `skills_archive` is extracted into `/workspace/skills` (auxiliary tooling, prompts, etc.). When `extract_patch` was enabled at session start and `repo_archive` is provided, the patch-extractor's meta repo is initialised against this state.
 
 Both fields are optional individually, but **at least one must be provided** — a request with neither returns `422`. Seeding is **one-shot per session** — a second call returns `409 Conflict`.
 
 Archives may be plain `tar` or gzip-compressed (`tar.gz`); they are sanitised and streamed into the container without being fully buffered in memory.
 
-| Parameter        | Description                                              | Required          | Valid Values               |
-| ---------------- | -------------------------------------------------------- | ----------------- | -------------------------- |
-| `repo_archive`   | Tar archive that becomes the initial state of `/repo`.   | At least one of   | `tar` or `tar.gz` (binary) |
-| `skills_archive` | Tar archive that becomes the initial state of `/skills`. | `repo_archive` or | `tar` or `tar.gz` (binary) |
-|                  |                                                          | `skills_archive`  |                            |
+| Parameter        | Description                                                        | Required          | Valid Values               |
+| ---------------- | ------------------------------------------------------------------ | ----------------- | -------------------------- |
+| `repo_archive`   | Tar archive that becomes the initial state of `/workspace/repo`.   | At least one of   | `tar` or `tar.gz` (binary) |
+| `skills_archive` | Tar archive that becomes the initial state of `/workspace/skills`. | `repo_archive` or | `tar` or `tar.gz` (binary) |
+|                  |                                                                    | `skills_archive`  |                            |
 
 ```sh
 $ curl -X POST \
@@ -162,35 +162,37 @@ $ curl -X POST \
 
 The response is an empty body with status `204`.
 
-### Applying File Mutations
+### Workspace File Operations
 
-To write or overwrite files in `/repo` without spawning a shell, use `POST /session/{session_id}/files/`. Each mutation specifies an absolute path under `/repo`, base64-encoded content, and POSIX mode bits. When `extract_patch` was enabled at session start, the meta-repo HEAD is advanced after a successful batch so the next `POST /session/{session_id}/` returns a patch that includes these changes.
+To inspect or modify files without spawning a shell, use the `POST /session/{session_id}/fs/{op}` endpoints. They operate anywhere under `/workspace` (`repo/`, `skills/`, `tmp/`) and are Python-free — content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so they work even on base images without a Python interpreter (e.g. `alpine`).
 
-Per-item errors (e.g. invalid path) are returned in `results[]` with `ok=false`; request-level errors (auth, schema, unknown session) return a 4xx status.
+| Op       | Body                             | Returns                     |
+| -------- | -------------------------------- | --------------------------- |
+| `ls`     | `{path}`                         | directory entries           |
+| `read`   | `{path, offset?, limit?}`        | utf-8 text or base64 binary |
+| `grep`   | `{pattern, path, glob?}`         | literal-substring matches   |
+| `glob`   | `{pattern, path}`                | paths matching the glob     |
+| `write`  | `{path, content, mode?}`         | `{ok, error?}`              |
+| `edit`   | `{path, old, new, replace_all?}` | `{occurrences, error?}`     |
+| `delete` | `{path}`                         | `{ok, error?}`              |
 
-| Parameter   | Description                              | Required | Valid Values                     |
-| ----------- | ---------------------------------------- | -------- | -------------------------------- |
-| `mutations` | Batch of file mutations to apply (1–64). | Yes      | Array of `{path, content, mode}` |
-
-`mutations[].path` must be absolute and under `/repo`; `mutations[].content` is base64-encoded full file content; `mutations[].mode` is an integer in the POSIX mode range (e.g. `0o644`).
+`path` must be absolute and under `/workspace`; the file ops (`write`/`edit`/`read`/`delete`) target a file, while the directory ops (`ls`/`grep`/`glob`) may also target the `/workspace` root itself. `content` is base64-encoded. Every response also carries an `error` field, set when the operation fails (e.g. invalid path, missing file). `read` additionally returns a human-readable sentinel string for an empty file (with `encoding: "utf-8"`), and an `error` when `offset` exceeds the file length. The sandbox is the single source of truth: edits under `/workspace/repo` land on the volume the patch-extractor diffs and therefore surface in the next run's patch, while `skills/` and `tmp/` stay container-local.
 
 ```sh
 $ curl -X POST \
   -H "Content-Type: application/json" \
   -H "X-API-Key: notsosecret" \
-  -d '{"mutations": [{"path": "/repo/hello.txt", "content": "aGVsbG8=", "mode": 420}]}' \
-  http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/files/
+  -d '{"path": "/workspace/repo/hello.txt", "content": "aGVsbG8=", "mode": 420}' \
+  http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/fs/write
 ```
 
 ```json
-{
-  "results": [{ "path": "/repo/hello.txt", "ok": true, "error": null }]
-}
+{ "ok": true, "error": null }
 ```
 
 ### Running Commands
 
-To run commands on a sandbox session, call `POST /session/{session_id}/` using the session ID returned when starting the session. Commands execute against the container's persistent `/repo` workspace, which carries state across calls in the same session (seed → mutations → commands → more commands…).
+To run commands on a sandbox session, call `POST /session/{session_id}/` using the session ID returned when starting the session. Commands execute against the container's persistent `/workspace/repo` workspace, which carries state across calls in the same session (seed → file ops → commands → more commands…).
 
 By default, all commands are executed sequentially regardless of their exit codes. Set `fail_fast` to `true` to stop on the first non-zero exit code. Pipelines run with `pipefail`, so a failing stage in `cmd1 | cmd2` correctly propagates a non-zero exit code.
 
@@ -249,7 +251,7 @@ session_id = (
     .json()["session_id"]
 )
 
-# 2. Seed /repo (and optionally /skills) from tar archives via multipart upload.
+# 2. Seed /workspace/repo (and optionally /workspace/skills) from tar archives via multipart upload.
 tarstream = io.BytesIO()
 with tarfile.open(fileobj=tarstream, mode="w:gz") as tar:
     # Add files to tar...
