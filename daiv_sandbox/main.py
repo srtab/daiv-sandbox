@@ -349,6 +349,23 @@ async def close_session(
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@app.get("/session/{session_id}/", responses=common_responses, name="Get session status")
+async def get_session(
+    request: Request,
+    session_id: Annotated[str, FastAPIPath(title="The ID of the session to check")],
+    api_key: str = Depends(get_api_key),
+) -> Response:
+    """
+    Return 204 if the session's container exists (restarting it if stopped, i.e. warming it for
+    reuse), or 404 if it does not. Lock-guarded so it can't race the reaper.
+    """
+    async with request.app.state.session_lock_manager.acquire(session_id):
+        cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
+        if not cmd_executor.container:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @app.get(
     "/-/health/", responses={200: {"content": {"application/json": {"example": {"status": "ok"}}}}}, name="Healthcheck"
 )

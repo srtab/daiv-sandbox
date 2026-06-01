@@ -336,6 +336,22 @@ def test_close_session_force_removes_container(client):
         mock_cmd_executor.stop_container.assert_not_called()
 
 
+def test_get_session_returns_204_when_present(client):
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        instance = mock_session_class.return_value
+        instance.container = Mock()
+        response = client.get("/session/some-id/")
+        assert response.status_code == 204
+
+
+def test_get_session_returns_404_when_missing(client):
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        instance = mock_session_class.return_value
+        instance.container = None
+        response = client.get("/session/missing-id/")
+        assert response.status_code == 404
+
+
 def test_close_session_returns_conflict_when_session_is_locked(mock_session, client, monkeypatch):
     monkeypatch.setattr(app.state, "session_lock_manager", BusySessionLockManager())
 
