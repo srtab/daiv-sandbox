@@ -35,5 +35,7 @@ def sandbox_session(client: TestClient):
     try:
         yield _create
     finally:
+        # DELETE now stops (preserves) the container by default; force-remove so the fixture honors
+        # its "always delete them" contract and integration runs don't leak stopped containers.
         for session_id in created_session_ids:
-            client.delete(f"/session/{session_id}/")
+            client.delete(f"/session/{session_id}/?force=true")

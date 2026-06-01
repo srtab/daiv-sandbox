@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 def test_git_commands_dont_raise_safe_directory_exception(client: TestClient, sandbox_session: Callable[..., str]):
     """Test that git commands don't raise safe directory exception."""
-    session_id = sandbox_session(base_image="alpine/git:latest", extract_patch=True)
+    session_id = sandbox_session(base_image="alpine/git:latest")
 
     seed = client.post(
         f"/session/{session_id}/seed/",

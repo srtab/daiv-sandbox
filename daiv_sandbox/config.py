@@ -45,8 +45,12 @@ class Settings(BaseSettings):
     SESSION_LOCK_WAIT_SECONDS: float = 1.0
     SESSION_LOCK_REFRESH_SECONDS: float = 30.0
 
-    # Git
-    GIT_IMAGE: str = "alpine/git:2.52.0"
+    # Session reaper / lifecycle
+    REAPER_ENABLED: bool = True
+    REAPER_INTERVAL_SECONDS: int = Field(default=600, gt=0)  # sweep cadence in seconds
+    SESSION_GRACE_SECONDS: int = Field(default=43200, ge=0)  # stopped -> removed age (12h)
+    MAX_STOPPED_SESSIONS: int = Field(default=50, ge=0)  # LRU cap on retained stopped containers
+    STOP_TIMEOUT_SECONDS: int = Field(default=2, ge=0)  # docker stop grace before SIGKILL
 
 
 settings = Settings()  # type: ignore

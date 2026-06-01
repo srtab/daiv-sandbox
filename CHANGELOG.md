@@ -7,9 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### Fixed
+### Added
 
-- `POST /session/{id}/seed/` now initialises the patch-extractor meta repo whenever the session was started with `extract_patch=True`, even when only `skills_archive` is provided (no `repo_archive`). Without this, the first `apply_file_mutations` or `run` call in a repoless flow failed with HTTP 500 because `/workdir/meta` was missing.
+- `POST /session/{id}/fs/{op}` — Python-free workspace file operations (`ls`, `read`, `grep`, `glob`, `write`, `edit`, `delete`) that act anywhere under `/workspace`. `read` paginates text with `offset`/`limit` and returns binary as base64; `grep` matches a literal substring; `glob` supports `*`, `**`, `?`, and `[abc]`.
+- `GET /session/{id}/` — returns `204` if the session's container exists (restarting it if stopped, warming it for reuse) or `404` if it does not.
+- `?force=true` query parameter on `DELETE /session/{id}/` to remove the container immediately instead of stopping it.
+- Background session reaper that removes stopped containers `DAIV_SANDBOX_SESSION_GRACE_SECONDS` after they stopped (default 12h), with an LRU cap of `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` retained stopped containers (default 50). Configurable via `DAIV_SANDBOX_REAPER_ENABLED`, `DAIV_SANDBOX_REAPER_INTERVAL_SECONDS`, and `DAIV_SANDBOX_STOP_TIMEOUT_SECONDS`.
+
+### Changed
+
+- `DELETE /session/{id}/` now _stops_ the container instead of removing it, preserving it for warm reuse; it is reclaimed later by the reaper, or immediately when `?force=true` is passed. **Breaking change** — the container is no longer removed on close by default.
+- Unified the container filesystem under `/workspace` (`repo/`, `skills/`, `tmp/`). Repo archives now extract into `/workspace/repo`, skills into `/workspace/skills`, and commands run in `/workspace/repo`. **Breaking change** — paths moved from `/repo` and `/skills`.
+
+### Removed
+
+- Patch extraction. Removed the patch-extractor side-car container, the `extract_patch` parameter from the start-session request, the `patch` field from the run-commands response, and the `DAIV_SANDBOX_GIT_IMAGE` setting. Recover changes by running git (e.g. `git diff`, `git status`) inside `/workspace/repo` through the run-commands endpoint. **Breaking change**
+- `POST /session/{id}/files/` batch file-mutation endpoint, replaced by the `POST /session/{id}/fs/{op}` endpoints. **Breaking change**
 
 ## [0.5.0] - 2026-05-04
 
