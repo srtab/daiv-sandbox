@@ -159,6 +159,22 @@ def test_session_type_label_constants():
     assert TYPE_CMD_EXECUTOR == "cmd_executor"
 
 
+def test_stop_container(mock_docker_client):
+    from daiv_sandbox.config import settings as cfg
+
+    session = SandboxDockerSession(session_id="test-session-id")
+    session.stop_container()
+    mock_docker_client.containers.get.assert_called_with("test-session-id")
+    mock_docker_client.containers.get.return_value.stop.assert_called_once_with(timeout=cfg.STOP_TIMEOUT_SECONDS)
+
+
+def test_stop_container_with_container_not_found(mock_docker_client):
+    session = SandboxDockerSession(session_id="test-session-id")
+    mock_docker_client.containers.get.side_effect = NotFound(session.session_id)
+    session.stop_container()  # must not raise
+    mock_docker_client.containers.get.return_value.stop.assert_not_called()
+
+
 def test_copy_to_runtime_creates_directory(mock_docker_client):
     import io
     import tarfile

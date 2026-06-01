@@ -360,6 +360,22 @@ class SandboxDockerSession:
         else:
             logger.info("Container '%s' removed", self.session_id)
 
+    def stop_container(self):
+        """
+        Stop the container without removing it, preserving its writable layer for warm reuse.
+
+        Idempotent: a missing container is logged and ignored; an already-stopped container is a
+        Docker no-op. PID 1 is ``sleep``, which ignores SIGTERM, so ``stop`` waits the (small)
+        ``STOP_TIMEOUT_SECONDS`` and then SIGKILLs — the filesystem is preserved either way.
+        """
+        try:
+            container = self.client.containers.get(self.session_id)
+        except NotFound:
+            logger.warning("Container '%s' not found", self.session_id)
+        else:
+            container.stop(timeout=settings.STOP_TIMEOUT_SECONDS)
+            logger.info("Container '%s' stopped", self.session_id)
+
     def copy_to_container(self, tardata: IO[bytes], dest: str | None = None, clear_before_copy: bool = True):
         """
         Copy a file or directory to a specific path in the container.
