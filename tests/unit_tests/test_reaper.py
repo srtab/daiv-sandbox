@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 from daiv_sandbox.locks import NoopSessionLockManager, SessionBusyError
 from daiv_sandbox.reaper import _list_stopped_sandbox_containers, _parse_docker_timestamp, _reap_once, _remove_guarded
@@ -103,3 +103,38 @@ async def test_reap_once_lru_evicts_oldest_beyond_cap():
     c1.remove.assert_called_once_with(force=True)
     c2.remove.assert_called_once_with(force=True)
     c3.remove.assert_not_called()
+
+
+async def test_maybe_reap_runs_directly_without_redis():
+    client = Mock()
+    client.containers.list.return_value = []
+    # redis=None -> no leader lock, sweep runs inline (no exception, list consulted).
+    from daiv_sandbox.reaper import _maybe_reap
+
+    await _maybe_reap(client, None, NoopSessionLockManager(), grace_seconds=43200, max_stopped=50)
+    client.containers.list.assert_called_once()
+
+
+async def test_maybe_reap_skips_when_not_leader():
+    from daiv_sandbox.reaper import _maybe_reap
+
+    client = Mock()
+    client.containers.list.return_value = []
+    lock = Mock()
+    lock.acquire = AsyncMock(return_value=False)  # another replica holds it
+    lock.release = AsyncMock(return_value=None)
+    redis = Mock()
+    redis.lock = Mock(return_value=lock)
+
+    await _maybe_reap(client, redis, NoopSessionLockManager(), grace_seconds=43200, max_stopped=50)
+
+    client.containers.list.assert_not_called()  # sweep skipped
+
+
+def test_start_reaper_returns_none_when_disabled(monkeypatch):
+    from daiv_sandbox import reaper
+    from daiv_sandbox.config import settings as cfg
+
+    monkeypatch.setattr(cfg, "REAPER_ENABLED", False)
+    app = Mock()
+    assert reaper.start_reaper(app) is None

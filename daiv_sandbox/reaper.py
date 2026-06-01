@@ -6,10 +6,13 @@ from datetime import UTC, datetime
 
 from docker.errors import NotFound
 
+from daiv_sandbox.config import settings
 from daiv_sandbox.locks import SessionBusyError
-from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, TYPE_CMD_EXECUTOR
+from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, TYPE_CMD_EXECUTOR, SandboxDockerSession
 
 logger = logging.getLogger("daiv_sandbox")
+
+_REAPER_LEADER_KEY = "daiv-sandbox:reaper-leader"
 
 
 def _parse_docker_timestamp(value: str) -> datetime | None:
@@ -84,3 +87,60 @@ async def _reap_once(client, lock_manager, *, now, grace_seconds: int, max_stopp
         survivors.sort(key=lambda item: item[1] or now)
         for container, _finished in survivors[: len(survivors) - max_stopped]:
             await _remove_guarded(container, lock_manager)
+
+
+async def _maybe_reap(client, redis, lock_manager, *, grace_seconds: int, max_stopped: int) -> None:
+    """Run one sweep, gated by a Redis leader lock so only one replica sweeps per tick.
+
+    When ``redis`` is None (single-instance / no locking) the sweep runs inline.
+    """
+    now = datetime.now(UTC)
+    if redis is None:
+        await _reap_once(client, lock_manager, now=now, grace_seconds=grace_seconds, max_stopped=max_stopped)
+        return
+
+    leader = redis.lock(_REAPER_LEADER_KEY, timeout=settings.REAPER_INTERVAL_SECONDS)
+    if not await leader.acquire(blocking=False):
+        logger.debug("Reaper: another replica holds the leader lock; skipping tick")
+        return
+    try:
+        await _reap_once(client, lock_manager, now=now, grace_seconds=grace_seconds, max_stopped=max_stopped)
+    finally:
+        try:
+            await leader.release()
+        except Exception:
+            logger.debug("Reaper: leader lock already released/expired")
+
+
+async def _reaper_loop(client, redis, lock_manager, *, interval: int, grace_seconds: int, max_stopped: int) -> None:
+    """Sweep forever on a fixed cadence. A failed sweep is logged and the loop continues."""
+    while True:
+        try:
+            await _maybe_reap(client, redis, lock_manager, grace_seconds=grace_seconds, max_stopped=max_stopped)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Reaper: sweep failed")
+        await asyncio.sleep(interval)
+
+
+def start_reaper(app) -> asyncio.Task | None:
+    """Schedule the reaper loop as a background task, or None when disabled.
+
+    Reads ``app.state.redis`` and ``app.state.session_lock_manager`` set up in ``lifespan``.
+    """
+    if not settings.REAPER_ENABLED:
+        logger.info("Reaper disabled (DAIV_SANDBOX_REAPER_ENABLED=false)")
+        return None
+
+    client = SandboxDockerSession._get_shared_client()
+    return asyncio.create_task(
+        _reaper_loop(
+            client,
+            app.state.redis,
+            app.state.session_lock_manager,
+            interval=settings.REAPER_INTERVAL_SECONDS,
+            grace_seconds=settings.SESSION_GRACE_SECONDS,
+            max_stopped=settings.MAX_STOPPED_SESSIONS,
+        )
+    )
