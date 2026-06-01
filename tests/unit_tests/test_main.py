@@ -802,6 +802,48 @@ def test_fs_read_binary_over_cap_is_error(mock_session, client):
     assert "exceeds maximum preview size" in body["error"]
 
 
+def test_fs_read_text_truncated_on_multibyte_boundary(mock_session, client):
+    """A page of multi-byte chars forces the cap slice to land mid-character; decode(errors='ignore')
+    must drop the partial char rather than raise, and the result stays within the cap with the marker.
+    Guards the errors='ignore' branch that an all-ASCII payload never exercises."""
+    from daiv_sandbox.main import READ_MAX_OUTPUT_BYTES
+
+    # "€" is 3 bytes in UTF-8, so the byte slice almost never aligns to a character boundary.
+    mock_session.read_file_bytes.return_value = ("€" * READ_MAX_OUTPUT_BYTES).encode("utf-8")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/big.txt"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["encoding"] == "utf-8"
+    assert "[Output truncated" in body["content"]
+    assert len(body["content"].encode("utf-8")) <= READ_MAX_OUTPUT_BYTES
+
+
+def test_fs_read_text_exactly_at_cap_not_truncated(mock_session, client):
+    """A text page whose byte length equals the cap is returned verbatim — the boundary is strictly
+    greater-than, so an off-by-one flip to >= would be caught here."""
+    from daiv_sandbox.main import READ_MAX_OUTPUT_BYTES
+
+    mock_session.read_file_bytes.return_value = b"a" * READ_MAX_OUTPUT_BYTES
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/exact.txt"})
+    body = resp.json()
+    assert body["encoding"] == "utf-8"
+    assert "Output truncated" not in body["content"]
+    assert len(body["content"].encode("utf-8")) == READ_MAX_OUTPUT_BYTES
+
+
+def test_fs_read_binary_exactly_at_cap_is_base64(mock_session, client):
+    """A binary file of exactly the cap size is still returned as base64 — only strictly larger errors."""
+    from daiv_sandbox.main import READ_MAX_OUTPUT_BYTES
+
+    raw = b"\xff" * READ_MAX_OUTPUT_BYTES
+    mock_session.read_file_bytes.return_value = raw
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/exact.bin"})
+    body = resp.json()
+    assert body["encoding"] == "base64"
+    assert base64.b64decode(body["content"]) == raw
+    assert body["error"] is None
+
+
 def test_fs_edit_multiple_occurrences(mock_session, client):
     mock_session.edit_file.side_effect = ValueError("multiple_occurrences")
     resp = client.post(

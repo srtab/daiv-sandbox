@@ -67,7 +67,7 @@ EXIT_CODE_TIMEOUT = 124  # matches timeout(1) convention
 READ_MAX_OUTPUT_BYTES = 512_000
 
 READ_TRUNCATION_MARKER = (
-    "\n\n[Output truncated: exceeded the 512000-byte read limit. "
+    f"\n\n[Output truncated: exceeded the {READ_MAX_OUTPUT_BYTES}-byte read limit. "
     "Continue with a larger offset or smaller limit to read the rest.]"
 )
 

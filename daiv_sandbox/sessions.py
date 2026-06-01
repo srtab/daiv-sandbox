@@ -503,10 +503,19 @@ class SandboxDockerSession:
             raise ValueError(f"path resolves to an unusable location: {path!r}")
 
         if create_only:
-            # `|| true` keeps the exit code 0 on the common (absent) path so execute_command does not
-            # log a spurious warning; presence is signalled by the EXISTS marker on stdout.
-            probe = self.execute_command(f"[ -e {_sh_quote(canonical)} ] && printf EXISTS || true")
-            if probe.output.strip() == "EXISTS":
+            # Probe existence and fail *closed*: the guard exists to prevent overwrites, so a
+            # malfunctioning probe must raise (caught and logged by fs_write) rather than be mistaken
+            # for "absent" and silently clobber the file. Both branches print a definite marker and
+            # exit 0, so an unrecognised marker or non-zero exit signals a broken probe, not absence.
+            probe = self.execute_command(
+                f"if [ -e {_sh_quote(canonical)} ]; then printf EXISTS; else printf ABSENT; fi"
+            )
+            marker = probe.output.strip()
+            if probe.exit_code != 0 or marker not in ("EXISTS", "ABSENT"):
+                raise RuntimeError(
+                    f"create-only existence probe failed for {path!r} (exit {probe.exit_code}, output {probe.output!r})"
+                )
+            if marker == "EXISTS":
                 raise FileExistsError(
                     f"Cannot write to {path} because it already exists. "
                     "Read and then make an edit, or write to a new path."
@@ -622,8 +631,10 @@ class SandboxDockerSession:
     def edit_file(self, path: str, old: str, new: str, replace_all: bool, *, allowed_roots: tuple[str, ...]) -> int:
         """Read, replace, and write back a text file. CRLF-aware. Returns occurrence count.
 
-        Raises FileNotFoundError, UnicodeDecodeError, or ValueError("string_not_found" /
-        "multiple_occurrences") for the endpoint to map to error codes.
+        Raises FileNotFoundError or UnicodeDecodeError, or a ValueError carrying a human-readable
+        message: ``"string_not_found"``, an EOF-newline mismatch hint (when ``old`` carries a
+        trailing newline the file lacks at EOF), or a multiple-occurrences message that includes the
+        count. ``fs_edit`` forwards the ValueError text to the caller verbatim.
         """
         raw = self.read_file_bytes(path)
         text = raw.decode("utf-8")  # UnicodeDecodeError → not a text file

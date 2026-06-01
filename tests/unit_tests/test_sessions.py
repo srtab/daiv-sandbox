@@ -452,9 +452,31 @@ def test_write_file_create_only_rejects_existing(mock_docker_client):
 def test_write_file_create_only_allows_new(mock_docker_client):
     """create_only=True writes when the probe reports the path is absent."""
     s = _session_with_container()
-    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="ABSENT"))
     s.copy_to_container = Mock()
     s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
+    s.copy_to_container.assert_called_once()
+
+
+def test_write_file_create_only_probe_failure_raises(mock_docker_client):
+    """A malfunctioning probe (unrecognised marker / non-zero exit) fails closed: it raises
+    RuntimeError instead of being mistaken for 'absent' and silently overwriting the file."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="sh: printf: not found"))
+    s.copy_to_container = Mock()
+    with pytest.raises(RuntimeError, match="existence probe failed"):
+        s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
+    s.copy_to_container.assert_not_called()
+
+
+def test_write_file_default_skips_existence_probe(mock_docker_client):
+    """The create_only=False default overwrites without probing — edit_file's write-back relies on
+    this, so the probe must be skipped entirely (no execute_command call)."""
+    s = _session_with_container()
+    s.execute_command = Mock()
+    s.copy_to_container = Mock()
+    s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,))
+    s.execute_command.assert_not_called()
     s.copy_to_container.assert_called_once()
 
 
@@ -824,6 +846,24 @@ def test_edit_file_eof_newline_ambiguous_hint():
     s = _edit_session(b"abckeydefkey")
     with pytest.raises(ValueError, match="add surrounding context"):
         s.edit_file("/scratch/a.txt", "key\n", "KEY\n", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_eof_newline_hint_normalizes_crlf():
+    """The hint LF-normalizes the file, so a CRLF body with no trailing newline still triggers the
+    unique 'trailing newline removed' hint — guards the text_lf normalization in the hint branch."""
+    s = _edit_session(b"abcdef\r\nkey")
+    with pytest.raises(ValueError, match="trailing newline removed"):
+        s.edit_file("/scratch/a.txt", "key\n", "KEY\n", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_single_newline_old_not_eof_hint():
+    """A lone-newline `old` must not enter the hint branch (the len(old_lf) > 1 guard): it falls
+    through to the plain string_not_found rather than a misleading EOF hint."""
+    s = _edit_session(b"abcdef")
+    with pytest.raises(ValueError, match="string_not_found"):
+        s.edit_file("/scratch/a.txt", "\n", "X", replace_all=False, allowed_roots=("/scratch",))
     s.write_file.assert_not_called()
 
 
