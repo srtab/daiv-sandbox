@@ -9,6 +9,7 @@ from docker.models.images import Image
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.sessions import (
+    _PATH_ABSENT_EXIT,
     PIPEFAIL_WRAPPER,
     SANDBOX_HOME,
     SANDBOX_ROOT,
@@ -122,6 +123,22 @@ def test__start_container(mock_docker_client):
         ],
         user="root",
     )
+
+
+def test_start_container_force_removes_on_bootstrap_failure(mock_docker_client):
+    """If mkdir/chown fails after the container starts, force-remove it.
+
+    The container runs `sleep 3600`, so it stays alive on failure and `remove=True` won't reap it;
+    `_start_container` must force-remove it so a failed start() leaks nothing.
+    """
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=1, output=b"boom")
+
+    with pytest.raises(RuntimeError):
+        session._start_container("img:latest")
+
+    mock_container.remove.assert_called_once_with(force=True)
 
 
 def test_remove_container(mock_docker_client):
@@ -421,6 +438,55 @@ def test_write_file_rejects_nul_in_path(mock_docker_client):
         session.write_file(f"{SANDBOX_ROOT}/foo\x00bar", b"x", mode=0o644)
 
 
+def test_write_file_create_only_rejects_existing(mock_docker_client):
+    """create_only=True refuses to overwrite: an existence probe that finds the file raises
+    FileExistsError before any archive is copied."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="EXISTS"))
+    s.copy_to_container = Mock()
+    with pytest.raises(FileExistsError, match="already exists"):
+        s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
+    s.copy_to_container.assert_not_called()
+
+
+def test_write_file_create_only_allows_new(mock_docker_client):
+    """create_only=True writes when the probe reports the path is absent."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="ABSENT"))
+    s.copy_to_container = Mock()
+    s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
+    s.copy_to_container.assert_called_once()
+
+
+def test_write_file_create_only_probe_failure_raises(mock_docker_client):
+    """A malfunctioning probe (unrecognised marker / non-zero exit) fails closed: it raises
+    RuntimeError instead of being mistaken for 'absent' and silently overwriting the file."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="sh: printf: not found"))
+    s.copy_to_container = Mock()
+    with pytest.raises(RuntimeError, match="existence probe failed"):
+        s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
+    s.copy_to_container.assert_not_called()
+
+
+def test_write_file_default_skips_existence_probe(mock_docker_client):
+    """The create_only=False default overwrites without probing — edit_file's write-back relies on
+    this, so the probe must be skipped entirely (no execute_command call)."""
+    s = _session_with_container()
+    s.execute_command = Mock()
+    s.copy_to_container = Mock()
+    s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,))
+    s.execute_command.assert_not_called()
+    s.copy_to_container.assert_called_once()
+
+
+def test_edit_file_write_back_does_not_use_create_only():
+    """edit's write-back must overwrite the file it just read (create_only must stay falsy)."""
+    s = _edit_session(b"hello world\n")
+    s.edit_file("/scratch/a.txt", "world", "there", replace_all=False, allowed_roots=("/scratch",))
+    assert not s.write_file.call_args.kwargs.get("create_only")
+
+
 def test_copy_to_container_allows_skills_root(mock_docker_client):
     """copy_to_container accepts /skills (and subdirs) as a destination."""
     session = SandboxDockerSession()
@@ -459,24 +525,21 @@ def test_copy_to_container_rejects_non_reserved_root(mock_docker_client):
         session.copy_to_container(buf, dest="/etc/passwd", clear_before_copy=False)
 
 
-def test_copy_to_container_allows_workdir_root(mock_docker_client):
-    """copy_to_container accepts /workdir (and subdirs) — the patch-extractor meta volume."""
+def test_copy_to_container_rejects_workdir_root(mock_docker_client):
+    """copy_to_container refuses /workdir: it is container-local control plane (the seed marker is
+    written there via exec, not copied), so it sits outside the archive-extraction boundary."""
     session = SandboxDockerSession()
     session.container = MagicMock()
-    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
-    session.container.put_archive.return_value = True
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:
         info = tarfile.TarInfo(name="meta.txt")
         info.size = 0
         tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
 
-    # Bare /workdir and a subpath under it are both accepted.
-    buf.seek(0)
-    session.copy_to_container(buf, dest=WORKDIR_ROOT, clear_before_copy=False)
-    buf.seek(0)
-    session.copy_to_container(buf, dest=f"{WORKDIR_ROOT}/sub", clear_before_copy=False)
+    with pytest.raises(ValueError, match="Refusing to extract"):
+        session.copy_to_container(buf, dest=WORKDIR_ROOT, clear_before_copy=False)
 
 
 def test_copy_to_container_allows_bare_workspace_root(mock_docker_client):
@@ -670,7 +733,7 @@ def test_grep_filters_by_basename_glob():
 
 
 def test_grep_raises_on_real_error_exit():
-    """grep exit code >= 2 is a real error (not 'no matches'), so surface it."""
+    """grep exit code >= 2 (other than the absent-path sentinel) is a real error, so surface it."""
     s = _session_with_container()
     s.execute_command = Mock(return_value=Mock(exit_code=2, output="grep: bad things"))
     with pytest.raises(RuntimeError):
@@ -684,11 +747,34 @@ def test_grep_no_matches_exit_1_is_ok():
     assert s.grep("x", "/scratch", glob=None) == []
 
 
+def test_grep_missing_path_raises_file_not_found():
+    """A genuinely absent search path is reported via FileNotFoundError (sentinel exit), distinct
+    from grep's own exit 2 — so fs_grep can treat it as 'no matches' rather than an error."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_ABSENT_EXIT, output=""))
+    with pytest.raises(FileNotFoundError):
+        s.grep("x", "/scratch/missing", glob=None)
+    assert f"|| exit {_PATH_ABSENT_EXIT}" in s.execute_command.call_args.args[0]
+
+
 def test_list_dir_raises_on_error_exit():
+    """A non-zero exit that is NOT the absent-path sentinel (e.g. ls's exit 2 for permission
+    denied on an existing path) is a genuine failure and must raise RuntimeError."""
     s = _session_with_container()
     s.execute_command = Mock(return_value=Mock(exit_code=2, output="ls: cannot access"))
     with pytest.raises(RuntimeError):
+        s.list_dir("/scratch/denied")
+
+
+def test_list_dir_missing_path_raises_file_not_found():
+    """A genuinely absent path is reported via FileNotFoundError (the shell guard's sentinel
+    exit code), distinct from a real listing failure — so fs_ls can treat it as an empty listing."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_ABSENT_EXIT, output=""))
+    with pytest.raises(FileNotFoundError):
         s.list_dir("/scratch/missing")
+    # The listing must probe existence so a true absence is distinguishable from a real error.
+    assert f"|| exit {_PATH_ABSENT_EXIT}" in s.execute_command.call_args.args[0]
 
 
 def test_find_paths_parses_type_markers():
@@ -700,10 +786,22 @@ def test_find_paths_parses_type_markers():
 
 
 def test_find_paths_raises_on_error_exit():
+    """A non-zero exit that is NOT the absent-path sentinel (e.g. a genuine traversal failure on an
+    existing tree) must raise RuntimeError."""
     s = _session_with_container()
-    s.execute_command = Mock(return_value=Mock(exit_code=1, output="find: not found"))
+    s.execute_command = Mock(return_value=Mock(exit_code=1, output="find: bad things"))
     with pytest.raises(RuntimeError):
+        s.find_paths("/scratch/denied")
+
+
+def test_find_paths_missing_path_raises_file_not_found():
+    """A genuinely absent path is reported via FileNotFoundError (sentinel exit), distinct from a
+    real traversal failure — so fs_glob can treat it as no matches."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_ABSENT_EXIT, output=""))
+    with pytest.raises(FileNotFoundError):
         s.find_paths("/scratch/missing")
+    assert f"|| exit {_PATH_ABSENT_EXIT}" in s.execute_command.call_args.args[0]
 
 
 def _edit_session(initial: bytes):
@@ -729,8 +827,43 @@ def test_edit_file_string_not_found():
 
 def test_edit_file_multiple_occurrences_without_replace_all():
     s = _edit_session(b"x x x\n")
-    with pytest.raises(ValueError, match="multiple_occurrences"):
+    with pytest.raises(ValueError, match="appears 3 times"):
         s.edit_file("/scratch/a.txt", "x", "y", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_eof_newline_unique_hint():
+    """old ends with a newline the file lacks at EOF, and the stripped key is unique → precise hint."""
+    s = _edit_session(b"abcdefkey")
+    with pytest.raises(ValueError, match="trailing newline removed"):
+        s.edit_file("/scratch/a.txt", "key\n", "KEY\n", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_eof_newline_ambiguous_hint():
+    """old ends with a newline the file lacks at EOF, and the stripped key is ambiguous →
+    hint to drop the newline AND add surrounding context."""
+    s = _edit_session(b"abckeydefkey")
+    with pytest.raises(ValueError, match="add surrounding context"):
+        s.edit_file("/scratch/a.txt", "key\n", "KEY\n", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_eof_newline_hint_normalizes_crlf():
+    """The hint LF-normalizes the file, so a CRLF body with no trailing newline still triggers the
+    unique 'trailing newline removed' hint — guards the text_lf normalization in the hint branch."""
+    s = _edit_session(b"abcdef\r\nkey")
+    with pytest.raises(ValueError, match="trailing newline removed"):
+        s.edit_file("/scratch/a.txt", "key\n", "KEY\n", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_single_newline_old_not_eof_hint():
+    """A lone-newline `old` must not enter the hint branch (the len(old_lf) > 1 guard): it falls
+    through to the plain string_not_found rather than a misleading EOF hint."""
+    s = _edit_session(b"abcdef")
+    with pytest.raises(ValueError, match="string_not_found"):
+        s.edit_file("/scratch/a.txt", "\n", "X", replace_all=False, allowed_roots=("/scratch",))
     s.write_file.assert_not_called()
 
 

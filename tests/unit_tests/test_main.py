@@ -19,8 +19,6 @@ def mock_session():
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session:
         mock_session = mock_session(session_id=str(uuid.uuid4()))
         mock_session._get_container.return_value = Mock(status="running")
-        # By default, no patch extraction (no label set)
-        mock_session.get_label.return_value = None
         yield mock_session
 
 
@@ -96,7 +94,6 @@ def test_run_commands_success(mock_session, client):  # noqa: N803
     assert response.status_code == 200, response.text
     response_data = response.json()
     assert "results" in response_data
-    assert "patch" in response_data
     assert response_data["results"][0]["output"] == "success"
     assert response_data["results"][0]["exit_code"] == 0
 
@@ -122,7 +119,6 @@ def test_run_commands_failure(mock_session, client):  # noqa: N803
     assert response.status_code == 200, response.text
     response_data = response.json()
     assert "results" in response_data
-    assert "patch" in response_data
     assert response_data["results"][0]["output"] == "error"
     assert response_data["results"][0]["exit_code"] == 1
 
@@ -148,7 +144,6 @@ def test_run_commands_with_workdir(mock_session, client):  # noqa: N803
     assert response.status_code == 200, response.text
     response_data = response.json()
     assert "results" in response_data
-    assert "patch" in response_data
     assert response_data["results"][0]["output"] == "success"
     assert response_data["results"][0]["exit_code"] == 0
 
@@ -294,133 +289,39 @@ def test_version(client):
     assert response.json() == {"version": __version__}
 
 
-def test_start_session_with_extract_patch_creates_volume(client):
-    """Test that starting a session with extract_patch=true creates a volume and mounts it correctly."""
+def test_start_session_starts_single_container(client):
+    """A session start creates exactly one cmd-executor container — no sidecar, no volume."""
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
-        mock_patch_extractor = Mock()
-        mock_patch_extractor.session_id = "patch-extractor-id"
-
         mock_cmd_executor = Mock()
         mock_cmd_executor.session_id = "cmd-executor-id"
-        mock_session_class.start.side_effect = [mock_patch_extractor, mock_cmd_executor]
+        mock_session_class.start.return_value = mock_cmd_executor
 
-        # Make the request
-        response = client.post("/session/", json={"base_image": "python:3.11", "extract_patch": True})
+        response = client.post("/session/", json={"base_image": "python:3.11"})
 
         assert response.status_code == 200
         assert response.json() == {"session_id": "cmd-executor-id"}
 
-        # Verify volume was created
-        mock_session_class.create_named_volume.assert_called_once()
-        call_kwargs = mock_session_class.create_named_volume.call_args[1]
-        assert "daiv-sandbox-workdir-" in call_kwargs["name"]
-        assert call_kwargs["labels"] == {"daiv.sandbox.managed": "1"}
-
-        # Verify both containers were started with correct volume mounts
-        assert mock_session_class.start.call_count == 2
-
-        # First call should be patch extractor with ro mount
-        patch_call = mock_session_class.start.call_args_list[0]
-        assert "volumes" in patch_call[1]
-        volume_name = list(patch_call[1]["volumes"].keys())[0]
-        assert patch_call[1]["volumes"][volume_name] == {"bind": "/workdir/new", "mode": "ro"}
-
-        # Second call should be cmd executor with rw mount
-        cmd_call = mock_session_class.start.call_args_list[1]
-        assert "volumes" in cmd_call[1]
-        volume_name = list(cmd_call[1]["volumes"].keys())[0]
-        assert cmd_call[1]["volumes"][volume_name] == {"bind": "/workspace/repo", "mode": "rw"}
+        # Exactly one container started, with no volume mount and no sidecar.
+        mock_session_class.start.assert_called_once()
+        assert "volumes" not in mock_session_class.start.call_args.kwargs
+        # No shared volume is created (the sidecar/volume path is gone).
+        mock_session_class.create_named_volume.assert_not_called()
 
 
-def test_close_session_removes_volume(client):
-    """Test that closing a session removes the associated volume."""
-    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL, DAIV_SANDBOX_WORKDIR_VOLUME_LABEL
-
+def test_close_session_removes_container(client):
+    """Closing a session removes the cmd-executor container (no sidecar / volume teardown)."""
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
-        # Mock the cmd executor
         mock_cmd_executor = Mock()
         mock_cmd_executor.session_id = "cmd-executor-id"
         mock_cmd_executor.container = Mock()
-
-        # Mock the patch extractor
-        mock_patch_extractor = Mock()
-        mock_patch_extractor.session_id = "patch-extractor-id"
-
-        # Mock the volume
-        mock_volume = Mock()
-        mock_docker_client = Mock()
-        mock_docker_client.volumes.get.return_value = mock_volume
-
-        mock_cmd_executor.client = mock_docker_client
-
-        # Setup get_label to return volume name and patch extractor ID
-        def get_label_side_effect(label):
-            if label == DAIV_SANDBOX_WORKDIR_VOLUME_LABEL:
-                return "test-volume-name"
-            elif label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL:
-                return "patch-extractor-id"
-            return None
-
-        mock_cmd_executor.get_label.side_effect = get_label_side_effect
-
-        # Setup the mock to return instances
-        mock_session_class.side_effect = [mock_cmd_executor, mock_patch_extractor]
-
-        # Make the request
-        response = client.delete("/session/cmd-executor-id/")
-
-        assert response.status_code == 204
-
-        # Verify volume was retrieved and removed
-        mock_docker_client.volumes.get.assert_called_once_with("test-volume-name")
-        mock_volume.remove.assert_called_once_with(force=False)
-
-        # Verify both containers were removed
-        mock_patch_extractor.remove_container.assert_called_once()
-        mock_cmd_executor.remove_container.assert_called_once()
-
-
-def test_close_session_handles_missing_volume(client):
-    """Test that closing a session handles missing volumes gracefully."""
-    from docker.errors import NotFound
-
-    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL, DAIV_SANDBOX_WORKDIR_VOLUME_LABEL
-
-    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
-        # Mock the cmd executor
-        mock_cmd_executor = Mock()
-        mock_cmd_executor.session_id = "cmd-executor-id"
-        mock_cmd_executor.container = Mock()
-
-        # Mock the docker client
-        mock_docker_client = Mock()
-        mock_docker_client.volumes.get.side_effect = NotFound("Volume not found")
-
-        mock_cmd_executor.client = mock_docker_client
-
-        # Setup get_label to return volume name but no patch extractor
-        def get_label_side_effect(label):
-            if label == DAIV_SANDBOX_WORKDIR_VOLUME_LABEL:
-                return "test-volume-name"
-            elif label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL:
-                return None
-            return None
-
-        mock_cmd_executor.get_label.side_effect = get_label_side_effect
-
-        # Setup the mock to return instance
         mock_session_class.return_value = mock_cmd_executor
 
-        # Make the request - should succeed even though volume is not found
         response = client.delete("/session/cmd-executor-id/")
 
         assert response.status_code == 204
-
-        # Verify we tried to get the volume
-        mock_docker_client.volumes.get.assert_called_once_with("test-volume-name")
-
-        # Verify container was still removed
         mock_cmd_executor.remove_container.assert_called_once()
+        # No volume lookup/removal happens anymore.
+        mock_cmd_executor.client.volumes.get.assert_not_called()
 
 
 def test_close_session_returns_conflict_when_session_is_locked(mock_session, client, monkeypatch):
@@ -490,7 +391,7 @@ def test_seed_session_rejects_double_seed(mock_session, client):
 
 
 def test_seed_session_extracts_skills_archive_only(mock_session, client):
-    """skills_archive only, no patch-extractor linked: copy_to_container hits /skills, meta init skipped."""
+    """skills_archive only: copy_to_container hits /skills; seed runs no in-container commands."""
     from docker.models.containers import ExecResult
 
     from daiv_sandbox.sessions import SKILLS_ROOT
@@ -507,48 +408,8 @@ def test_seed_session_extracts_skills_archive_only(mock_session, client):
     assert resp.status_code == 204, resp.text
     mock_session.copy_to_container.assert_called_once()
     assert mock_session.copy_to_container.call_args.kwargs.get("dest") == SKILLS_ROOT
-    # No patch-extractor session label → no meta init runs.
+    # Seeding only copies archives + writes the marker (via exec_run); never execute_command.
     mock_session.execute_command.assert_not_called()
-
-
-def test_seed_session_meta_init_runs_on_skills_archive_only(client):
-    """Repoless seed (skills_archive only) still inits meta when patch-extractor is linked.
-
-    Without this, the first ``run`` call in a repoless run would 500 on HEAD-advance
-    because ``/workdir/meta`` was never initialised.
-    """
-    from docker.models.containers import ExecResult
-
-    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
-
-    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_cls:
-        mock_cmd_executor = Mock()
-        mock_cmd_executor.container = Mock()
-        mock_cmd_executor.container.exec_run.side_effect = [
-            ExecResult(exit_code=1, output=b""),  # seeded check → not seeded
-            ExecResult(exit_code=0, output=b""),  # marker write
-        ]
-        mock_cmd_executor.get_label.side_effect = lambda label: (
-            "patch-extractor-id" if label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL else None
-        )
-
-        mock_patch_extractor = Mock()
-        mock_patch_extractor.execute_command.return_value = RunResult(
-            command="init", output="", exit_code=0, workdir="/workdir"
-        )
-
-        mock_cls.side_effect = [mock_cmd_executor, mock_patch_extractor]
-
-        resp = client.post(
-            "/session/test-session/seed/",
-            files={
-                "skills_archive": ("skills.tar", _minimal_archive_bytes("intro.md", b"# hi\n"), "application/x-tar")
-            },
-        )
-
-    assert resp.status_code == 204, resp.text
-    mock_cmd_executor.copy_to_container.assert_called_once()
-    mock_patch_extractor.execute_command.assert_called_once()
 
 
 def test_seed_session_extracts_both_archives(mock_session, client):
@@ -610,70 +471,6 @@ def test_seed_session_invalid_skills_archive_returns_422(mock_session, client):
     )
     assert resp.status_code == 422
     assert "skills_archive" in resp.json()["detail"].lower()
-
-
-def test_seed_session_meta_init_runs_on_repo_archive(client):
-    """When a patch extractor is linked, CMD_INIT_META_SCRIPT is executed after /workspace/repo is copied."""
-    from docker.models.containers import ExecResult
-
-    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
-
-    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_cls:
-        mock_cmd_executor = Mock()
-        mock_cmd_executor.container = Mock()
-        mock_cmd_executor.container.exec_run.side_effect = [
-            ExecResult(exit_code=1, output=b""),  # seeded check → not seeded
-            ExecResult(exit_code=0, output=b""),  # marker write
-        ]
-        mock_cmd_executor.get_label.side_effect = lambda label: (
-            "patch-extractor-id" if label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL else None
-        )
-
-        mock_patch_extractor = Mock()
-        mock_patch_extractor.execute_command.return_value = RunResult(
-            command="init", output="", exit_code=0, workdir="/workdir"
-        )
-
-        mock_cls.side_effect = [mock_cmd_executor, mock_patch_extractor]
-
-        resp = client.post(
-            "/session/test-session/seed/",
-            files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
-        )
-
-    assert resp.status_code == 204, resp.text
-    mock_cmd_executor.copy_to_container.assert_called_once()
-    mock_patch_extractor.execute_command.assert_called_once()
-
-
-def test_seed_session_meta_init_failure_returns_500(client):
-    """If CMD_INIT_META_SCRIPT exits non-zero, seed returns 500."""
-    from docker.models.containers import ExecResult
-
-    from daiv_sandbox.main import DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL
-
-    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_cls:
-        mock_cmd_executor = Mock()
-        mock_cmd_executor.container = Mock()
-        mock_cmd_executor.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
-        mock_cmd_executor.get_label.side_effect = lambda label: (
-            "patch-extractor-id" if label == DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL else None
-        )
-
-        mock_patch_extractor = Mock()
-        mock_patch_extractor.execute_command.return_value = RunResult(
-            command="init", output="fatal: not a git repo", exit_code=128, workdir="/workdir"
-        )
-
-        mock_cls.side_effect = [mock_cmd_executor, mock_patch_extractor]
-
-        resp = client.post(
-            "/session/test-session/seed/",
-            files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
-        )
-
-    assert resp.status_code == 500
-    assert "patch-extractor" in resp.json()["detail"].lower()
 
 
 def test_seed_session_marker_write_failure_returns_500(mock_session, client):
@@ -757,6 +554,34 @@ def test_fs_write_rejects_path_outside_workspace_repo_sibling(mock_session, clie
     mock_session.write_file.assert_not_called()
 
 
+def test_fs_write_conflict_returns_quiet_error(mock_session, client):
+    """A create-only conflict (write_file raises FileExistsError) is surfaced as ok=False with the
+    deepagents message — not an HTTP error."""
+    mock_session.write_file.side_effect = FileExistsError(
+        "Cannot write to /workspace/tmp/a.txt because it already exists. "
+        "Read and then make an edit, or write to a new path."
+    )
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/write",
+        json={"path": "/workspace/tmp/a.txt", "content": base64.b64encode(b"x").decode(), "mode": 0o644},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is False
+    assert "already exists" in body["error"]
+
+
+def test_fs_write_passes_create_only(mock_session, client):
+    """fs/write requests create-only semantics from the session layer."""
+    mock_session.write_file.return_value = None
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/write",
+        json={"path": "/workspace/tmp/a.txt", "content": base64.b64encode(b"x").decode(), "mode": 0o644},
+    )
+    assert resp.status_code == 200, resp.text
+    assert mock_session.write_file.call_args.kwargs.get("create_only") is True
+
+
 def test_fs_ls_returns_entries(mock_session, client):
     mock_session.list_dir.return_value = [("/workspace/tmp/sub", True), ("/workspace/tmp/f.py", False)]
     resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/workspace/tmp"})
@@ -783,6 +608,17 @@ def test_fs_ls_surfaces_command_error(mock_session, client):
     assert body["error"] is not None
 
 
+def test_fs_ls_missing_directory_returns_empty(mock_session, client):
+    """A missing directory is a quiet, non-error case: empty entries, no error (so callers
+    probing optional dirs — e.g. skills locations most repos lack — get no failure)."""
+    mock_session.list_dir.side_effect = FileNotFoundError("/workspace/repo/.claude/skills")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/workspace/repo/.claude/skills"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["entries"] == []
+    assert body["error"] is None
+
+
 def test_fs_grep_surfaces_command_error(mock_session, client):
     mock_session.grep.side_effect = RuntimeError("grep failed (exit 2)")
     resp = client.post(f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/tmp", "pattern": "x"})
@@ -790,6 +626,18 @@ def test_fs_grep_surfaces_command_error(mock_session, client):
     body = resp.json()
     assert body["matches"] == []
     assert body["error"] is not None
+
+
+def test_fs_grep_missing_directory_returns_empty(mock_session, client):
+    """A missing search path is a quiet, non-error case: no matches, no error."""
+    mock_session.grep.side_effect = FileNotFoundError("/workspace/repo/.claude/skills")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/repo/.claude/skills", "pattern": "x"}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["matches"] == []
+    assert body["error"] is None
 
 
 def test_fs_glob_unbalanced_bracket_is_literal(mock_session, client):
@@ -855,6 +703,40 @@ def test_fs_glob_surfaces_find_error(mock_session, client):
     assert resp.json()["error"] is not None
 
 
+def test_fs_glob_missing_directory_returns_empty(mock_session, client):
+    """A missing base directory is a quiet, non-error case: no matches, no error."""
+    mock_session.find_paths.side_effect = FileNotFoundError("/workspace/repo/.cursor/skills")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/glob",
+        json={"path": "/workspace/repo/.cursor/skills", "pattern": "**/*"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["matches"] == []
+    assert body["error"] is None
+
+
+def test_fs_glob_results_are_sorted(mock_session, client):
+    """Glob matches are returned sorted by path (deterministic, matching deepagents' sorted glob),
+    regardless of the order find_paths enumerated them."""
+    from daiv_sandbox.sessions import DirEntry
+
+    mock_session.find_paths.return_value = [
+        DirEntry("/workspace/tmp/c.py", False),
+        DirEntry("/workspace/tmp/a.py", False),
+        DirEntry("/workspace/tmp/b.py", False),
+    ]
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/glob", json={"path": "/workspace/tmp", "pattern": "*.py"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert [e["path"] for e in resp.json()["matches"]] == [
+        "/workspace/tmp/a.py",
+        "/workspace/tmp/b.py",
+        "/workspace/tmp/c.py",
+    ]
+
+
 def test_fs_read_missing_file(mock_session, client):
     mock_session.read_file_bytes.side_effect = FileNotFoundError("/workspace/tmp/x")
     resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/x"})
@@ -884,6 +766,82 @@ def test_fs_read_offset_beyond_eof(mock_session, client):
         f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt", "offset": 50, "limit": 10}
     )
     assert "offset" in resp.json()["error"].lower()
+
+
+def test_fs_read_text_truncated_at_cap(mock_session, client):
+    """A text page larger than the byte-cap is truncated to the cap and ends with the marker."""
+    from daiv_sandbox.main import READ_MAX_OUTPUT_BYTES
+
+    mock_session.read_file_bytes.return_value = b"a" * (READ_MAX_OUTPUT_BYTES + 100_000)
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/big.txt"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["encoding"] == "utf-8"
+    assert "[Output truncated" in body["content"]
+    assert len(body["content"].encode("utf-8")) <= READ_MAX_OUTPUT_BYTES
+
+
+def test_fs_read_text_under_cap_has_no_marker(mock_session, client):
+    """A small text page is returned verbatim with no truncation marker."""
+    mock_session.read_file_bytes.return_value = b"hello\nworld\n"
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt"})
+    body = resp.json()
+    assert body["encoding"] == "utf-8"
+    assert body["content"] == "hello\nworld"
+    assert "Output truncated" not in body["content"]
+
+
+def test_fs_read_binary_over_cap_is_error(mock_session, client):
+    """A binary file larger than the cap returns an error rather than an unbounded base64 blob."""
+    from daiv_sandbox.main import READ_MAX_OUTPUT_BYTES
+
+    mock_session.read_file_bytes.return_value = b"\xff" * (READ_MAX_OUTPUT_BYTES + 1)
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/big.bin"})
+    body = resp.json()
+    assert body["content"] is None
+    assert "exceeds maximum preview size" in body["error"]
+
+
+def test_fs_read_text_truncated_on_multibyte_boundary(mock_session, client):
+    """A page of multi-byte chars forces the cap slice to land mid-character; decode(errors='ignore')
+    must drop the partial char rather than raise, and the result stays within the cap with the marker.
+    Guards the errors='ignore' branch that an all-ASCII payload never exercises."""
+    from daiv_sandbox.main import READ_MAX_OUTPUT_BYTES
+
+    # "€" is 3 bytes in UTF-8, so the byte slice almost never aligns to a character boundary.
+    mock_session.read_file_bytes.return_value = ("€" * READ_MAX_OUTPUT_BYTES).encode("utf-8")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/big.txt"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["encoding"] == "utf-8"
+    assert "[Output truncated" in body["content"]
+    assert len(body["content"].encode("utf-8")) <= READ_MAX_OUTPUT_BYTES
+
+
+def test_fs_read_text_exactly_at_cap_not_truncated(mock_session, client):
+    """A text page whose byte length equals the cap is returned verbatim — the boundary is strictly
+    greater-than, so an off-by-one flip to >= would be caught here."""
+    from daiv_sandbox.main import READ_MAX_OUTPUT_BYTES
+
+    mock_session.read_file_bytes.return_value = b"a" * READ_MAX_OUTPUT_BYTES
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/exact.txt"})
+    body = resp.json()
+    assert body["encoding"] == "utf-8"
+    assert "Output truncated" not in body["content"]
+    assert len(body["content"].encode("utf-8")) == READ_MAX_OUTPUT_BYTES
+
+
+def test_fs_read_binary_exactly_at_cap_is_base64(mock_session, client):
+    """A binary file of exactly the cap size is still returned as base64 — only strictly larger errors."""
+    from daiv_sandbox.main import READ_MAX_OUTPUT_BYTES
+
+    raw = b"\xff" * READ_MAX_OUTPUT_BYTES
+    mock_session.read_file_bytes.return_value = raw
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/exact.bin"})
+    body = resp.json()
+    assert body["encoding"] == "base64"
+    assert base64.b64decode(body["content"]) == raw
+    assert body["error"] is None
 
 
 def test_fs_edit_multiple_occurrences(mock_session, client):

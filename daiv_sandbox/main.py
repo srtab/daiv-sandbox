@@ -40,7 +40,6 @@ from daiv_sandbox.schemas import (
     StartSessionRequest,
     StartSessionResponse,
 )
-from daiv_sandbox.scripts import CMD_INIT_META_SCRIPT, CMD_TURN_DIFF_SCRIPT
 from daiv_sandbox.sessions import (
     SANDBOX_ROOT,
     SKILLS_ROOT,
@@ -57,15 +56,20 @@ logger = logging.getLogger(__name__)
 HEADER_API_KEY_NAME = "X-API-Key"
 
 DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
-DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL = "daiv.sandbox.patch_extractor_session_id"
-DAIV_SANDBOX_WORKDIR_VOLUME_LABEL = "daiv.sandbox.workdir_volume"
-DAIV_SANDBOX_MANAGED_LABEL = "daiv.sandbox.managed"
 
-TYPE_PATCH_EXTRACTOR = "patch_extractor"
 TYPE_CMD_EXECUTOR = "cmd_executor"
 
-NO_CHANGES_MESSAGE = "nothing to commit, working tree clean"
 EXIT_CODE_TIMEOUT = 124  # matches timeout(1) convention
+
+# Cap on the bytes a single fs/read returns. Mirrors deepagents BaseSandbox MAX_OUTPUT_BYTES /
+# MAX_BINARY_BYTES. The full file is still read into the process (get_archive); this only bounds
+# the response payload so a page of pathologically long lines can't produce an unbounded reply.
+READ_MAX_OUTPUT_BYTES = 512_000
+
+READ_TRUNCATION_MARKER = (
+    f"\n\n[Output truncated: exceeded the {READ_MAX_OUTPUT_BYTES}-byte read limit. "
+    "Continue with a larger offset or smaller limit to read the rest.]"
+)
 
 
 # Configure Sentry
@@ -183,33 +187,9 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
 
     This session ID ensures a consistent execution environment for the commands, including files and directories.
     """
-    import uuid
-
     cmd_executor_labels = {DAIV_SANDBOX_TYPE_LABEL: TYPE_CMD_EXECUTOR}
-    workdir_volume_name: str | None = None
-
-    if request.extract_patch:
-        # Create a shared Docker volume for the workspace
-        workdir_volume_name = f"daiv-sandbox-workdir-{uuid.uuid4()}"
-        await asyncio.to_thread(
-            SandboxDockerSession.create_named_volume, name=workdir_volume_name, labels={DAIV_SANDBOX_MANAGED_LABEL: "1"}
-        )
-
-        patch_extractor = await asyncio.to_thread(
-            SandboxDockerSession.start,
-            image=settings.GIT_IMAGE,
-            labels={DAIV_SANDBOX_TYPE_LABEL: TYPE_PATCH_EXTRACTOR},
-            network_mode="none",
-            volumes={workdir_volume_name: {"bind": "/workdir/new", "mode": "ro"}},
-        )
-
-        cmd_executor_labels[DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL] = patch_extractor.session_id
-        cmd_executor_labels[DAIV_SANDBOX_WORKDIR_VOLUME_LABEL] = workdir_volume_name
 
     cmd_executor_kwargs = {}
-
-    if workdir_volume_name:
-        cmd_executor_kwargs["volumes"] = {workdir_volume_name: {"bind": SANDBOX_ROOT, "mode": "rw"}}
 
     if not request.network_enabled:
         cmd_executor_kwargs["network_mode"] = "none"
@@ -223,21 +203,9 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     if request.cpus:
         cmd_executor_kwargs["cpus"] = request.cpus
 
-    try:
-        cmd_executor = await asyncio.to_thread(
-            SandboxDockerSession.start, image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
-        )
-    except Exception:
-        # Clean up already-created resources on failure to avoid leaked containers/volumes.
-        if workdir_volume_name:
-            patch_extractor_sid = cmd_executor_labels.get(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL)
-            if patch_extractor_sid:
-                SandboxDockerSession(session_id=patch_extractor_sid).remove_container()
-            try:
-                SandboxDockerSession._get_shared_client().volumes.get(workdir_volume_name).remove(force=True)
-            except Exception:
-                logger.warning("Failed to clean up volume '%s' after session creation failure", workdir_volume_name)
-        raise
+    cmd_executor = await asyncio.to_thread(
+        SandboxDockerSession.start, image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
+    )
     if cmd_executor.session_id is None:
         raise RuntimeError("Started session is missing a session ID")
     return StartSessionResponse(session_id=cmd_executor.session_id)
@@ -256,8 +224,7 @@ async def seed_session(
 
     Multipart fields (at least one is required):
       * ``repo_archive``    — tar (auto-detected compression: gzip, bzip2, xz, zstd, or plain)
-                              extracted into ``/workspace/repo``. When present, the patch-extractor's
-                              meta repo is initialised.
+                              extracted into ``/workspace/repo``.
       * ``skills_archive``  — tar (same compression options) extracted into ``/workspace/skills``.
 
     One-shot per session: subsequent calls return 409.
@@ -302,23 +269,6 @@ async def seed_session(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"skills_archive is invalid: {exc}"
                 ) from exc
 
-        # Meta init whenever a patch-extractor is linked (extract_patch=True at session start).
-        # Even with no repo_archive (repoless runs or skills-only seeds) the agent will mutate
-        # /workspace/repo via bash or the fs/* endpoints; the run endpoint's HEAD-advance requires
-        # /workdir/meta to exist. The init script's seed commit is `--allow-empty`, so an empty
-        # /workdir/new is fine.
-        if extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
-            patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=extract_patch_session_id)
-            init_result = await asyncio.to_thread(
-                patch_extractor.execute_command, CMD_INIT_META_SCRIPT, workdir="/workdir"
-            )
-            if init_result.exit_code != 0:
-                logger.error("Failed to init meta repo: [%s] %s", init_result.exit_code, init_result.output)
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to initialise patch-extractor meta repo. Check logs.",
-                )
-
         marker_result = await asyncio.to_thread(
             cmd_executor.container.exec_run, ["/bin/sh", "-c", "touch /workdir/.daiv-seeded"], user="root"
         )
@@ -340,8 +290,7 @@ async def run_on_session(
     api_key: str = Depends(get_api_key),
 ) -> RunResponse:
     """
-    Run a set of commands on a session and return the results, including the patch of changes
-    made by these commands (HEAD~1..HEAD against the meta repo).
+    Run a set of commands on a session and return each command's result.
     """
     async with http_request.app.state.session_lock_manager.acquire(session_id):
         cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
@@ -376,27 +325,7 @@ async def run_on_session(
             if request.fail_fast and result.exit_code != 0:
                 break
 
-        base64_patch: str | None = None
-
-        if extract_patch_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
-            patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=extract_patch_session_id)
-            patch_result = await asyncio.to_thread(
-                patch_extractor.execute_command, CMD_TURN_DIFF_SCRIPT, workdir="/workdir"
-            )
-
-            if patch_result.exit_code != 0 and NO_CHANGES_MESSAGE not in patch_result.output:
-                logger.error("Failed to extract turn diff: [%s] %s", patch_result.exit_code, patch_result.output)
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to extract patch with the changes made by the commands. Check logs.",
-                )
-
-            if NO_CHANGES_MESSAGE in patch_result.output or patch_result.output.strip() == "":
-                base64_patch = None
-            else:
-                base64_patch = base64.b64encode(patch_result.output.encode()).decode()
-
-        return RunResponse(results=results, patch=base64_patch)
+        return RunResponse(results=results)
 
 
 @app.delete("/session/{session_id}/", responses=common_responses, name="Close a session")
@@ -406,35 +335,15 @@ async def close_session(
     api_key: str = Depends(get_api_key),
 ) -> Response:
     """
-    Close a session by removing the Docker container and associated resources.
+    Close a session by removing the Docker container.
     """
-    from docker.errors import NotFound as VolumeNotFound
-
     async with request.app.state.session_lock_manager.acquire(session_id):
         cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
 
         if not cmd_executor.container:
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-        if patch_extractor_session_id := cmd_executor.get_label(DAIV_SANDBOX_PATCH_EXTRACTOR_SESSION_ID_LABEL):
-            patch_extractor = await asyncio.to_thread(SandboxDockerSession, session_id=patch_extractor_session_id)
-            await asyncio.gather(
-                asyncio.to_thread(patch_extractor.remove_container), asyncio.to_thread(cmd_executor.remove_container)
-            )
-        else:
-            await asyncio.to_thread(cmd_executor.remove_container)
-
-        # Remove shared workdir volume after all containers are removed.
-        if workdir_volume_name := cmd_executor.get_label(DAIV_SANDBOX_WORKDIR_VOLUME_LABEL):
-            try:
-                volume = await asyncio.to_thread(cmd_executor.client.volumes.get, workdir_volume_name)
-                await asyncio.to_thread(volume.remove, force=False)
-                logger.info("Removed shared volume '%s'", workdir_volume_name)
-            except VolumeNotFound:
-                logger.warning("Volume '%s' not found (already removed)", workdir_volume_name)
-            except Exception as e:
-                # Volume might still be in use or other error - log but don't fail the request
-                logger.warning("Failed to remove volume '%s': %s", workdir_volume_name, e)
+        await asyncio.to_thread(cmd_executor.remove_container)
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -464,9 +373,7 @@ async def version() -> dict[Literal["version"], str]:
 # These read/write/search files anywhere under WORKSPACE_ROOT (repo/, skills/, tmp/).
 # They are Python-free (content via the Docker archive API, search/listing via POSIX
 # grep/find/ls/rm), so they work on images without a Python interpreter (e.g. alpine).
-# The endpoints never invoke the patch-extractor themselves, but edits under repo/ land
-# on the shared workdir volume the patch-extractor diffs, so those DO surface in the next
-# patch; skills/ and tmp/ are container-local and stay diff-invisible.
+# Edits land directly on the container's workspace, which is the single source of truth.
 
 _WORKSPACE_ROOTS = (WORKSPACE_ROOT,)
 
@@ -518,8 +425,16 @@ async def fs_write(
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             await asyncio.to_thread(
-                cmd.write_file, request.path, request.content, mode=request.mode, allowed_roots=_WORKSPACE_ROOTS
+                cmd.write_file,
+                request.path,
+                request.content,
+                mode=request.mode,
+                allowed_roots=_WORKSPACE_ROOTS,
+                create_only=True,
             )
+        except FileExistsError as exc:
+            # Expected create-only conflict: surface it quietly (no ERROR-level traceback).
+            return FsWriteResponse(ok=False, error=str(exc))
         except Exception as exc:
             logger.exception("fs_write failed for %s", request.path)
             return FsWriteResponse(ok=False, error=str(exc))
@@ -542,6 +457,10 @@ async def fs_read(
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
+            if len(raw) > READ_MAX_OUTPUT_BYTES:
+                return FsReadResponse(
+                    error=f"Binary file exceeds maximum preview size of {READ_MAX_OUTPUT_BYTES} bytes"
+                )
             return FsReadResponse(content=base64.b64encode(raw).decode("ascii"), encoding="base64")
         if not text:
             return FsReadResponse(content="System reminder: File exists but has empty contents", encoding="utf-8")
@@ -549,7 +468,14 @@ async def fs_read(
         page = lines[request.offset : request.offset + request.limit]
         if request.offset and not page:
             return FsReadResponse(error=f"Line offset {request.offset} exceeds file length ({len(lines)} lines)")
-        return FsReadResponse(content="\n".join(page), encoding="utf-8")
+        content = "\n".join(page)
+        encoded = content.encode("utf-8")
+        if len(encoded) > READ_MAX_OUTPUT_BYTES:
+            marker_bytes = len(READ_TRUNCATION_MARKER.encode("utf-8"))
+            # Reserve room for the marker so the total stays within the cap (deepagents' effective_limit).
+            truncated = encoded[: READ_MAX_OUTPUT_BYTES - marker_bytes].decode("utf-8", errors="ignore")
+            content = truncated + READ_TRUNCATION_MARKER
+        return FsReadResponse(content=content, encoding="utf-8")
 
 
 @app.post("/session/{session_id}/fs/ls", responses=common_responses, name="List a workspace directory")
@@ -560,6 +486,10 @@ async def fs_ls(
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             entries = await asyncio.to_thread(cmd.list_dir, request.path)
+        except FileNotFoundError:
+            # A missing directory is not an error for a listing probe (e.g. callers checking
+            # optional skills dirs most repos lack); return an empty listing quietly.
+            return FsLsResponse(entries=[])
         except Exception as exc:
             logger.exception("fs_ls failed for %s", request.path)
             return FsLsResponse(error=str(exc))
@@ -574,6 +504,9 @@ async def fs_grep(
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob)
+        except FileNotFoundError:
+            # A missing search path is not an error for a probe; return no matches quietly.
+            return FsGrepResponse(matches=[])
         except Exception as exc:
             logger.exception("fs_grep failed for %s", request.path)
             return FsGrepResponse(error=str(exc))
@@ -590,6 +523,9 @@ async def fs_glob(
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             all_entries = await asyncio.to_thread(cmd.find_paths, request.path)
+        except FileNotFoundError:
+            # A missing base directory is not an error for a probe; return no matches quietly.
+            return FsGlobResponse(matches=[])
         except Exception as exc:
             logger.exception("fs_glob failed for %s", request.path)
             return FsGlobResponse(error=str(exc))
@@ -600,6 +536,8 @@ async def fs_glob(
             for (p, d) in all_entries
             if p.startswith(f"{base}/") and regex.match(p[len(base) + 1 :])
         ]
+        # Deterministic order (matches deepagents' sorted glob) so client-side truncation is stable.
+        matched.sort(key=lambda e: e.path)
         return FsGlobResponse(matches=matched)
 
 

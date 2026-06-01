@@ -9,22 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Reserved a `/workspace/tmp` scratchpad root at session start (`mkdir -p` + `chown`) that bash also sees and that is never included in extracted patches (it lives outside the `/workspace/repo` volume the patch-extractor diffs).
-- `POST /session/{id}/fs/{op}` — Python-free file operations across the session workspace (`/workspace`): `ls`, `read`, `grep`, `glob`, `write`, `edit`, and `delete`. Content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work on images without a Python interpreter (e.g. `alpine`). The endpoints never invoke the patch-extractor directly; edits under `repo/` land on the diffed volume and surface in the next patch, while `skills/` and `tmp/` stay container-local.
+- Reserved a `/workspace/tmp` scratchpad root at session start (`mkdir -p` + `chown`) that bash also sees and that stays container-local (it lives outside `/workspace/repo`).
+- `POST /session/{id}/fs/{op}` — Python-free file operations across the session workspace (`/workspace`): `ls`, `read`, `grep`, `glob`, `write`, `edit`, and `delete`. Content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work on images without a Python interpreter (e.g. `alpine`). Edits under `repo/` land directly on the container workspace, while `skills/` and `tmp/` stay container-local.
 - `scripts/dump_schemas.py` now also exports the new `Fs*` request/response schemas for downstream `daiv` consumers.
 
 ### Changed
 
 - Session container layout unified under `/workspace/{repo,skills,tmp}` (was `/repo`, `/skills`, `/scratch`); `fs/*` endpoints now operate across the whole `/workspace`. **Breaking:** requires the matching daiv release.
 - `fs/glob` now delegates to the stdlib `glob.translate`; a malformed bracket class (e.g. a lone `[`) is treated as a literal (shell-like) instead of returning `400`.
+- `fs/read` now bounds its response: a text page larger than 512000 bytes is truncated with a marker, and a binary file larger than 512000 bytes returns an error instead of an unbounded base64 blob (mirrors deepagents' read limits).
+- `fs/write` is now create-only: writing to a path that already exists returns `ok=False` with a message to read-and-edit or pick a new path (matches the deepagents `write` contract). Editing an existing file via `fs/edit` is unaffected.
+- `fs/glob` results are now returned sorted by path, so client-side truncation is deterministic.
+- `fs/edit` returns clearer errors: a precise hint when `old` carries a trailing newline the file lacks at EOF, and the occurrence count in the multiple-matches error.
 
 ### Removed
 
-- `POST /session/{id}/files/` (`apply_file_mutations`) and its `PutMutation` / `ApplyMutationsRequest` / `MutationResult` / `ApplyMutationsResponse` schemas. The endpoint existed to keep a client-side file mirror in sync with the sandbox; the sandbox is now the single source of truth, so write files through the `fs/*` endpoints (or bash) instead — edits under `/workspace/repo` surface in the next run's patch. **Breaking:** requires the matching daiv release.
+- The patch-extractor: the `alpine/git` sidecar container, the shared `/workspace/repo` Docker volume, and the meta-repo turn-diff machinery. With the sandbox as the single source of truth and the seeded repo being a real git repository, callers recover changes by running git inside `/workspace/repo` (`git diff` / `git status`) instead of consuming a server-computed patch. This drops the `extract_patch` field from `StartSessionRequest`, the `patch` field from the run response, and the `DAIV_SANDBOX_GIT_IMAGE` setting. **Breaking:** requires the matching daiv release.
+- `POST /session/{id}/files/` (`apply_file_mutations`) and its `PutMutation` / `ApplyMutationsRequest` / `MutationResult` / `ApplyMutationsResponse` schemas. The endpoint existed to keep a client-side file mirror in sync with the sandbox; the sandbox is now the single source of truth, so write files through the `fs/*` endpoints (or bash) instead — edits under `/workspace/repo` mutate the container workspace in place. **Breaking:** requires the matching daiv release.
 
 ### Fixed
 
-- `POST /session/{id}/seed/` now initialises the patch-extractor meta repo whenever the session was started with `extract_patch=True`, even when only `skills_archive` is provided (no `repo_archive`). Without this, the first `run` call in a repoless flow failed with HTTP 500 because `/workdir/meta` was missing.
+- `fs/ls`, `fs/glob`, and `fs/grep` on a path that does not exist now return an empty result (`{"entries"/"matches": [], "error": null}`) instead of a populated `error` field plus an ERROR-level traceback in the server logs. The underlying primitives (`list_dir`/`find_paths`/`grep`) distinguish a genuinely absent path (reported as `FileNotFoundError` via an explicit existence probe, because the tools' own exit codes are ambiguous between "missing" and "permission denied") from a real failure, which still surfaces an error. This silences the log noise from callers probing optional directories most repos lack (e.g. `.claude/skills`, `.cursor/skills`, `.agents/skills`).
 
 ## [0.5.0] - 2026-05-04
 

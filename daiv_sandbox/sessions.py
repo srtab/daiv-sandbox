@@ -17,7 +17,6 @@ from daiv_sandbox.schemas import RunResult
 
 if TYPE_CHECKING:
     from docker.models.containers import Container
-    from docker.models.volumes import Volume
 
 logger = logging.getLogger("daiv_sandbox")
 
@@ -50,6 +49,13 @@ class GrepHit(NamedTuple):
 PIPEFAIL_WRAPPER = (
     'if [ -x /bin/bash ]; then exec /bin/bash -o pipefail -c "$1"; else exec /bin/sh -o pipefail -c "$1"; fi'
 )
+
+# Sentinel exit code the fs-primitive shell guards (`list_dir`/`find_paths`/`grep`) emit when the
+# target path does not exist. The tools' own "cannot access" exits are ambiguous (`ls`/`grep` use 2
+# for both missing and permission denied) and we discard stderr, so an explicit existence test lets
+# us map only a true absence to FileNotFoundError. 7 is unused by `test`/`ls`/`grep`/`find` (which
+# exit 0/1/2), so it can't collide.
+_PATH_ABSENT_EXIT = 7
 
 
 def _sh_quote(value: str) -> str:
@@ -268,24 +274,6 @@ class SandboxDockerSession:
         instance._start_container(image, **kwargs)
         return instance
 
-    @classmethod
-    def create_named_volume(
-        cls, name: str, labels: dict[str, str] | None = None, client: DockerClient | None = None
-    ) -> Volume:
-        """
-        Create a named volume with the given name and labels.
-
-        Args:
-            name (str): The name of the volume to create.
-            labels (dict[str, str] | None): The labels to add to the volume.
-            client (DockerClient | None): Docker client, if not provided, the shared client will be reused.
-
-        Returns:
-            Volume: The created volume.
-        """
-        instance = cls(client=client)
-        return instance.client.volumes.create(name=name, labels=labels or {})
-
     def _ping(self) -> bool:
         """
         Ping the Docker client.
@@ -333,36 +321,31 @@ class SandboxDockerSession:
 
         logger.info("Container '%s' started (status: %s)", container.short_id, container.status)
 
-        # Ensure the sandbox directories exist and are writable by the sandbox user.
-        mkdir_result = container.exec_run(
-            ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
-            user="root",
-        )
-        if mkdir_result.exit_code != 0:
-            raise RuntimeError(
-                f"Failed to create sandbox directories in {container.short_id}: "
-                f"(exit_code: {mkdir_result.exit_code}) -> {mkdir_result.output}"
-            )
+        # Bootstrap the directory layout. The container runs `sleep 3600`, so it stays alive on
+        # failure and `remove=True` won't reap it — force-remove on any bootstrap error so a failed
+        # start() leaves nothing behind (no leaked container holding its runtime/cpu/memory reservations).
+        sandbox_dirs = [WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT]
+        try:
+            # Ensure the sandbox directories exist and are writable by the sandbox user.
+            mkdir_result = container.exec_run(["mkdir", "-p", "--", *sandbox_dirs], user="root")
+            if mkdir_result.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to create sandbox directories in {container.short_id}: "
+                    f"(exit_code: {mkdir_result.exit_code}) -> {mkdir_result.output}"
+                )
 
-        chown_result = container.exec_run(
-            [
-                "chown",
-                self._get_user(),
-                "--",
-                WORKSPACE_ROOT,
-                SANDBOX_ROOT,
-                WORKDIR_ROOT,
-                SANDBOX_HOME,
-                SKILLS_ROOT,
-                SCRATCH_ROOT,
-            ],
-            user="root",
-        )
-        if chown_result.exit_code != 0:
-            raise RuntimeError(
-                f"Failed to chown sandbox directories in {container.short_id}: "
-                f"(exit_code: {chown_result.exit_code}) -> {chown_result.output}"
-            )
+            chown_result = container.exec_run(["chown", self._get_user(), "--", *sandbox_dirs], user="root")
+            if chown_result.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to chown sandbox directories in {container.short_id}: "
+                    f"(exit_code: {chown_result.exit_code}) -> {chown_result.output}"
+                )
+        except Exception:
+            try:
+                container.remove(force=True)
+            except Exception:
+                logger.warning("Failed to remove container %s after bootstrap failure", container.short_id)
+            raise
 
     def remove_container(self):
         """
@@ -398,16 +381,15 @@ class SandboxDockerSession:
             raise ValueError("Refusing to extract an archive into the container root directory")
 
         # Confine the destination to WORKSPACE_ROOT (SANDBOX_ROOT/SKILLS_ROOT/SCRATCH_ROOT all live
-        # under it, so the single /workspace prefix subsumes them) or WORKDIR_ROOT (where the
-        # patch-extractor's meta-repo machinery lives). Validate lexically through the shared validator
-        # so a `..`/NUL/newline in `dest` is rejected at this boundary rather than relying on every
-        # caller pre-validating. allow_root=True permits a bare-root dest.
+        # under it, so the single /workspace prefix subsumes them). Validate lexically through the
+        # shared validator so a `..`/NUL/newline in `dest` is rejected at this boundary rather than
+        # relying on every caller pre-validating. allow_root=True permits a bare-root dest.
+        # (/workdir is container-local control plane — the seed marker is written there via exec, not
+        # copied — so it is intentionally NOT an allowed archive destination.)
         try:
-            _validate_sandbox_path(to_dir_norm, allowed_roots=(WORKSPACE_ROOT, WORKDIR_ROOT), allow_root=True)
+            _validate_sandbox_path(to_dir_norm, allowed_roots=(WORKSPACE_ROOT,), allow_root=True)
         except ValueError as exc:
-            raise ValueError(
-                f"Refusing to extract an archive outside of {WORKSPACE_ROOT!r} or {WORKDIR_ROOT!r}: {exc}"
-            ) from exc
+            raise ValueError(f"Refusing to extract an archive outside of {WORKSPACE_ROOT!r}: {exc}") from exc
 
         if clear_before_copy:
             q = _sh_quote(to_dir_norm)
@@ -495,19 +477,62 @@ class SandboxDockerSession:
 
         return RunResult(command=command, output=output, exit_code=result.exit_code, workdir=command_workdir)
 
+    def _run_path_guarded(self, path: str, body: str) -> RunResult:
+        """Run *body* only if *path* exists, mapping a true absence to FileNotFoundError.
+
+        Prepends an explicit `[ -e ]` existence test that exits with `_PATH_ABSENT_EXIT` when the
+        path is missing, then raises FileNotFoundError on that sentinel. This disambiguates a real
+        absence from a tool's own "cannot access" exit (`ls`/`grep` use 2 for both missing and
+        permission denied) since stderr is discarded. *body* must already quote *path* itself.
+        """
+        result = self.execute_command(f"[ -e {_sh_quote(path)} ] || exit {_PATH_ABSENT_EXIT}; {body}")
+        if result.exit_code == _PATH_ABSENT_EXIT:
+            raise FileNotFoundError(path)
+        return result
+
     def write_file(
-        self, path: str, content: bytes, *, mode: int, allowed_roots: tuple[str, ...] = (SANDBOX_ROOT,)
+        self,
+        path: str,
+        content: bytes,
+        *,
+        mode: int,
+        allowed_roots: tuple[str, ...] = (SANDBOX_ROOT,),
+        create_only: bool = False,
     ) -> None:
         """
         Write *content* to *path* (absolute, under one of *allowed_roots*) inside the container.
 
         The path is validated lexically. The content is shipped via a single-file tar
         through the existing copy_to_container pipeline (sanitised, mode preserved).
+
+        When *create_only* is True, refuse to overwrite an existing path (matching deepagents'
+        create-only ``write`` contract). The check probes existence with ``[ -e ]``; there is an
+        inherent TOCTOU window between the probe and the write. The default (False) overwrites,
+        which is what ``edit_file``'s write-back relies on.
         """
         canonical = _validate_sandbox_path(path, allowed_roots=allowed_roots)
         parent_dir, _, filename = canonical.rpartition("/")
         if not parent_dir or not filename:
             raise ValueError(f"path resolves to an unusable location: {path!r}")
+
+        if create_only:
+            # Probe existence and fail *closed*: the guard exists to prevent overwrites, so a
+            # malfunctioning probe must raise (caught and logged by fs_write) rather than be mistaken
+            # for "absent" and silently clobber the file. Both branches print a definite marker and
+            # exit 0, so an unrecognised marker or non-zero exit signals a broken probe, not absence.
+            probe = self.execute_command(
+                f"if [ -e {_sh_quote(canonical)} ]; then printf EXISTS; else printf ABSENT; fi"
+            )
+            marker = probe.output.strip()
+            if probe.exit_code != 0 or marker not in ("EXISTS", "ABSENT"):
+                raise RuntimeError(
+                    f"create-only existence probe failed for {path!r} (exit {probe.exit_code}, output {probe.output!r})"
+                )
+            if marker == "EXISTS":
+                raise FileExistsError(
+                    f"Cannot write to {path} because it already exists. "
+                    "Read and then make an edit, or write to a new path."
+                )
 
         with _build_single_file_tar_stream(filename, content, mode=mode) as tar_stream:
             self.copy_to_container(tar_stream, dest=parent_dir, clear_before_copy=False)
@@ -537,10 +562,12 @@ class SandboxDockerSession:
     def list_dir(self, path: str) -> list[DirEntry]:
         """List one directory level. Uses `ls -1Ap` (portable; dirs get a trailing '/').
 
-        Raises RuntimeError if the listing fails (e.g. missing path / permission denied),
-        so callers can distinguish a real error from a genuinely empty directory.
+        Raises FileNotFoundError when the path does not exist (callers may treat that as an
+        empty listing), and RuntimeError when the listing genuinely fails (e.g. permission
+        denied) — both distinct from a real but empty directory, which returns [].
         """
-        result = self.execute_command(f"ls -1Ap -- {_sh_quote(path)} 2>/dev/null")
+        quoted = _sh_quote(path)
+        result = self._run_path_guarded(path, f"ls -1Ap -- {quoted} 2>/dev/null")
         if result.exit_code != 0:
             raise RuntimeError(f"ls failed (exit {result.exit_code}) for {path!r}")
         entries: list[DirEntry] = []
@@ -560,10 +587,11 @@ class SandboxDockerSession:
         `glob`, when given, restricts results to files whose basename matches it. The
         filtering is applied host-side (busybox `grep` on minimal images like alpine has
         no `--include`). grep exit code 1 means "no matches" (returns []); exit >= 2 is a
-        real error and raises RuntimeError.
+        real error and raises RuntimeError. A genuinely absent path raises FileNotFoundError
+        (callers may treat that as no matches), distinct from grep's own exit 2.
         """
-        cmd = f"grep -rHnF -e {_sh_quote(pattern)} -- {_sh_quote(path)} 2>/dev/null"
-        result = self.execute_command(cmd)
+        quoted = _sh_quote(path)
+        result = self._run_path_guarded(path, f"grep -rHnF -e {_sh_quote(pattern)} -- {quoted} 2>/dev/null")
         if result.exit_code >= 2:
             raise RuntimeError(f"grep failed (exit {result.exit_code}) for {path!r}")
         matches: list[GrepHit] = []
@@ -580,13 +608,15 @@ class SandboxDockerSession:
 
         Uses a busybox-safe type-marker scheme (GNU `find -printf` is unavailable on
         images like alpine): directories are suffixed with ``/D`` and files with ``/F``.
-        Raises RuntimeError if the traversal fails (e.g. missing path).
+        Raises FileNotFoundError when the path does not exist (callers may treat that as no
+        matches), and RuntimeError when the traversal genuinely fails.
         """
-        cmd = (
-            f"{{ find {_sh_quote(path)} -mindepth 1 -type d 2>/dev/null | sed 's/$/\\/D/'; "
-            f"find {_sh_quote(path)} -mindepth 1 ! -type d 2>/dev/null | sed 's/$/\\/F/'; }}"
+        quoted = _sh_quote(path)
+        body = (
+            f"{{ find {quoted} -mindepth 1 -type d 2>/dev/null | sed 's/$/\\/D/'; "
+            f"find {quoted} -mindepth 1 ! -type d 2>/dev/null | sed 's/$/\\/F/'; }}"
         )
-        result = self.execute_command(cmd)
+        result = self._run_path_guarded(path, body)
         if result.exit_code != 0:
             raise RuntimeError(f"find failed (exit {result.exit_code}) for {path!r}")
         out: list[DirEntry] = []
@@ -600,8 +630,10 @@ class SandboxDockerSession:
     def edit_file(self, path: str, old: str, new: str, replace_all: bool, *, allowed_roots: tuple[str, ...]) -> int:
         """Read, replace, and write back a text file. CRLF-aware. Returns occurrence count.
 
-        Raises FileNotFoundError, UnicodeDecodeError, or ValueError("string_not_found" /
-        "multiple_occurrences") for the endpoint to map to error codes.
+        Raises FileNotFoundError or UnicodeDecodeError, or a ValueError carrying a human-readable
+        message: ``"string_not_found"``, an EOF-newline mismatch hint (when ``old`` carries a
+        trailing newline the file lacks at EOF), or a multiple-occurrences message that includes the
+        count. ``fs_edit`` forwards the ValueError text to the caller verbatim.
         """
         raw = self.read_file_bytes(path)
         text = raw.decode("utf-8")  # UnicodeDecodeError → not a text file
@@ -618,9 +650,31 @@ class SandboxDockerSession:
                 matched_old, matched_new, count = cand_old, cand_new, c
                 break
         if count == 0:
+            # EOF-newline mismatch hint (port of deepagents perform_string_replacement): the model
+            # appended a terminator `old` carries but the file lacks at EOF. Compare on LF-normalized
+            # forms so a CRLF file is handled the same way the variant loop above does.
+            text_lf = text.replace("\r\n", "\n")
+            if old_lf.endswith("\n") and len(old_lf) > 1 and text_lf.endswith(old_lf.removesuffix("\n")):
+                stripped = old_lf.removesuffix("\n")
+                stripped_count = text_lf.count(stripped)
+                if stripped_count == 1:
+                    raise ValueError(
+                        "old_string ends with a newline, but the file does not end with a newline. "
+                        "Retry with the trailing newline removed from old_string "
+                        "(and from new_string if it also ends with a newline)."
+                    )
+                raise ValueError(
+                    f"old_string ends with a newline, but the file does not end with a newline. "
+                    f"With the trailing newline removed, old_string would appear {stripped_count} "
+                    f"times in the file. Retry with the trailing newline removed and add surrounding "
+                    f"context so the match is unique."
+                )
             raise ValueError("string_not_found")
         if count > 1 and not replace_all:
-            raise ValueError("multiple_occurrences")
+            raise ValueError(
+                f"String appears {count} times in file. Use replace_all=True to replace all instances, "
+                f"or provide a more specific string with surrounding context."
+            )
         result = text.replace(matched_old, matched_new) if replace_all else text.replace(matched_old, matched_new, 1)
         self.write_file(path, result.encode("utf-8"), mode=0o644, allowed_roots=allowed_roots)
         return count
@@ -685,15 +739,3 @@ class SandboxDockerSession:
                 return None
 
         return container
-
-    def get_label(self, label: str) -> str | None:
-        """
-        Get a label from the container.
-
-        Args:
-            label (str): The label to get.
-
-        Returns:
-            str | None: The value of the label, or None if the label is not set.
-        """
-        return self.container.attrs["Config"].get("Labels", {}).get(label)
