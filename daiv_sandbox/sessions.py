@@ -310,11 +310,10 @@ class SandboxDockerSession:
         container = self.client.containers.run(
             image,
             entrypoint="/bin/sh",
-            command=["-lc", "sleep 3600"],  # 1 hour
+            command=["-lc", "sleep infinity"],  # long-lived; reaper owns the lifetime
             detach=True,
             tty=True,
             runtime=settings.RUNTIME,
-            remove=True,
             user=self._get_user(),
             **kwargs,
         )
@@ -324,9 +323,8 @@ class SandboxDockerSession:
 
         logger.info("Container '%s' started (status: %s)", container.short_id, container.status)
 
-        # Bootstrap the directory layout. The container runs `sleep 3600`, so it stays alive on
-        # failure and `remove=True` won't reap it — force-remove on any bootstrap error so a failed
-        # start() leaves nothing behind (no leaked container holding its runtime/cpu/memory reservations).
+        # Bootstrap the directory layout. On failure, force-remove so a failed start() leaks nothing
+        # (no leaked container holding its runtime/cpu/memory reservations).
         sandbox_dirs = [WORKSPACE_ROOT, SANDBOX_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT]
         try:
             # Ensure the sandbox directories exist and are writable by the sandbox user.

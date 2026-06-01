@@ -93,11 +93,10 @@ def test__start_container(mock_docker_client):
     mock_docker_client.containers.run.assert_called_once_with(
         "test-image",
         entrypoint="/bin/sh",
-        command=["-lc", "sleep 3600"],
+        command=["-lc", "sleep infinity"],
         detach=True,
         tty=True,
         runtime=settings.RUNTIME,
-        remove=True,
         user=f"{settings.RUN_UID}:{settings.RUN_GID}",
     )
     assert session.container is not None
@@ -125,7 +124,7 @@ def test__start_container(mock_docker_client):
 def test_start_container_force_removes_on_bootstrap_failure(mock_docker_client):
     """If mkdir/chown fails after the container starts, force-remove it.
 
-    The container runs `sleep 3600`, so it stays alive on failure and `remove=True` won't reap it;
+    The container runs `sleep infinity` with no auto-remove, so it stays alive on failure;
     `_start_container` must force-remove it so a failed start() leaks nothing.
     """
     session = SandboxDockerSession()
