@@ -50,6 +50,13 @@ PIPEFAIL_WRAPPER = (
     'if [ -x /bin/bash ]; then exec /bin/bash -o pipefail -c "$1"; else exec /bin/sh -o pipefail -c "$1"; fi'
 )
 
+# Sentinel exit code the fs-primitive shell guards (`list_dir`/`find_paths`/`grep`) emit when the
+# target path does not exist. The tools' own "cannot access" exits are ambiguous (`ls`/`grep` use 2
+# for both missing and permission denied) and we discard stderr, so an explicit existence test lets
+# us map only a true absence to FileNotFoundError. 7 is unused by `test`/`ls`/`grep`/`find` (which
+# exit 0/1/2), so it can't collide.
+_PATH_ABSENT_EXIT = 7
+
 
 def _sh_quote(value: str) -> str:
     """
@@ -512,10 +519,16 @@ class SandboxDockerSession:
     def list_dir(self, path: str) -> list[DirEntry]:
         """List one directory level. Uses `ls -1Ap` (portable; dirs get a trailing '/').
 
-        Raises RuntimeError if the listing fails (e.g. missing path / permission denied),
-        so callers can distinguish a real error from a genuinely empty directory.
+        Raises FileNotFoundError when the path does not exist (callers may treat that as an
+        empty listing), and RuntimeError when the listing genuinely fails (e.g. permission
+        denied) — both distinct from a real but empty directory, which returns [].
         """
-        result = self.execute_command(f"ls -1Ap -- {_sh_quote(path)} 2>/dev/null")
+        quoted = _sh_quote(path)
+        # Test existence first so a true absence (sentinel exit) is distinguishable from a real
+        # failure: `ls` exit 2 is ambiguous (missing vs permission denied) and stderr is discarded.
+        result = self.execute_command(f"[ -e {quoted} ] || exit {_PATH_ABSENT_EXIT}; ls -1Ap -- {quoted} 2>/dev/null")
+        if result.exit_code == _PATH_ABSENT_EXIT:
+            raise FileNotFoundError(path)
         if result.exit_code != 0:
             raise RuntimeError(f"ls failed (exit {result.exit_code}) for {path!r}")
         entries: list[DirEntry] = []
@@ -535,10 +548,16 @@ class SandboxDockerSession:
         `glob`, when given, restricts results to files whose basename matches it. The
         filtering is applied host-side (busybox `grep` on minimal images like alpine has
         no `--include`). grep exit code 1 means "no matches" (returns []); exit >= 2 is a
-        real error and raises RuntimeError.
+        real error and raises RuntimeError. A genuinely absent path raises FileNotFoundError
+        (callers may treat that as no matches), distinct from grep's own exit 2.
         """
-        cmd = f"grep -rHnF -e {_sh_quote(pattern)} -- {_sh_quote(path)} 2>/dev/null"
+        quoted = _sh_quote(path)
+        # Probe existence first: a missing path is reported via the sentinel exit (FileNotFoundError),
+        # distinct from grep's exit 2, which also covers genuine read errors on an existing path.
+        cmd = f"[ -e {quoted} ] || exit {_PATH_ABSENT_EXIT}; grep -rHnF -e {_sh_quote(pattern)} -- {quoted} 2>/dev/null"
         result = self.execute_command(cmd)
+        if result.exit_code == _PATH_ABSENT_EXIT:
+            raise FileNotFoundError(path)
         if result.exit_code >= 2:
             raise RuntimeError(f"grep failed (exit {result.exit_code}) for {path!r}")
         matches: list[GrepHit] = []
@@ -555,13 +574,20 @@ class SandboxDockerSession:
 
         Uses a busybox-safe type-marker scheme (GNU `find -printf` is unavailable on
         images like alpine): directories are suffixed with ``/D`` and files with ``/F``.
-        Raises RuntimeError if the traversal fails (e.g. missing path).
+        Raises FileNotFoundError when the path does not exist (callers may treat that as no
+        matches), and RuntimeError when the traversal genuinely fails.
         """
+        quoted = _sh_quote(path)
+        # Probe existence first so a missing base (sentinel exit -> FileNotFoundError) is
+        # distinguishable from a real traversal failure.
         cmd = (
-            f"{{ find {_sh_quote(path)} -mindepth 1 -type d 2>/dev/null | sed 's/$/\\/D/'; "
-            f"find {_sh_quote(path)} -mindepth 1 ! -type d 2>/dev/null | sed 's/$/\\/F/'; }}"
+            f"[ -e {quoted} ] || exit {_PATH_ABSENT_EXIT}; "
+            f"{{ find {quoted} -mindepth 1 -type d 2>/dev/null | sed 's/$/\\/D/'; "
+            f"find {quoted} -mindepth 1 ! -type d 2>/dev/null | sed 's/$/\\/F/'; }}"
         )
         result = self.execute_command(cmd)
+        if result.exit_code == _PATH_ABSENT_EXIT:
+            raise FileNotFoundError(path)
         if result.exit_code != 0:
             raise RuntimeError(f"find failed (exit {result.exit_code}) for {path!r}")
         out: list[DirEntry] = []

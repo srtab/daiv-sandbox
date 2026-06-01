@@ -457,6 +457,10 @@ async def fs_ls(
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             entries = await asyncio.to_thread(cmd.list_dir, request.path)
+        except FileNotFoundError:
+            # A missing directory is not an error for a listing probe (e.g. callers checking
+            # optional skills dirs most repos lack); return an empty listing quietly.
+            return FsLsResponse(entries=[])
         except Exception as exc:
             logger.exception("fs_ls failed for %s", request.path)
             return FsLsResponse(error=str(exc))
@@ -471,6 +475,9 @@ async def fs_grep(
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob)
+        except FileNotFoundError:
+            # A missing search path is not an error for a probe; return no matches quietly.
+            return FsGrepResponse(matches=[])
         except Exception as exc:
             logger.exception("fs_grep failed for %s", request.path)
             return FsGrepResponse(error=str(exc))
@@ -487,6 +494,9 @@ async def fs_glob(
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             all_entries = await asyncio.to_thread(cmd.find_paths, request.path)
+        except FileNotFoundError:
+            # A missing base directory is not an error for a probe; return no matches quietly.
+            return FsGlobResponse(matches=[])
         except Exception as exc:
             logger.exception("fs_glob failed for %s", request.path)
             return FsGlobResponse(error=str(exc))

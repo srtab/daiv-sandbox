@@ -580,6 +580,17 @@ def test_fs_ls_surfaces_command_error(mock_session, client):
     assert body["error"] is not None
 
 
+def test_fs_ls_missing_directory_returns_empty(mock_session, client):
+    """A missing directory is a quiet, non-error case: empty entries, no error (so callers
+    probing optional dirs — e.g. skills locations most repos lack — get no failure)."""
+    mock_session.list_dir.side_effect = FileNotFoundError("/workspace/repo/.claude/skills")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/workspace/repo/.claude/skills"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["entries"] == []
+    assert body["error"] is None
+
+
 def test_fs_grep_surfaces_command_error(mock_session, client):
     mock_session.grep.side_effect = RuntimeError("grep failed (exit 2)")
     resp = client.post(f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/tmp", "pattern": "x"})
@@ -587,6 +598,18 @@ def test_fs_grep_surfaces_command_error(mock_session, client):
     body = resp.json()
     assert body["matches"] == []
     assert body["error"] is not None
+
+
+def test_fs_grep_missing_directory_returns_empty(mock_session, client):
+    """A missing search path is a quiet, non-error case: no matches, no error."""
+    mock_session.grep.side_effect = FileNotFoundError("/workspace/repo/.claude/skills")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/repo/.claude/skills", "pattern": "x"}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["matches"] == []
+    assert body["error"] is None
 
 
 def test_fs_glob_unbalanced_bracket_is_literal(mock_session, client):
@@ -650,6 +673,19 @@ def test_fs_glob_surfaces_find_error(mock_session, client):
     resp = client.post(f"/session/{mock_session.session_id}/fs/glob", json={"path": "/workspace/tmp/x", "pattern": "*"})
     assert resp.status_code == 200, resp.text
     assert resp.json()["error"] is not None
+
+
+def test_fs_glob_missing_directory_returns_empty(mock_session, client):
+    """A missing base directory is a quiet, non-error case: no matches, no error."""
+    mock_session.find_paths.side_effect = FileNotFoundError("/workspace/repo/.cursor/skills")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/glob",
+        json={"path": "/workspace/repo/.cursor/skills", "pattern": "**/*"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["matches"] == []
+    assert body["error"] is None
 
 
 def test_fs_read_missing_file(mock_session, client):

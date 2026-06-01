@@ -9,6 +9,7 @@ from docker.models.images import Image
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.sessions import (
+    _PATH_ABSENT_EXIT,
     PIPEFAIL_WRAPPER,
     SANDBOX_HOME,
     SANDBOX_ROOT,
@@ -683,7 +684,7 @@ def test_grep_filters_by_basename_glob():
 
 
 def test_grep_raises_on_real_error_exit():
-    """grep exit code >= 2 is a real error (not 'no matches'), so surface it."""
+    """grep exit code >= 2 (other than the absent-path sentinel) is a real error, so surface it."""
     s = _session_with_container()
     s.execute_command = Mock(return_value=Mock(exit_code=2, output="grep: bad things"))
     with pytest.raises(RuntimeError):
@@ -697,11 +698,34 @@ def test_grep_no_matches_exit_1_is_ok():
     assert s.grep("x", "/scratch", glob=None) == []
 
 
+def test_grep_missing_path_raises_file_not_found():
+    """A genuinely absent search path is reported via FileNotFoundError (sentinel exit), distinct
+    from grep's own exit 2 — so fs_grep can treat it as 'no matches' rather than an error."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_ABSENT_EXIT, output=""))
+    with pytest.raises(FileNotFoundError):
+        s.grep("x", "/scratch/missing", glob=None)
+    assert f"|| exit {_PATH_ABSENT_EXIT}" in s.execute_command.call_args.args[0]
+
+
 def test_list_dir_raises_on_error_exit():
+    """A non-zero exit that is NOT the absent-path sentinel (e.g. ls's exit 2 for permission
+    denied on an existing path) is a genuine failure and must raise RuntimeError."""
     s = _session_with_container()
     s.execute_command = Mock(return_value=Mock(exit_code=2, output="ls: cannot access"))
     with pytest.raises(RuntimeError):
+        s.list_dir("/scratch/denied")
+
+
+def test_list_dir_missing_path_raises_file_not_found():
+    """A genuinely absent path is reported via FileNotFoundError (the shell guard's sentinel
+    exit code), distinct from a real listing failure — so fs_ls can treat it as an empty listing."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_ABSENT_EXIT, output=""))
+    with pytest.raises(FileNotFoundError):
         s.list_dir("/scratch/missing")
+    # The listing must probe existence so a true absence is distinguishable from a real error.
+    assert f"|| exit {_PATH_ABSENT_EXIT}" in s.execute_command.call_args.args[0]
 
 
 def test_find_paths_parses_type_markers():
@@ -713,10 +737,22 @@ def test_find_paths_parses_type_markers():
 
 
 def test_find_paths_raises_on_error_exit():
+    """A non-zero exit that is NOT the absent-path sentinel (e.g. a genuine traversal failure on an
+    existing tree) must raise RuntimeError."""
     s = _session_with_container()
-    s.execute_command = Mock(return_value=Mock(exit_code=1, output="find: not found"))
+    s.execute_command = Mock(return_value=Mock(exit_code=1, output="find: bad things"))
     with pytest.raises(RuntimeError):
+        s.find_paths("/scratch/denied")
+
+
+def test_find_paths_missing_path_raises_file_not_found():
+    """A genuinely absent path is reported via FileNotFoundError (sentinel exit), distinct from a
+    real traversal failure — so fs_glob can treat it as no matches."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_ABSENT_EXIT, output=""))
+    with pytest.raises(FileNotFoundError):
         s.find_paths("/scratch/missing")
+    assert f"|| exit {_PATH_ABSENT_EXIT}" in s.execute_command.call_args.args[0]
 
 
 def _edit_session(initial: bytes):

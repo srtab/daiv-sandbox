@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The patch-extractor: the `alpine/git` sidecar container, the shared `/workspace/repo` Docker volume, and the meta-repo turn-diff machinery. With the sandbox as the single source of truth and the seeded repo being a real git repository, callers recover changes by running git inside `/workspace/repo` (`git diff` / `git status`) instead of consuming a server-computed patch. This drops the `extract_patch` field from `StartSessionRequest`, the `patch` field from the run response, and the `DAIV_SANDBOX_GIT_IMAGE` setting. **Breaking:** requires the matching daiv release.
 - `POST /session/{id}/files/` (`apply_file_mutations`) and its `PutMutation` / `ApplyMutationsRequest` / `MutationResult` / `ApplyMutationsResponse` schemas. The endpoint existed to keep a client-side file mirror in sync with the sandbox; the sandbox is now the single source of truth, so write files through the `fs/*` endpoints (or bash) instead — edits under `/workspace/repo` mutate the container workspace in place. **Breaking:** requires the matching daiv release.
 
+### Fixed
+
+- `fs/ls`, `fs/glob`, and `fs/grep` on a path that does not exist now return an empty result (`{"entries"/"matches": [], "error": null}`) instead of a populated `error` field plus an ERROR-level traceback in the server logs. The underlying primitives (`list_dir`/`find_paths`/`grep`) distinguish a genuinely absent path (reported as `FileNotFoundError` via an explicit existence probe, because the tools' own exit codes are ambiguous between "missing" and "permission denied") from a real failure, which still surfaces an error. This silences the log noise from callers probing optional directories most repos lack (e.g. `.claude/skills`, `.cursor/skills`, `.agents/skills`).
+
 ## [0.5.0] - 2026-05-04
 
 ### Added
