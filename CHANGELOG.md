@@ -9,35 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Reserved a `/workspace/tmp` scratchpad root at session start (`mkdir -p` + `chown`) that bash also sees and that stays container-local (it lives outside `/workspace/repo`).
-- `POST /session/{id}/fs/{op}` — Python-free file operations across the session workspace (`/workspace`): `ls`, `read`, `grep`, `glob`, `write`, `edit`, and `delete`. Content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work on images without a Python interpreter (e.g. `alpine`). Edits under `repo/` land directly on the container workspace, while `skills/` and `tmp/` stay container-local.
-- `scripts/dump_schemas.py` now also exports the new `Fs*` request/response schemas for downstream `daiv` consumers.
-- Background session reaper: `DELETE /session/{id}/` now _stops_ the container (preserving it for warm reuse) and a reaper removes stopped containers after `DAIV_SANDBOX_SESSION_GRACE_SECONDS` (default 12h) or when the `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` LRU cap is exceeded. New settings: `DAIV_SANDBOX_REAPER_ENABLED`, `DAIV_SANDBOX_REAPER_INTERVAL_SECONDS`, `DAIV_SANDBOX_SESSION_GRACE_SECONDS`, `DAIV_SANDBOX_MAX_STOPPED_SESSIONS`, `DAIV_SANDBOX_STOP_TIMEOUT_SECONDS`.
-- `GET /session/{id}/` — returns 204 if the session container exists (restarting it if stopped), else 404. Used by clients to validate/warm a session before reuse.
+- `POST /session/{id}/fs/{op}` — Python-free workspace file operations (`ls`, `read`, `grep`, `glob`, `write`, `edit`, `delete`) that act anywhere under `/workspace`. `read` paginates text with `offset`/`limit` and returns binary as base64; `grep` matches a literal substring; `glob` supports `*`, `**`, `?`, and `[abc]`.
+- `GET /session/{id}/` — returns `204` if the session's container exists (restarting it if stopped, warming it for reuse) or `404` if it does not.
+- `?force=true` query parameter on `DELETE /session/{id}/` to remove the container immediately instead of stopping it.
+- Background session reaper that removes stopped containers `DAIV_SANDBOX_SESSION_GRACE_SECONDS` after they stopped (default 12h), with an LRU cap of `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` retained stopped containers (default 50). Configurable via `DAIV_SANDBOX_REAPER_ENABLED`, `DAIV_SANDBOX_REAPER_INTERVAL_SECONDS`, and `DAIV_SANDBOX_STOP_TIMEOUT_SECONDS`.
 
 ### Changed
 
-- Session containers are created with `sleep infinity` and without Docker auto-remove, so they survive a stop and can be resumed. `DELETE` stops instead of removing; `?force=true` restores the old immediate-removal behavior. **Breaking:** requires the matching daiv release for warm reuse.
-- Session container layout unified under `/workspace/{repo,skills,tmp}` (was `/repo`, `/skills`, `/scratch`); `fs/*` endpoints now operate across the whole `/workspace`. **Breaking:** requires the matching daiv release.
-- `fs/glob` now delegates to the stdlib `glob.translate`; a malformed bracket class (e.g. a lone `[`) is treated as a literal (shell-like) instead of returning `400`.
-- `fs/read` now bounds its response: a text page larger than 512000 bytes is truncated with a marker, and a binary file larger than 512000 bytes returns an error instead of an unbounded base64 blob (mirrors deepagents' read limits).
-- `fs/write` is now create-only: writing to a path that already exists returns `ok=False` with a message to read-and-edit or pick a new path (matches the deepagents `write` contract). Editing an existing file via `fs/edit` is unaffected.
-- `fs/glob` results are now returned sorted by path, so client-side truncation is deterministic.
-- `fs/edit` returns clearer errors: a precise hint when `old` carries a trailing newline the file lacks at EOF, and the occurrence count in the multiple-matches error.
+- `DELETE /session/{id}/` now _stops_ the container instead of removing it, preserving it for warm reuse; it is reclaimed later by the reaper, or immediately when `?force=true` is passed. **Breaking change** — the container is no longer removed on close by default.
+- Unified the container filesystem under `/workspace` (`repo/`, `skills/`, `tmp/`). Repo archives now extract into `/workspace/repo`, skills into `/workspace/skills`, and commands run in `/workspace/repo`. **Breaking change** — paths moved from `/repo` and `/skills`.
 
 ### Removed
 
-- The patch-extractor: the `alpine/git` sidecar container, the shared `/workspace/repo` Docker volume, and the meta-repo turn-diff machinery. With the sandbox as the single source of truth and the seeded repo being a real git repository, callers recover changes by running git inside `/workspace/repo` (`git diff` / `git status`) instead of consuming a server-computed patch. This drops the `extract_patch` field from `StartSessionRequest`, the `patch` field from the run response, and the `DAIV_SANDBOX_GIT_IMAGE` setting. **Breaking:** requires the matching daiv release.
-- `POST /session/{id}/files/` (`apply_file_mutations`) and its `PutMutation` / `ApplyMutationsRequest` / `MutationResult` / `ApplyMutationsResponse` schemas. The endpoint existed to keep a client-side file mirror in sync with the sandbox; the sandbox is now the single source of truth, so write files through the `fs/*` endpoints (or bash) instead — edits under `/workspace/repo` mutate the container workspace in place. **Breaking:** requires the matching daiv release.
-
-### Fixed
-
-- `fs/ls`, `fs/glob`, and `fs/grep` on a path that does not exist now return an empty result (`{"entries"/"matches": [], "error": null}`) instead of a populated `error` field plus an ERROR-level traceback in the server logs. The underlying primitives (`list_dir`/`find_paths`/`grep`) distinguish a genuinely absent path (reported as `FileNotFoundError` via an explicit existence probe, because the tools' own exit codes are ambiguous between "missing" and "permission denied") from a real failure, which still surfaces an error. This silences the log noise from callers probing optional directories most repos lack (e.g. `.claude/skills`, `.cursor/skills`, `.agents/skills`).
-- Reaper no longer removes a session that was warmed (restarted via `GET`/`run`/`fs`) between the sweep's listing and the removal: it re-reads the container state under the per-session lock and skips a container that is running again, closing a time-of-check/time-of-use race that could reap a session mid-use.
-- `GET`/`run`/`seed`/`fs` on a session whose container exists but fails to **restart** now returns `503` (a retryable infrastructure fault) instead of masking the Docker error as a `404 "not found"` — which previously led clients to spin up new containers against a degraded daemon. A genuinely missing (or not-yet-warmable) container still returns `404`.
-- `DELETE /session/{id}/` now returns `503` when the Docker daemon fails to stop the container (previously a bare `500` with a stack trace), so clients can tell the session may still be running. A container that vanished before the stop is treated as already-stopped.
-- `copy_to_container` checks the `chmod` result before running `chown`, so a permission-normalization failure is attributed to the step that actually failed instead of running `chown` against a still-mis-permissioned tree and reporting the wrong error.
-- The `fs/*` endpoints no longer swallow unexpected exceptions into a `200` response with an error string: only the expected operational failures (`RuntimeError`, and the create-only `FileExistsError` for `write`) are reported in-body, while programming errors and Docker transport faults now propagate to a real `500` so they surface in metrics/Sentry.
+- Patch extraction. Removed the patch-extractor side-car container, the `extract_patch` parameter from the start-session request, the `patch` field from the run-commands response, and the `DAIV_SANDBOX_GIT_IMAGE` setting. Recover changes by running git (e.g. `git diff`, `git status`) inside `/workspace/repo` through the run-commands endpoint. **Breaking change**
+- `POST /session/{id}/files/` batch file-mutation endpoint, replaced by the `POST /session/{id}/fs/{op}` endpoints. **Breaking change**
 
 ## [0.5.0] - 2026-05-04
 
