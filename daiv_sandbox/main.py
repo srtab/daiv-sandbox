@@ -330,18 +330,21 @@ async def run_on_session(
 async def close_session(
     request: Request,
     session_id: Annotated[str, FastAPIPath(title="The ID of the session to close")],
+    force: bool = False,
     api_key: str = Depends(get_api_key),
 ) -> Response:
     """
-    Close a session by removing the Docker container.
+    Close a session. By default the container is *stopped* (preserved for warm reuse and reclaimed
+    later by the reaper). Pass ``?force=true`` to remove it immediately.
     """
     async with request.app.state.session_lock_manager.acquire(session_id):
-        cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
+        cmd_executor = SandboxDockerSession()
+        cmd_executor.session_id = session_id
 
-        if not cmd_executor.container:
-            return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-        await asyncio.to_thread(cmd_executor.remove_container)
+        if force:
+            await asyncio.to_thread(cmd_executor.remove_container)
+        else:
+            await asyncio.to_thread(cmd_executor.stop_container)
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 

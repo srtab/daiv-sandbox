@@ -308,20 +308,32 @@ def test_start_session_starts_single_container(client):
         mock_session_class.create_named_volume.assert_not_called()
 
 
-def test_close_session_removes_container(client):
-    """Closing a session removes the cmd-executor container (no sidecar / volume teardown)."""
+def test_close_session_stops_container_by_default(client):
+    """Closing a session stops (not removes) the container, preserving it for warm reuse."""
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
         mock_cmd_executor = Mock()
         mock_cmd_executor.session_id = "cmd-executor-id"
-        mock_cmd_executor.container = Mock()
         mock_session_class.return_value = mock_cmd_executor
 
         response = client.delete("/session/cmd-executor-id/")
 
         assert response.status_code == 204
+        mock_cmd_executor.stop_container.assert_called_once()
+        mock_cmd_executor.remove_container.assert_not_called()
+
+
+def test_close_session_force_removes_container(client):
+    """DELETE ?force=true removes the container immediately."""
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.session_id = "cmd-executor-id"
+        mock_session_class.return_value = mock_cmd_executor
+
+        response = client.delete("/session/cmd-executor-id/?force=true")
+
+        assert response.status_code == 204
         mock_cmd_executor.remove_container.assert_called_once()
-        # No volume lookup/removal happens anymore.
-        mock_cmd_executor.client.volumes.get.assert_not_called()
+        mock_cmd_executor.stop_container.assert_not_called()
 
 
 def test_close_session_returns_conflict_when_session_is_locked(mock_session, client, monkeypatch):
