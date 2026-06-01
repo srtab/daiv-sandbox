@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
+from unittest.mock import Mock
 
-from daiv_sandbox.reaper import _parse_docker_timestamp
+from daiv_sandbox.reaper import _list_stopped_sandbox_containers, _parse_docker_timestamp
+from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, TYPE_CMD_EXECUTOR
 
 
 def test_parse_nanosecond_timestamp_truncates_to_micros():
@@ -23,3 +25,18 @@ def test_parse_empty_is_none():
 
 def test_parse_garbage_is_none():
     assert _parse_docker_timestamp("not-a-timestamp") is None
+
+
+def test_list_stopped_filters_out_running():
+    running = Mock(status="running")
+    exited = Mock(status="exited")
+    dead = Mock(status="dead")
+    client = Mock()
+    client.containers.list.return_value = [running, exited, dead]
+
+    result = _list_stopped_sandbox_containers(client)
+
+    client.containers.list.assert_called_once_with(
+        all=True, filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}"}
+    )
+    assert result == [exited, dead]

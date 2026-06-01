@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
+from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, TYPE_CMD_EXECUTOR
+
 logger = logging.getLogger("daiv_sandbox")
 
 
@@ -24,3 +26,13 @@ def _parse_docker_timestamp(value: str) -> datetime | None:
         return datetime.fromisoformat(text).replace(tzinfo=UTC)
     except ValueError:
         return None
+
+
+def _list_stopped_sandbox_containers(client) -> list:
+    """Return all sandbox cmd-executor containers that are not currently running.
+
+    Filters by label, then drops running containers in Python so every non-running state
+    (``exited`` from a clean stop, a crash/OOM, or ``dead``) is collected.
+    """
+    containers = client.containers.list(all=True, filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}"})
+    return [c for c in containers if getattr(c, "status", None) != "running"]
