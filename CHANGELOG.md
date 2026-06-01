@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Session container layout unified under `/workspace/{repo,skills,tmp}` (was `/repo`, `/skills`, `/scratch`); `fs/*` endpoints now operate across the whole `/workspace`. **Breaking:** requires the matching daiv release.
 - `fs/glob` now delegates to the stdlib `glob.translate`; a malformed bracket class (e.g. a lone `[`) is treated as a literal (shell-like) instead of returning `400`.
+- `fs/read` now bounds its response: a text page larger than 512000 bytes is truncated with a marker, and a binary file larger than 512000 bytes returns an error instead of an unbounded base64 blob (mirrors deepagents' read limits).
+- `fs/write` is now create-only: writing to a path that already exists returns `ok=False` with a message to read-and-edit or pick a new path (matches the deepagents `write` contract). Editing an existing file via `fs/edit` is unaffected.
+- `fs/glob` results are now returned sorted by path, so client-side truncation is deterministic.
+- `fs/edit` returns clearer errors: a precise hint when `old` carries a trailing newline the file lacks at EOF, and the occurrence count in the multiple-matches error.
 
 ### Removed
 
