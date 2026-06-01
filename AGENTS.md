@@ -37,7 +37,7 @@ make test
 
 ## Code Style & Conventions
 
-- **Formatter/linter:** ruff (line length 120, target Python 3.12)
+- **Formatter/linter:** ruff (line length 120, target Python 3.14 — inferred from `requires-python`)
 - **Import sorting:** isort rules via ruff
 - **pyproject.toml formatting:** pyproject-fmt
 - **EditorConfig:** UTF-8, LF endings, 4-space indent for Python
@@ -48,29 +48,36 @@ make test
 
 ```mermaid
 flowchart LR
-    Client -->|POST /run/commands/| FastAPI
-    Client -->|POST /run/code/| FastAPI
+    Client -->|POST /session/| FastAPI
+    Client -->|POST /session/{id}/seed/| FastAPI
+    Client -->|POST /session/{id}/fs/op| FastAPI
+    Client -->|POST /session/{id}/| FastAPI
+    Client -->|DELETE /session/{id}/| FastAPI
     FastAPI --> SandboxDockerSession
-    SandboxDockerSession -->|create container| Docker
-    SandboxDockerSession -->|copy archive| Container
-    SandboxDockerSession -->|exec command| Container
-    Container -->|output + changed files| SandboxDockerSession
-    SandboxDockerSession -->|response| FastAPI
-    FastAPI --> Client
+    SandboxDockerSession -->|create / exec / copy archive| Container
+    FastAPI -->|results| Client
 ```
 
-The application exposes two main endpoints:
+The application is session-based. A session owns a single long-lived `cmd_executor` container:
 
-- **`/run/commands/`** — Accepts an archive (base64-encoded tar.gz), extracts it into an ephemeral
-  container, runs a list of commands sequentially, and returns command outputs along with any files
-  changed by the last command.
-- **`/run/code/`** — Executes arbitrary code in a specified language (currently Python only) with
-  optional dependency injection via `LanguageManager`.
+- **`POST /session/`** — start a session from a `base_image`; returns a `session_id`.
+- **`POST /session/{id}/seed/`** — one-shot: extract `repo_archive` into `/workspace/repo` and/or
+  `skills_archive` into `/workspace/skills`.
+- **`POST /session/{id}/fs/{op}`** — Python-free file operations (`ls`, `read`, `grep`, `glob`,
+  `write`, `edit`, `delete`) anywhere under `/workspace`.
+- **`POST /session/{id}/`** — run commands sequentially in `/workspace/repo`; returns each command's
+  output. The container workspace is mutated in place; recover changes by running git (`git diff`,
+  `git status`) inside `/workspace/repo` through the same endpoint.
+- **`DELETE /session/{id}/`** — tear down the container.
 
-`SandboxDockerSession` manages ephemeral containers: it pulls/builds the image, creates the
-container, copies archives into it (`copy_to_runtime`), executes commands (`execute_command`),
-detects changed files by timestamp comparison, and tears down the container on exit. Timeout
-enforcement uses SIGALRM (default 600 seconds).
+The container filesystem is unified under `/workspace` (`repo/`, `skills/`, `tmp/`). The sandbox is the
+single source of truth: edits under `/workspace/repo` (via bash or `fs/*`) land directly on the
+container's workspace, while `skills/` and `tmp/` stay container-local.
+
+`SandboxDockerSession` (in `sessions.py`) pulls the image, creates the container as a non-root user,
+copies sanitised archives in (`copy_to_container`), executes commands (`execute_command`), and exposes
+the `fs/*` primitives. Per-command timeouts are enforced with `asyncio.wait_for`
+(`DAIV_SANDBOX_COMMAND_TIMEOUT`, default `0` = no timeout); a timed-out command returns exit code `124`.
 
 ## Testing Strategy
 
@@ -107,8 +114,8 @@ pytest -vv
 
 - **API key authentication** via `X-API-Key` header (env var `DAIV_SANDBOX_API_KEY`)
 - **Optional gVisor (`runsc`) runtime** for enhanced container isolation
-- **Ephemeral containers** destroyed after each request
-- **Max execution time** enforced via SIGALRM (default 600s)
+- **Session-scoped containers** torn down on `DELETE /session/{id}/` (along with the shared volume)
+- **Per-command timeout** enforced via `asyncio.wait_for` (`DAIV_SANDBOX_COMMAND_TIMEOUT`, default `0` = no timeout); timed-out commands return exit code `124`
 - **Secrets** loaded from `/run/secrets` or environment variables
 - **License:** Apache 2.0
 - **Sentry integration** for error tracking (optional, via `DAIV_SANDBOX_SENTRY_DSN`)

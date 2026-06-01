@@ -11,10 +11,22 @@ the two sides. To refresh the dump:
 import json
 
 from daiv_sandbox.schemas import (
-    ApplyMutationsRequest,
-    ApplyMutationsResponse,
-    MutationResult,
-    PutMutation,
+    FsDeleteRequest,
+    FsDeleteResponse,
+    FsEditRequest,
+    FsEditResponse,
+    FsEntry,
+    FsGlobRequest,
+    FsGlobResponse,
+    FsGrepMatch,
+    FsGrepRequest,
+    FsGrepResponse,
+    FsLsRequest,
+    FsLsResponse,
+    FsReadRequest,
+    FsReadResponse,
+    FsWriteRequest,
+    FsWriteResponse,
     RunRequest,
     RunResponse,
     RunResult,
@@ -23,15 +35,27 @@ from daiv_sandbox.schemas import (
 )
 
 _TYPES = [
-    ApplyMutationsRequest,
-    ApplyMutationsResponse,
-    MutationResult,
-    PutMutation,
     RunRequest,
     RunResponse,
     RunResult,
     StartSessionRequest,
     StartSessionResponse,
+    FsDeleteRequest,
+    FsDeleteResponse,
+    FsEditRequest,
+    FsEditResponse,
+    FsEntry,
+    FsGlobRequest,
+    FsGlobResponse,
+    FsGrepMatch,
+    FsGrepRequest,
+    FsGrepResponse,
+    FsLsRequest,
+    FsLsResponse,
+    FsReadRequest,
+    FsReadResponse,
+    FsWriteRequest,
+    FsWriteResponse,
 ]
 
 
