@@ -1,50 +1,42 @@
-# Project Overview
+# AGENTS.md
 
-`daiv-sandbox` is a FastAPI application for securely executing arbitrary commands and untrusted code in transient Docker containers, optionally using gVisor (`runsc`) for enhanced isolation. It is designed as a code/commands executor for DAIV agents. The stack includes Python 3.14, FastAPI, Docker SDK, Pydantic, and `uv` package manager.
+This file provides guidance to agents when working with code in this repository.
 
-## Repository Structure
+## Project Overview
 
-```
-- daiv_sandbox/       Core FastAPI application (main.py, config.py, sessions.py, etc.)
-- tests/              Pytest test suite for unit tests.
-- .github/workflows/  GitHub Actions for CI (lint, test) and Docker image publishing.
-- Dockerfile          Multi-stage Docker build for production deployment.
-```
+`daiv-sandbox` is a FastAPI application for securely executing arbitrary commands and untrusted code
+in transient Docker containers, optionally using gVisor (`runsc`) for enhanced isolation. It is
+designed as a code/commands executor for DAIV agents. The stack includes Python 3.14, FastAPI,
+Docker SDK, Pydantic, and the `uv` package manager.
 
-## Build & Development Commands
-
-All commands should be invoked via `make` (see `Makefile`).
-
-### Linting & formatting
+## Commands (verified)
 
 ```bash
-# Run all lint checks (ruff check + format check + pyproject-fmt)
-make lint
-
-# Auto-fix linting and formatting issues
-make lint-fix
-
-# Run type checking with mypy
-make lint-typing
+make test          # pytest with coverage (uv run --all-extras pytest -s tests)
+make lint          # ruff check + format check + pyproject-fmt check
+make lint-fix      # auto-fix ruff + format + pyproject-fmt
+make lint-typing   # mypy on daiv_sandbox/
+make run           # fastapi dev on port 8888
 ```
 
-### Testing
+Single test: `uv run --all-extras pytest -s tests/unit_tests/test_main.py -k "test_name"`
 
-```bash
-# Run tests with coverage report
-make test
-```
+`DAIV_SANDBOX_API_KEY=notsosecret` is set automatically by `pytest-env` — no `.env` needed for tests.
 
-## Code Style & Conventions
+## Repo map
 
-- **Formatter/linter:** ruff (line length 120, target Python 3.14 — inferred from `requires-python`)
-- **Import sorting:** isort rules via ruff
-- **pyproject.toml formatting:** pyproject-fmt
-- **EditorConfig:** UTF-8, LF endings, 4-space indent for Python
-- **Commit messages:** present tense, imperative mood, ≤72 char first line
-- **Branch naming:** `feat/`, `fix/`, `chore/`, `security/` prefixes
+- `daiv_sandbox/main.py` — FastAPI app; all endpoints defined here
+- `daiv_sandbox/sessions.py` — `SandboxDockerSession`; Docker container lifecycle and `fs/*` primitives
+- `daiv_sandbox/reaper.py` — background reaper that removes stopped session containers
+- `daiv_sandbox/locks.py` — optional Redis-backed per-session locking
+- `daiv_sandbox/schemas.py` — Pydantic request/response models
+- `daiv_sandbox/config.py` — settings (env vars, secrets from `/run/secrets`)
+- `daiv_sandbox/logs.py` — logging configuration
+- `tests/unit_tests/` — fast unit tests (mock Docker); **run these first**
+- `tests/integration_tests/` — require a live Docker daemon; skipped in standard CI
+- `scripts/dump_schemas.py` — exports JSON schemas for all request/response models
 
-## Architecture Notes
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -84,36 +76,33 @@ copies sanitised archives in (`copy_to_container`), executes commands (`execute_
 the `fs/*` primitives. Per-command timeouts are enforced with `asyncio.wait_for`
 (`DAIV_SANDBOX_COMMAND_TIMEOUT`, default `0` = no timeout); a timed-out command returns exit code `124`.
 
-## Testing Strategy
+## Invariants / footguns
 
-- **Framework:** `pytest` with `pytest-cov`, `pytest-mock`, `pytest-xdist`
-- **Coverage config:** `.coveragerc`, source is `daiv_sandbox/`
-- **Test files are in `tests/` directory.**
+- **API is session-based (v0.5+).** The old `/run/commands/` and `/run/code/` endpoints are gone.
+  Current flow: `POST /session/` → `POST /session/{id}/seed/` → `POST /session/{id}/` →
+  `DELETE /session/{id}/`. Probe/warm a session with `GET /session/{id}/`.
+- **`/session/{id}/seed/` is one-shot per session** and uses `multipart/form-data` (`repo_archive`,
+  `skills_archive`); at least one field is required, and a second call returns `409`.
+- **The sandbox is the single source of truth.** There is no server-computed patch and no
+  `files/` mutation endpoint — write through the `fs/*` endpoints (or bash) and recover changes with
+  git inside `/workspace/repo`.
+- **`DELETE` stops, it does not remove** (the container is kept for warm reuse and reaped later);
+  pass `?force=true` for immediate removal.
+- **Commands run with `pipefail` enabled** — pipeline exit codes are not masked.
+- **Per-command timeout** is controlled by `DAIV_SANDBOX_COMMAND_TIMEOUT` (default `0` = no timeout)
+  and overridable per-request via the `timeout` field; a timed-out command returns exit code `124`.
+- **`/workspace/skills` is reserved** inside containers for seeded skills — do not write there from
+  session code.
+- **Ruff line length is 120**, Python target `3.14`. Do not adjust these.
+- **`CHANGELOG.md` must be updated** following Keep a Changelog conventions when shipping any
+  functional change.
 
-### Canonical test command
+## Where changes usually go
 
-```bash
-make test
-```
-
-### Common pytest workflows (if running pytest directly)
-
-```bash
-# Run all tests
-pytest
-
-# Run a specific file
-pytest tests/test_<name>.py
-
-# Run a specific test function
-pytest tests/test_<name>.py -k "<test_name_substring>"
-
-# Run by keyword
-pytest -k "<keyword>"
-
-# Show extra detail on failures
-pytest -vv
-```
+- New endpoints → `daiv_sandbox/main.py` + `daiv_sandbox/schemas.py`
+- Container behaviour and `fs/*` primitives → `daiv_sandbox/sessions.py`
+- Session lifecycle / reaping → `daiv_sandbox/reaper.py` + `daiv_sandbox/config.py`
+- Settings/env vars → `daiv_sandbox/config.py`
 
 ## Security & Compliance
 
