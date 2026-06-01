@@ -401,8 +401,8 @@ class SandboxDockerSession:
         # under it, so the single /workspace prefix subsumes them). Validate lexically through the
         # shared validator so a `..`/NUL/newline in `dest` is rejected at this boundary rather than
         # relying on every caller pre-validating. allow_root=True permits a bare-root dest.
-        # (/workdir is container-local control plane — the seed marker is written there via exec, not
-        # copied — so it is intentionally NOT an allowed archive destination.)
+        # (The seed marker lives in the sandbox home, outside /workspace — written there via exec, not
+        # copied — so it stays container-local and out of reach of the fs/* endpoints.)
         try:
             _validate_sandbox_path(to_dir_norm, allowed_roots=(WORKSPACE_ROOT,), allow_root=True)
         except ValueError as exc:

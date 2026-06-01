@@ -43,6 +43,7 @@ from daiv_sandbox.schemas import (
 )
 from daiv_sandbox.sessions import (
     DAIV_SANDBOX_TYPE_LABEL,
+    SANDBOX_HOME,
     SANDBOX_ROOT,
     SKILLS_ROOT,
     TYPE_CMD_EXECUTOR,
@@ -59,6 +60,10 @@ logger = logging.getLogger(__name__)
 HEADER_API_KEY_NAME = "X-API-Key"
 
 EXIT_CODE_TIMEOUT = 124  # matches timeout(1) convention
+
+# One-shot seed guard marker. Lives in the sandbox home (outside /workspace) so it is container-local
+# and not reachable through the fs/* endpoints; written/read via exec as root.
+SEED_MARKER = f"{SANDBOX_HOME}/.daiv-seeded"
 
 # Cap on the bytes a single fs/read returns. Mirrors deepagents BaseSandbox MAX_OUTPUT_BYTES /
 # MAX_BINARY_BYTES. The full file is still read into the process (get_archive); this only bounds
@@ -244,7 +249,7 @@ async def seed_session(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
 
         check = await asyncio.to_thread(
-            cmd_executor.container.exec_run, ["/bin/sh", "-c", "test -f /workdir/.daiv-seeded"], user="root"
+            cmd_executor.container.exec_run, ["/bin/sh", "-c", f"test -f {SEED_MARKER}"], user="root"
         )
         if check.exit_code == 0:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session already seeded")
@@ -272,7 +277,7 @@ async def seed_session(
                 ) from exc
 
         marker_result = await asyncio.to_thread(
-            cmd_executor.container.exec_run, ["/bin/sh", "-c", "touch /workdir/.daiv-seeded"], user="root"
+            cmd_executor.container.exec_run, ["/bin/sh", "-c", f"touch {SEED_MARKER}"], user="root"
         )
         if marker_result.exit_code != 0:
             logger.error("Failed to mark session as seeded: [%s] %s", marker_result.exit_code, marker_result.output)
