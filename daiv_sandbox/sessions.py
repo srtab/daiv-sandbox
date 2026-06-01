@@ -23,7 +23,6 @@ logger = logging.getLogger("daiv_sandbox")
 # Canonical sandbox root directory inside all containers
 WORKSPACE_ROOT = "/workspace"
 SANDBOX_ROOT = "/workspace/repo"
-WORKDIR_ROOT = "/workdir"
 SANDBOX_HOME = "/home/daiv-sandbox"
 SKILLS_ROOT = "/workspace/skills"
 SCRATCH_ROOT = "/workspace/tmp"
@@ -324,7 +323,7 @@ class SandboxDockerSession:
         # Bootstrap the directory layout. The container runs `sleep 3600`, so it stays alive on
         # failure and `remove=True` won't reap it — force-remove on any bootstrap error so a failed
         # start() leaves nothing behind (no leaked container holding its runtime/cpu/memory reservations).
-        sandbox_dirs = [WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT]
+        sandbox_dirs = [WORKSPACE_ROOT, SANDBOX_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT]
         try:
             # Ensure the sandbox directories exist and are writable by the sandbox user.
             mkdir_result = container.exec_run(["mkdir", "-p", "--", *sandbox_dirs], user="root")

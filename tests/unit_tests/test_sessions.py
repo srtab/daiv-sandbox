@@ -15,7 +15,6 @@ from daiv_sandbox.sessions import (
     SANDBOX_ROOT,
     SCRATCH_ROOT,
     SKILLS_ROOT,
-    WORKDIR_ROOT,
     WORKSPACE_ROOT,
     SandboxDockerSession,
     _build_single_file_tar_stream,
@@ -106,8 +105,7 @@ def test__start_container(mock_docker_client):
     assert session.session_id == mock_docker_client.containers.run.return_value.id
     # Should create sandbox directories and chown them
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
-        user="root",
+        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
     )
     mock_container.exec_run.assert_any_call(
         [
@@ -116,7 +114,6 @@ def test__start_container(mock_docker_client):
             "--",
             WORKSPACE_ROOT,
             SANDBOX_ROOT,
-            WORKDIR_ROOT,
             SANDBOX_HOME,
             SKILLS_ROOT,
             SCRATCH_ROOT,
@@ -525,23 +522,6 @@ def test_copy_to_container_rejects_non_reserved_root(mock_docker_client):
         session.copy_to_container(buf, dest="/etc/passwd", clear_before_copy=False)
 
 
-def test_copy_to_container_rejects_workdir_root(mock_docker_client):
-    """copy_to_container refuses /workdir: it is container-local control plane (the seed marker is
-    written there via exec, not copied), so it sits outside the archive-extraction boundary."""
-    session = SandboxDockerSession()
-    session.container = MagicMock()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tf:
-        info = tarfile.TarInfo(name="meta.txt")
-        info.size = 0
-        tf.addfile(info, io.BytesIO(b""))
-    buf.seek(0)
-
-    with pytest.raises(ValueError, match="Refusing to extract"):
-        session.copy_to_container(buf, dest=WORKDIR_ROOT, clear_before_copy=False)
-
-
 def test_copy_to_container_allows_bare_workspace_root(mock_docker_client):
     """A bare /workspace dest is accepted (its subdirs repo/skills/tmp all live under it)."""
     session = SandboxDockerSession()
@@ -584,8 +564,7 @@ def test_start_container_creates_skills_root(mock_docker_client):
 
     # mkdir -p was called including SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
-        user="root",
+        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
     )
     # chown was called for SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
@@ -595,7 +574,6 @@ def test_start_container_creates_skills_root(mock_docker_client):
             "--",
             WORKSPACE_ROOT,
             SANDBOX_ROOT,
-            WORKDIR_ROOT,
             SANDBOX_HOME,
             SKILLS_ROOT,
             SCRATCH_ROOT,
