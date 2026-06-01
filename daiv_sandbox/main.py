@@ -41,8 +41,10 @@ from daiv_sandbox.schemas import (
     StartSessionResponse,
 )
 from daiv_sandbox.sessions import (
+    DAIV_SANDBOX_TYPE_LABEL,
     SANDBOX_ROOT,
     SKILLS_ROOT,
+    TYPE_CMD_EXECUTOR,
     WORKSPACE_ROOT,
     SandboxDockerSession,
     _validate_sandbox_path,
@@ -54,10 +56,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 HEADER_API_KEY_NAME = "X-API-Key"
-
-DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
-
-TYPE_CMD_EXECUTOR = "cmd_executor"
 
 EXIT_CODE_TIMEOUT = 124  # matches timeout(1) convention
 

@@ -27,6 +27,10 @@ SANDBOX_HOME = "/home/daiv-sandbox"
 SKILLS_ROOT = "/workspace/skills"
 SCRATCH_ROOT = "/workspace/tmp"
 
+# Container label identifying daiv-sandbox cmd-executor containers (used for discovery/reaping).
+DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
+TYPE_CMD_EXECUTOR = "cmd_executor"
+
 
 class DirEntry(NamedTuple):
     """A single filesystem entry returned by ``list_dir``/``find_paths``."""

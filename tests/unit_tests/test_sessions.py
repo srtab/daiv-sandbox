@@ -153,6 +153,13 @@ def test_remove_container_with_container_not_found(mock_docker_client):
     mock_docker_client.containers.get.return_value.remove.assert_not_called()
 
 
+def test_session_type_label_constants():
+    from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, TYPE_CMD_EXECUTOR
+
+    assert DAIV_SANDBOX_TYPE_LABEL == "daiv.sandbox.type"
+    assert TYPE_CMD_EXECUTOR == "cmd_executor"
+
+
 def test_copy_to_runtime_creates_directory(mock_docker_client):
     import io
     import tarfile
