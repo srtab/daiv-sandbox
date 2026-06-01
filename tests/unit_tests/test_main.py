@@ -688,6 +688,27 @@ def test_fs_glob_missing_directory_returns_empty(mock_session, client):
     assert body["error"] is None
 
 
+def test_fs_glob_results_are_sorted(mock_session, client):
+    """Glob matches are returned sorted by path (deterministic, matching deepagents' sorted glob),
+    regardless of the order find_paths enumerated them."""
+    from daiv_sandbox.sessions import DirEntry
+
+    mock_session.find_paths.return_value = [
+        DirEntry("/workspace/tmp/c.py", False),
+        DirEntry("/workspace/tmp/a.py", False),
+        DirEntry("/workspace/tmp/b.py", False),
+    ]
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/glob", json={"path": "/workspace/tmp", "pattern": "*.py"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert [e["path"] for e in resp.json()["matches"]] == [
+        "/workspace/tmp/a.py",
+        "/workspace/tmp/b.py",
+        "/workspace/tmp/c.py",
+    ]
+
+
 def test_fs_read_missing_file(mock_session, client):
     mock_session.read_file_bytes.side_effect = FileNotFoundError("/workspace/tmp/x")
     resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/x"})

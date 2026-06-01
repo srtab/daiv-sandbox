@@ -507,6 +507,8 @@ async def fs_glob(
             for (p, d) in all_entries
             if p.startswith(f"{base}/") and regex.match(p[len(base) + 1 :])
         ]
+        # Deterministic order (matches deepagents' sorted glob) so client-side truncation is stable.
+        matched.sort(key=lambda e: e.path)
         return FsGlobResponse(matches=matched)
 
 
