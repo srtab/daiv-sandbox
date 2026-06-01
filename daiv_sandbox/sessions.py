@@ -477,6 +477,19 @@ class SandboxDockerSession:
 
         return RunResult(command=command, output=output, exit_code=result.exit_code, workdir=command_workdir)
 
+    def _run_path_guarded(self, path: str, body: str) -> RunResult:
+        """Run *body* only if *path* exists, mapping a true absence to FileNotFoundError.
+
+        Prepends an explicit `[ -e ]` existence test that exits with `_PATH_ABSENT_EXIT` when the
+        path is missing, then raises FileNotFoundError on that sentinel. This disambiguates a real
+        absence from a tool's own "cannot access" exit (`ls`/`grep` use 2 for both missing and
+        permission denied) since stderr is discarded. *body* must already quote *path* itself.
+        """
+        result = self.execute_command(f"[ -e {_sh_quote(path)} ] || exit {_PATH_ABSENT_EXIT}; {body}")
+        if result.exit_code == _PATH_ABSENT_EXIT:
+            raise FileNotFoundError(path)
+        return result
+
     def write_file(
         self,
         path: str,
@@ -554,11 +567,7 @@ class SandboxDockerSession:
         denied) — both distinct from a real but empty directory, which returns [].
         """
         quoted = _sh_quote(path)
-        # Test existence first so a true absence (sentinel exit) is distinguishable from a real
-        # failure: `ls` exit 2 is ambiguous (missing vs permission denied) and stderr is discarded.
-        result = self.execute_command(f"[ -e {quoted} ] || exit {_PATH_ABSENT_EXIT}; ls -1Ap -- {quoted} 2>/dev/null")
-        if result.exit_code == _PATH_ABSENT_EXIT:
-            raise FileNotFoundError(path)
+        result = self._run_path_guarded(path, f"ls -1Ap -- {quoted} 2>/dev/null")
         if result.exit_code != 0:
             raise RuntimeError(f"ls failed (exit {result.exit_code}) for {path!r}")
         entries: list[DirEntry] = []
@@ -582,12 +591,7 @@ class SandboxDockerSession:
         (callers may treat that as no matches), distinct from grep's own exit 2.
         """
         quoted = _sh_quote(path)
-        # Probe existence first: a missing path is reported via the sentinel exit (FileNotFoundError),
-        # distinct from grep's exit 2, which also covers genuine read errors on an existing path.
-        cmd = f"[ -e {quoted} ] || exit {_PATH_ABSENT_EXIT}; grep -rHnF -e {_sh_quote(pattern)} -- {quoted} 2>/dev/null"
-        result = self.execute_command(cmd)
-        if result.exit_code == _PATH_ABSENT_EXIT:
-            raise FileNotFoundError(path)
+        result = self._run_path_guarded(path, f"grep -rHnF -e {_sh_quote(pattern)} -- {quoted} 2>/dev/null")
         if result.exit_code >= 2:
             raise RuntimeError(f"grep failed (exit {result.exit_code}) for {path!r}")
         matches: list[GrepHit] = []
@@ -608,16 +612,11 @@ class SandboxDockerSession:
         matches), and RuntimeError when the traversal genuinely fails.
         """
         quoted = _sh_quote(path)
-        # Probe existence first so a missing base (sentinel exit -> FileNotFoundError) is
-        # distinguishable from a real traversal failure.
-        cmd = (
-            f"[ -e {quoted} ] || exit {_PATH_ABSENT_EXIT}; "
+        body = (
             f"{{ find {quoted} -mindepth 1 -type d 2>/dev/null | sed 's/$/\\/D/'; "
             f"find {quoted} -mindepth 1 ! -type d 2>/dev/null | sed 's/$/\\/F/'; }}"
         )
-        result = self.execute_command(cmd)
-        if result.exit_code == _PATH_ABSENT_EXIT:
-            raise FileNotFoundError(path)
+        result = self._run_path_guarded(path, body)
         if result.exit_code != 0:
             raise RuntimeError(f"find failed (exit {result.exit_code}) for {path!r}")
         out: list[DirEntry] = []
