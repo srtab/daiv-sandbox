@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 
+from docker.errors import NotFound
+
+from daiv_sandbox.locks import SessionBusyError
 from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, TYPE_CMD_EXECUTOR
 
 logger = logging.getLogger("daiv_sandbox")
@@ -36,3 +40,47 @@ def _list_stopped_sandbox_containers(client) -> list:
     """
     containers = client.containers.list(all=True, filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}"})
     return [c for c in containers if getattr(c, "status", None) != "running"]
+
+
+async def _remove_guarded(container, lock_manager) -> bool:
+    """Force-remove *container* while holding its per-session lock.
+
+    Returns True if removal was attempted, False if the session was busy (a request — e.g. a
+    restart-on-access — is in flight, so we skip and let the next sweep retry). Tolerates a
+    container that vanished between listing and removal.
+    """
+    try:
+        async with lock_manager.acquire(container.id):
+            await asyncio.to_thread(container.remove, force=True)
+    except SessionBusyError:
+        logger.info("Reaper: session %s busy; skipping this tick", container.id)
+        return False
+    except NotFound:
+        return True
+    except Exception:
+        logger.exception("Reaper: failed to remove container %s", container.id)
+        return False
+    else:
+        logger.info("Reaper: removed stopped container %s", container.id)
+        return True
+
+
+async def _reap_once(client, lock_manager, *, now, grace_seconds: int, max_stopped: int) -> None:
+    """One sweep: remove stopped containers older than the grace window, then LRU-evict any beyond
+    the count cap (oldest ``FinishedAt`` first). Containers with no parseable ``FinishedAt`` are
+    kept and treated as newest for cap ordering."""
+    containers = await asyncio.to_thread(_list_stopped_sandbox_containers, client)
+
+    survivors: list[tuple[object, datetime | None]] = []
+    for container in containers:
+        finished = _parse_docker_timestamp((container.attrs or {}).get("State", {}).get("FinishedAt", ""))
+        if finished is not None and (now - finished).total_seconds() >= grace_seconds:
+            await _remove_guarded(container, lock_manager)
+        else:
+            survivors.append((container, finished))
+
+    if max_stopped >= 0 and len(survivors) > max_stopped:
+        # Oldest first; unknown FinishedAt sorts as "now" (kept last, i.e. not evicted first).
+        survivors.sort(key=lambda item: item[1] or now)
+        for container, _finished in survivors[: len(survivors) - max_stopped]:
+            await _remove_guarded(container, lock_manager)
