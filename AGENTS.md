@@ -1,132 +1,109 @@
 # AGENTS.md
 
-This file provides guidance to agents when working with code in this repository.
+This file provides guidance to agents (Claude Code and others) when working with code in this repository.
 
-## Project Overview
+## Overview
 
-`daiv-sandbox` is a FastAPI application for securely executing arbitrary commands and untrusted code
-in transient Docker containers, optionally using gVisor (`runsc`) for enhanced isolation. It is
-designed as a code/commands executor for DAIV agents. The stack includes Python 3.14, FastAPI,
-Docker SDK, Pydantic, and the `uv` package manager.
+`daiv-sandbox` is a FastAPI service that executes untrusted commands and file operations inside
+transient Docker containers, optionally hardened with the gVisor (`runsc`) runtime. It is the
+code/commands executor for [DAIV](https://github.com/srtab/daiv) agents. Stack: Python 3.14, FastAPI,
+the Docker SDK, Pydantic, and the `uv` package manager.
 
-## Commands (verified)
+## Commands
 
 ```bash
-make test          # pytest with coverage (uv run --all-extras pytest -s tests)
-make lint          # ruff check + format check + pyproject-fmt check
+make test          # uv run --all-extras pytest -s tests  (unit + integration, with coverage)
+make lint          # ruff check + ruff format --check + pyproject-fmt --check
 make lint-fix      # auto-fix ruff + format + pyproject-fmt
 make lint-typing   # mypy on daiv_sandbox/
-make run           # fastapi dev on port 8888
+make run           # fastapi dev on port 8888 (reload)
 ```
 
-Single test: `uv run --all-extras pytest -s tests/unit_tests/test_main.py -k "test_name"`
-
-`DAIV_SANDBOX_API_KEY=notsosecret` is set automatically by `pytest-env` — no `.env` needed for tests.
-
-## Repo map
-
-- `daiv_sandbox/main.py` — FastAPI app; all endpoints defined here
-- `daiv_sandbox/sessions.py` — `SandboxDockerSession`; Docker container lifecycle and `fs/*` primitives
-- `daiv_sandbox/reaper.py` — background reaper that removes stopped session containers
-- `daiv_sandbox/locks.py` — optional Redis-backed per-session locking
-- `daiv_sandbox/schemas.py` — Pydantic request/response models
-- `daiv_sandbox/config.py` — settings (env vars, secrets from `/run/secrets`)
-- `daiv_sandbox/logs.py` — logging configuration
-- `tests/unit_tests/` — fast unit tests (mock Docker); **run these first**
-- `tests/integration_tests/` — require a live Docker daemon; skipped in standard CI
-- `scripts/dump_schemas.py` — exports JSON schemas for all request/response models
+- **Single test:** `uv run --all-extras pytest -s tests/unit_tests/test_main.py -k "test_name"`
+- **Unit only (no Docker needed):** `uv run --all-extras pytest -s tests/unit_tests`
+- `tests/integration_tests/` spin up **real containers** and require a running Docker daemon; `make test`
+  runs them (CI runs `make test` on a Docker-enabled runner). Run the unit suite alone when no daemon is
+  available.
+- `pytest-env` sets `DAIV_SANDBOX_API_KEY=notsosecret` automatically — no `.env` needed for tests.
+- CI gate is `make lint` then `make test`; `make lint-typing` (mypy) is available locally but is not a CI gate.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    Client -->|POST /session/| FastAPI
-    Client -->|POST /session/{id}/seed/| FastAPI
-    Client -->|POST /session/{id}/fs/op| FastAPI
-    Client -->|POST /session/{id}/| FastAPI
-    Client -->|GET /session/{id}/| FastAPI
-    Client -->|DELETE /session/{id}/ stop| FastAPI
-    FastAPI --> SandboxDockerSession
-    SandboxDockerSession -->|create / exec / copy archive| Container
-    FastAPI -->|results| Client
-```
+**Two distinct Docker contexts — do not conflate them.** The FastAPI app is itself one container
+(`Dockerfile`, runs as user `app`, talks to the host Docker socket). It manages a _separate_ sandbox
+container per session, in which untrusted code runs. `settings.RUN_UID/RUN_GID` and the gVisor runtime
+apply to the **sandbox** containers, not the service.
 
-The application is session-based. A session owns a single long-lived `cmd_executor` container:
+**A session is one long-lived sandbox container.** `SandboxDockerSession` (`sessions.py`) wraps it:
 
-- **`POST /session/`** — start a session from a `base_image`; returns a `session_id`.
-- **`POST /session/{id}/seed/`** — one-shot: extract `repo_archive` into `/workspace/repo` and/or
-  `skills_archive` into `/workspace/skills`.
-- **`POST /session/{id}/fs/{op}`** — Python-free file operations (`ls`, `read`, `grep`, `glob`,
-  `write`, `edit`, `delete`) anywhere under `/workspace`.
-- **`POST /session/{id}/`** — run commands sequentially in `/workspace/repo`; returns each command's
-  output. The container workspace is mutated in place; recover changes by running git (`git diff`,
-  `git status`) inside `/workspace/repo` through the same endpoint.
-- **`DELETE /session/{id}/`** — stop the container (preserved for warm reuse); `?force=true`
-  removes it immediately. A background reaper removes stopped containers
-  `DAIV_SANDBOX_SESSION_GRACE_SECONDS` after they stopped (default 12h), with an LRU cap of
-  `DAIV_SANDBOX_MAX_STOPPED_SESSIONS`.
-- **`GET /session/{id}/`** — 204 if the session exists (restarting it if stopped), else 404.
+- `start()` pulls the image and runs a container with `entrypoint=/bin/sh -lc "sleep infinity"` (PID 1
+  never exits on its own), labeled `daiv.sandbox.type=cmd_executor`. The `session_id` returned to clients
+  **is the container id**.
+- On every later request, `SandboxDockerSession(session_id=...)` looks the container up via
+  `_get_container()`, which **restarts a stopped container on access** (warm reuse).
+- `DELETE` _stops_ the container by default (`stop_container`), preserving its writable layer; `?force=true`
+  removes it. The background **reaper** (`reaper.py`) later removes stopped containers.
+- All blocking Docker calls are wrapped in `asyncio.to_thread`, and a single `DockerClient` is shared
+  across the process (`_get_shared_client`).
 
-The container filesystem is unified under `/workspace` (`repo/`, `skills/`, `tmp/`). The sandbox is the
-single source of truth: edits under `/workspace/repo` (via bash or `fs/*`) land directly on the
-container's workspace, while `skills/` and `tmp/` stay container-local.
+**`/workspace` is the single source of truth.** The container layout is `/workspace/{repo,skills,tmp}`
+(constants `SANDBOX_ROOT`, `SKILLS_ROOT`, `SCRATCH_ROOT`) plus `/home/daiv-sandbox` (`SANDBOX_HOME`).
+`seed` extracts archives into `repo/` and `skills/`; `run` executes commands in `/workspace/repo`;
+`fs/*` operate anywhere under `/workspace`. There is no server-side patch/diff — recover changes by
+running git inside `/workspace/repo`. The one-shot seed guard marker lives in `SANDBOX_HOME` (outside
+`/workspace`, so it's unreachable through `fs/*`).
 
-`SandboxDockerSession` (in `sessions.py`) pulls the image, creates the container as a non-root user,
-copies sanitised archives in (`copy_to_container`), executes commands (`execute_command`), and exposes
-the `fs/*` primitives. Per-command timeouts are enforced with `asyncio.wait_for`
-(`DAIV_SANDBOX_COMMAND_TIMEOUT`, default `0` = no timeout); a timed-out command returns exit code `124`.
+**Endpoints** (`main.py`, all under `root_path=/api/v1`, all require the `X-API-Key` header):
+`POST /session/` → `POST /session/{id}/seed/` (multipart, one-shot, 409 if re-seeded) →
+`POST /session/{id}/fs/{op}` (`ls`/`read`/`grep`/`glob`/`write`/`edit`/`delete`) and
+`POST /session/{id}/` (run commands) → `GET /session/{id}/` (204 exists/warms, 404 missing) →
+`DELETE /session/{id}/`. Plus `GET /-/health/` and `GET /-/version/`.
 
-## Invariants / footguns
+**Concurrency & locking.** Every session-scoped endpoint runs inside
+`app.state.session_lock_manager.acquire(session_id)` (`locks.py`). Without `REDIS_URL` this is a no-op
+(single replica); with it, a Redis lock serialises requests for the same session across replicas, and a
+request that can't acquire it within the wait window raises `SessionBusyError`. The reaper uses a Redis
+_leader_ lock so only one replica sweeps per tick.
 
-- **API is session-based (v0.5+).** The old `/run/commands/` and `/run/code/` endpoints are gone.
-  Current flow: `POST /session/` → `POST /session/{id}/seed/` → `POST /session/{id}/` →
-  `DELETE /session/{id}/`. Probe/warm a session with `GET /session/{id}/`.
-- **`/session/{id}/seed/` is one-shot per session** and uses `multipart/form-data` (`repo_archive`,
-  `skills_archive`); at least one field is required, and a second call returns `409`.
-- **The sandbox is the single source of truth.** There is no server-computed patch and no
-  `files/` mutation endpoint — write through the `fs/*` endpoints (or bash) and recover changes with
-  git inside `/workspace/repo`.
-- **`DELETE` stops, it does not remove** (the container is kept for warm reuse and reaped later);
-  pass `?force=true` for immediate removal.
-- **Commands run with `pipefail` enabled** — pipeline exit codes are not masked.
-- **Per-command timeout** is controlled by `DAIV_SANDBOX_COMMAND_TIMEOUT` (default `0` = no timeout)
-  and overridable per-request via the `timeout` field; a timed-out command returns exit code `124`.
-- **`/workspace/skills` is reserved** inside containers for seeded skills — do not write there from
-  session code.
-- **Ruff line length is 120**, Python target `3.14`. Do not adjust these.
-- **`CHANGELOG.md` must be updated** following Keep a Changelog conventions when shipping any
-  functional change.
+**The reaper** (`reaper.py`) sweeps on a fixed cadence: it lists non-running cmd-executor containers,
+removes those whose `State.FinishedAt` is older than `SESSION_GRACE_SECONDS`, then LRU-evicts any beyond
+`MAX_STOPPED_SESSIONS`. Removal re-reads container state **under the per-session lock** and skips a
+container that has been warmed again — closing a TOCTOU race against in-flight requests.
 
-## Where changes usually go
+**Error-status contract (deliberate — keep these distinct).** Missing session → `404`. A Docker fault
+while restarting/stopping an existing container → `SessionUnavailableError` → `503` (retryable infra
+fault, **not** masked as 404). Lock contention → `SessionBusyError` → `409`. Missing/invalid API key →
+`403`.
 
-- New endpoints → `daiv_sandbox/main.py` + `daiv_sandbox/schemas.py`
-- Container behaviour and `fs/*` primitives → `daiv_sandbox/sessions.py`
-- Session lifecycle / reaping → `daiv_sandbox/reaper.py` + `daiv_sandbox/config.py`
-- Settings/env vars → `daiv_sandbox/config.py`
+**`fs/*` is Python-free and defends a container boundary, not a path prefix.** File content moves via
+the Docker archive API; search/listing shells out to POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work
+on minimal images (e.g. `alpine`) with no Python interpreter. `_validate_sandbox_path` rejects `..`, NUL,
+and newlines and confines paths to `/workspace`, but the check is **lexical** — it does not resolve
+symlinks. The real trust boundary is the sandbox container (gVisor / non-root), not the `/workspace`
+prefix. `fs/read` caps a single response at `READ_MAX_OUTPUT_BYTES` (512 KB); `fs/write` is create-only.
 
-## Security & Compliance
+**Untrusted-input handling.** Uploaded archives are sanitised before extraction (`_sanitize_archive_stream`):
+symlinks/hardlinks/device nodes/FIFOs and absolute/`..` paths are rejected, ownership is normalised to
+`RUN_UID/RUN_GID`, and the stream spools through a `SpooledTemporaryFile` instead of being buffered whole.
+Run commands execute through a portable `pipefail` wrapper so pipeline exit codes aren't masked, with a
+per-command timeout enforced by `asyncio.wait_for` (timed-out command → exit code `124`, remaining
+commands skipped).
 
-- **API key authentication** via `X-API-Key` header (env var `DAIV_SANDBOX_API_KEY`)
-- **Optional gVisor (`runsc`) runtime** for enhanced container isolation
-- **Session-scoped containers** _stopped_ on `DELETE /session/{id}/` and removed by a background
-  reaper after `DAIV_SANDBOX_SESSION_GRACE_SECONDS` (default 12h) or when the
-  `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` LRU cap is exceeded; `?force=true` removes immediately.
-  Untrusted artifacts therefore persist for at most the grace window after the last use.
-- **Per-command timeout** enforced via `asyncio.wait_for` (`DAIV_SANDBOX_COMMAND_TIMEOUT`, default `0` = no timeout); timed-out commands return exit code `124`
-- **Secrets** loaded from `/run/secrets` or environment variables
-- **License:** Apache 2.0
-- **Sentry integration** for error tracking (optional, via `DAIV_SANDBOX_SENTRY_DSN`)
+## Module map (`daiv_sandbox/`)
 
-## Plan expectations (for agents proposing changes)
+- `main.py` — FastAPI app, all endpoints, `lifespan` (wires the lock manager + reaper), Sentry init, exception handlers.
+- `sessions.py` — `SandboxDockerSession`: container lifecycle, archive copy/sanitisation, command exec, and the `fs/*` primitives; path constants and `_validate_sandbox_path`.
+- `reaper.py` — background loop that removes stopped session containers (age + LRU, leader-locked).
+- `locks.py` — `NoopSessionLockManager` / `RedisSessionLockManager` and `SessionBusyError`.
+- `config.py` — `settings` singleton (pydantic-settings).
+- `schemas.py` — request/response models.
+- `logs.py` — logging configuration.
 
-When presenting a plan, include the following:
+## Conventions
 
-- validate plan by running `make test` and confirming that all tests pass
-- update `CHANGELOG.md` based on the present changelog conventions
-
-## Maintenance Notes
-
-- Update this file when:
-  - `Makefile` targets change
-  - the repo structure changes (new key packages/dirs)
-  - tooling changes (ruff/mypy/pytest)
+- **Config:** all settings come from `DAIV_SANDBOX_`-prefixed env vars (or files in `/run/secrets`) via the
+  `settings` singleton in `config.py`. See the README table for the full list; `DAIV_SANDBOX_API_KEY` is required.
+- **Sandbox containers always run as a non-root user** (`RUN_UID:RUN_GID`); passing `user` to
+  `_start_container` is rejected on purpose.
+- **Ruff:** line length 120, target Python 3.14, `preview = true`. `make lint-fix` before committing.
+- **`CHANGELOG.md`** follows Keep a Changelog and must be updated for any user-facing/functional change.
