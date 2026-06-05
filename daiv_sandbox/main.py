@@ -221,8 +221,6 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
 
     if not request.network_enabled:
         cmd_executor_kwargs["network_mode"] = "none"
-    elif settings.NETWORK:
-        cmd_executor_kwargs["network"] = settings.NETWORK
 
     if request.environment:
         cmd_executor_kwargs["environment"] = request.environment
