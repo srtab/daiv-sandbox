@@ -200,6 +200,10 @@ common_responses = {
     },
 }
 
+# fs/* endpoints surface all path/operation problems in the 200 body via the structured FsError,
+# so they never return 400 — expose a 400-free variant rather than advertising an unreachable status.
+_fs_responses = {code: resp for code, resp in common_responses.items() if code != status.HTTP_400_BAD_REQUEST}
+
 
 @app.post("/session/", responses=common_responses, name="Obtain a session ID")
 async def start_session(request: StartSessionRequest, api_key: str = Depends(get_api_key)) -> StartSessionResponse:
@@ -217,6 +221,8 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
 
     if not request.network_enabled:
         cmd_executor_kwargs["network_mode"] = "none"
+    elif settings.NETWORK:
+        cmd_executor_kwargs["network"] = settings.NETWORK
 
     if request.environment:
         cmd_executor_kwargs["environment"] = request.environment
@@ -454,7 +460,7 @@ async def _workspace_executor(http_request: Request, session_id: str) -> AsyncIt
         yield cmd
 
 
-@app.post("/session/{session_id}/fs/write", responses=common_responses, name="Write a workspace file")
+@app.post("/session/{session_id}/fs/write", responses=_fs_responses, name="Write a workspace file")
 async def fs_write(
     http_request: Request, session_id: str, request: FsWriteRequest, api_key: str = Depends(get_api_key)
 ) -> FsWriteResponse:
@@ -475,12 +481,15 @@ async def fs_write(
         except FileExistsError as exc:
             return FsWriteResponse(ok=False, error=FsError(code=FsErrorCode.ALREADY_EXISTS, message=str(exc)))
         except RuntimeError as exc:
+            # Expected operational failure (copy/probe). Any *other* exception (programming error,
+            # Docker transport fault) is NOT caught here so it propagates to a real 500 — surfacing in
+            # metrics/Sentry rather than hiding behind a 200 with an error body.
             logger.exception("fs_write failed for %s", request.path)
             return FsWriteResponse(ok=False, error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
         return FsWriteResponse(ok=True)
 
 
-@app.post("/session/{session_id}/fs/read", responses=common_responses, name="Read a workspace file")
+@app.post("/session/{session_id}/fs/read", responses=_fs_responses, name="Read a workspace file")
 async def fs_read(
     http_request: Request, session_id: str, request: FsReadRequest, api_key: str = Depends(get_api_key)
 ) -> FsReadResponse:
@@ -530,7 +539,7 @@ async def fs_read(
         return FsReadResponse(content=content, encoding="utf-8")
 
 
-@app.post("/session/{session_id}/fs/ls", responses=common_responses, name="List a workspace directory")
+@app.post("/session/{session_id}/fs/ls", responses=_fs_responses, name="List a workspace directory")
 async def fs_ls(
     http_request: Request, session_id: str, request: FsLsRequest, api_key: str = Depends(get_api_key)
 ) -> FsLsResponse:
@@ -557,7 +566,7 @@ async def fs_ls(
         return FsLsResponse(entries=[FsEntry(path=p, is_dir=d) for p, d in entries])
 
 
-@app.post("/session/{session_id}/fs/grep", responses=common_responses, name="Grep workspace files")
+@app.post("/session/{session_id}/fs/grep", responses=_fs_responses, name="Grep workspace files")
 async def fs_grep(
     http_request: Request, session_id: str, request: FsGrepRequest, api_key: str = Depends(get_api_key)
 ) -> FsGrepResponse:
@@ -580,7 +589,7 @@ async def fs_grep(
         return FsGrepResponse(matches=[FsGrepMatch(path=p, line=n, text=t) for p, n, t in matches])
 
 
-@app.post("/session/{session_id}/fs/glob", responses=common_responses, name="Glob workspace files")
+@app.post("/session/{session_id}/fs/glob", responses=_fs_responses, name="Glob workspace files")
 async def fs_glob(
     http_request: Request, session_id: str, request: FsGlobRequest, api_key: str = Depends(get_api_key)
 ) -> FsGlobResponse:
@@ -588,6 +597,7 @@ async def fs_glob(
         _validate_workspace_dir(request.path)
     except ValueError as exc:
         return FsGlobResponse(error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
+    # glob.translate treats malformed bracket classes as literals (shell-like), so this never raises.
     regex = _glob_to_regex(request.pattern)
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
@@ -617,7 +627,7 @@ async def fs_glob(
         return FsGlobResponse(matches=matched)
 
 
-@app.post("/session/{session_id}/fs/edit", responses=common_responses, name="Edit a workspace file")
+@app.post("/session/{session_id}/fs/edit", responses=_fs_responses, name="Edit a workspace file")
 async def fs_edit(
     http_request: Request, session_id: str, request: FsEditRequest, api_key: str = Depends(get_api_key)
 ) -> FsEditResponse:
@@ -654,7 +664,7 @@ async def fs_edit(
         return FsEditResponse(occurrences=count)
 
 
-@app.post("/session/{session_id}/fs/delete", responses=common_responses, name="Delete a workspace file")
+@app.post("/session/{session_id}/fs/delete", responses=_fs_responses, name="Delete a workspace file")
 async def fs_delete(
     http_request: Request, session_id: str, request: FsDeleteRequest, api_key: str = Depends(get_api_key)
 ) -> FsDeleteResponse:

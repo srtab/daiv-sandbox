@@ -1043,6 +1043,18 @@ def test_fs_read_binary_exactly_at_cap_is_base64(mock_session, client):
     assert body["error"] is None
 
 
+def test_fs_edit_string_not_found(mock_session, client):
+    """edit_file raises ValueError('string_not_found') when `old` isn't present; it must map to the
+    STRING_NOT_FOUND code (not MULTIPLE_OCCURRENCES, whose message starts with 'String appears')."""
+    mock_session.edit_file.side_effect = ValueError("string_not_found")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/edit",
+        json={"path": "/workspace/tmp/a.txt", "old": "x", "new": "y", "replace_all": False},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"]["code"] == "string_not_found"
+
+
 def test_fs_edit_multiple_occurrences(mock_session, client):
     mock_session.edit_file.side_effect = ValueError("String appears multiple times")
     resp = client.post(
