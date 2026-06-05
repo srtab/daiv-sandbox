@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     RUN_UID: int = 1000
     RUN_GID: int = 1000
     COMMAND_TIMEOUT: int = Field(default=0, ge=0)  # per-command timeout in seconds; 0 = no timeout
+    # Network attached to cmd-executor containers when a session is network-enabled. None -> Docker's
+    # default bridge (no compose-service DNS). Set to a compose/user-defined network (e.g.
+    # "daiv_default") so containers can resolve & reach sibling services like "gitlab:8929".
+    NETWORK: str | None = None
 
     # Session locking
     REDIS_URL: str | None = None
