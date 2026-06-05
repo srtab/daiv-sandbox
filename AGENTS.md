@@ -81,6 +81,11 @@ on minimal images (e.g. `alpine`) with no Python interpreter. `_validate_sandbox
 and newlines and confines paths to `/workspace`, but the check is **lexical** — it does not resolve
 symlinks. The real trust boundary is the sandbox container (gVisor / non-root), not the `/workspace`
 prefix. `fs/read` caps a single response at `READ_MAX_OUTPUT_BYTES` (512 KB); `fs/write` is create-only.
+`fs/*` outcomes are reported in the 200 body via a structured `error` object (`{code, message}`,
+codes from `FsErrorCode` in `schemas.py`): absence is `not_found` (distinct from an empty
+listing/no-match), a type mismatch is `not_a_directory`/`is_a_directory`, a malformed path is
+`invalid_path`, and `fs/delete` reports a `removed` boolean. HTTP status codes remain reserved for
+session/transport concerns (404 missing session, 409 lock, 503 infra, 403 auth, 500 unexpected).
 
 **Untrusted-input handling.** Uploaded archives are sanitised before extraction (`_sanitize_archive_stream`):
 symlinks/hardlinks/device nodes/FIFOs and absolute/`..` paths are rejected, ownership is normalised to

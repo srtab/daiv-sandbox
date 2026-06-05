@@ -170,17 +170,38 @@ The response is an empty body with status `204`.
 
 To inspect or modify files without spawning a shell, use the `POST /session/{session_id}/fs/{op}` endpoints. They operate anywhere under `/workspace` (`repo/`, `skills/`, `tmp/`) and are Python-free — content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so they work even on base images without a Python interpreter (e.g. `alpine`).
 
-| Op       | Body                             | Returns                     |
-| -------- | -------------------------------- | --------------------------- |
-| `ls`     | `{path}`                         | directory entries           |
-| `read`   | `{path, offset?, limit?}`        | utf-8 text or base64 binary |
-| `grep`   | `{pattern, path, glob?}`         | literal-substring matches   |
-| `glob`   | `{pattern, path}`                | paths matching the glob     |
-| `write`  | `{path, content, mode?}`         | `{ok, error?}`              |
-| `edit`   | `{path, old, new, replace_all?}` | `{occurrences, error?}`     |
-| `delete` | `{path}`                         | `{ok, error?}`              |
+| Op       | Body                             | Returns                                |
+| -------- | -------------------------------- | -------------------------------------- |
+| `ls`     | `{path}`                         | directory entries + `error?`           |
+| `read`   | `{path, offset?, limit?}`        | utf-8 text or base64 binary + `error?` |
+| `grep`   | `{pattern, path, glob?}`         | literal-substring matches + `error?`   |
+| `glob`   | `{pattern, path}`                | paths matching the glob + `error?`     |
+| `write`  | `{path, content, mode?}`         | `{ok, error?}`                         |
+| `edit`   | `{path, old, new, replace_all?}` | `{occurrences, error?}`                |
+| `delete` | `{path}`                         | `{ok, removed, error?}`                |
 
-`path` must be absolute and under `/workspace`; the file ops (`write`/`edit`/`read`/`delete`) target a file, while the directory ops (`ls`/`grep`/`glob`) may also target the `/workspace` root itself. `content` is base64-encoded. Every response also carries an `error` field, set when the operation fails (e.g. invalid path, missing file).
+`path` must be absolute and under `/workspace`; the file ops (`write`/`edit`/`read`/`delete`) target a file, while the directory ops (`ls`/`grep`/`glob`) may also target the `/workspace` root itself. `content` is base64-encoded.
+
+Every response carries an `error` field with the shape `{code, message}` when the operation fails — `null` on success. `code` is one of the stable `FsErrorCode` values:
+
+| Code                   | Meaning                                                              |
+| ---------------------- | -------------------------------------------------------------------- |
+| `invalid_path`         | Path is malformed (`..`, NUL, newline) or outside `/workspace`.      |
+| `not_found`            | Path does not exist (distinct from an empty directory / no-match).   |
+| `not_a_directory`      | `ls` was called on a file path.                                      |
+| `is_a_directory`       | `read`, `edit`, or `delete` was called on a directory path.          |
+| `not_a_text_file`      | `read` returned binary content that exceeds the size cap.            |
+| `string_not_found`     | `edit` found no occurrence of `old`.                                 |
+| `multiple_occurrences` | `edit` found more than one occurrence and `replace_all` was not set. |
+| `already_exists`       | `write` target already exists (create-only).                         |
+| `too_large`            | Content exceeds the 512 KB read cap.                                 |
+| `invalid_offset`       | `read` `offset` is beyond the file length.                           |
+| `permission_denied`    | Filesystem permission error inside the container.                    |
+| `exec_failed`          | The underlying shell command failed unexpectedly.                    |
+
+`fs/delete` additionally returns a `removed` boolean: `true` if the file was deleted, `false` if it was already absent.
+
+`fs/ls`, `fs/grep`, and `fs/glob` return HTTP `200` with `error.code=invalid_path` for malformed paths (no longer `400`), keeping all fs ops consistent: HTTP status codes are reserved for session/transport concerns (404 missing session, 409 lock, 503 infra, 403 auth).
 
 `read` has a few additional behaviors: an empty file returns a human-readable sentinel string (with `encoding: "utf-8"`); an `offset` beyond the file length returns an `error`; a single response is capped at 512000 bytes — a larger text page is truncated with a marker (continue with a larger `offset`/smaller `limit`), and a binary file over the cap returns an `error` rather than a base64 blob.
 
