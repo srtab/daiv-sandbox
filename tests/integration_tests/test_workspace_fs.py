@@ -186,3 +186,65 @@ def test_traversal_above_workspace_is_rejected(client, workspace_session):
     resp = client.post(f"/session/{sid}/fs/ls", json={"path": "/workspace/../etc"})
     assert resp.status_code == 200, resp.text
     assert resp.json()["error"]["code"] == "invalid_path"
+
+
+def test_ls_on_file_reports_not_a_directory(client, workspace_session):
+    sid = workspace_session
+    ls = client.post(f"/session/{sid}/fs/ls", json={"path": "/workspace/repo/README.md"})
+    assert ls.status_code == 200, ls.text
+    body = ls.json()
+    assert body["entries"] == []
+    assert body["error"]["code"] == "not_a_directory"
+
+
+def test_read_directory_reports_is_a_directory(client, workspace_session):
+    sid = workspace_session
+    r = client.post(f"/session/{sid}/fs/read", json={"path": "/workspace/repo", "offset": 0, "limit": 2000})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["content"] is None
+    assert body["error"]["code"] == "is_a_directory"
+
+
+def test_glob_on_file_base_reports_not_a_directory(client, workspace_session):
+    sid = workspace_session
+    gl = client.post(f"/session/{sid}/fs/glob", json={"path": "/workspace/repo/README.md", "pattern": "*"})
+    assert gl.status_code == 200, gl.text
+    body = gl.json()
+    assert body["matches"] == []
+    assert body["error"]["code"] == "not_a_directory"
+
+
+def test_delete_missing_reports_not_removed(client, workspace_session):
+    sid = workspace_session
+    d = client.post(f"/session/{sid}/fs/delete", json={"path": "/workspace/tmp/never-existed.txt"})
+    assert d.status_code == 200, d.text
+    body = d.json()
+    assert body["ok"] is True
+    assert body["removed"] is False
+    assert body["error"] is None
+
+
+def test_delete_existing_reports_removed(client, workspace_session):
+    sid = workspace_session
+    w = client.post(
+        f"/session/{sid}/fs/write",
+        json={"path": "/workspace/tmp/doomed.txt", "content": base64.b64encode(b"x\n").decode(), "mode": 0o644},
+    )
+    assert w.status_code == 200 and w.json()["ok"] is True, w.text
+    d = client.post(f"/session/{sid}/fs/delete", json={"path": "/workspace/tmp/doomed.txt"})
+    assert d.status_code == 200, d.text
+    body = d.json()
+    assert body["ok"] is True
+    assert body["removed"] is True
+
+
+def test_delete_directory_reports_is_a_directory(client, workspace_session):
+    sid = workspace_session
+    run = client.post(f"/session/{sid}/", json={"commands": ["mkdir -p /workspace/tmp/adir"]})
+    assert run.status_code == 200, run.text
+    d = client.post(f"/session/{sid}/fs/delete", json={"path": "/workspace/tmp/adir"})
+    assert d.status_code == 200, d.text
+    body = d.json()
+    assert body["ok"] is False
+    assert body["error"]["code"] == "is_a_directory"
