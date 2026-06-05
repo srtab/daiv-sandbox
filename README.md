@@ -188,9 +188,9 @@ Every response carries an `error` field with the shape `{code, message}` when th
 | ---------------------- | -------------------------------------------------------------------- |
 | `invalid_path`         | Path is malformed (`..`, NUL, newline) or outside `/workspace`.      |
 | `not_found`            | Path does not exist (distinct from an empty directory / no-match).   |
-| `not_a_directory`      | `ls` was called on a file path.                                      |
+| `not_a_directory`      | `ls` or `glob` was called on a file path.                            |
 | `is_a_directory`       | `read`, `edit`, or `delete` was called on a directory path.          |
-| `not_a_text_file`      | `read` returned binary content that exceeds the size cap.            |
+| `not_a_text_file`      | `edit` target is not valid UTF-8 text.                               |
 | `string_not_found`     | `edit` found no occurrence of `old`.                                 |
 | `multiple_occurrences` | `edit` found more than one occurrence and `replace_all` was not set. |
 | `already_exists`       | `write` target already exists (create-only).                         |
