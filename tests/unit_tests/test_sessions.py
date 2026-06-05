@@ -10,6 +10,8 @@ from docker.models.images import Image
 from daiv_sandbox.config import settings
 from daiv_sandbox.sessions import (
     _PATH_ABSENT_EXIT,
+    _PATH_DENIED_EXIT,
+    _PATH_WRONG_TYPE_EXIT,
     PIPEFAIL_WRAPPER,
     SANDBOX_HOME,
     SANDBOX_ROOT,
@@ -1015,3 +1017,55 @@ def test_validate_allows_workspace_root_only_with_allow_root():
 def test_validate_rejects_outside_workspace(path):
     with pytest.raises(ValueError):
         _validate_sandbox_path(path, allowed_roots=(WORKSPACE_ROOT,))
+
+
+def _tar_of_dir(dir_name: str) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name=dir_name)
+        info.type = tarfile.DIRTYPE
+        tf.addfile(info)
+    return buf.getvalue()
+
+
+def test_list_dir_wrong_type_raises_not_a_directory():
+    """The classifying guard exits 8 when the path exists but is not a directory."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_WRONG_TYPE_EXIT, output=""))
+    with pytest.raises(NotADirectoryError):
+        s.list_dir("/scratch/a-file")
+
+
+def test_list_dir_permission_denied_raises():
+    """The guard exits 9 when an existing directory is not readable/traversable by the sandbox user."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_DENIED_EXIT, output=""))
+    with pytest.raises(PermissionError):
+        s.list_dir("/scratch/denied")
+
+
+def test_read_file_bytes_directory_raises_is_a_directory():
+    """Reading a directory must raise IsADirectoryError, not return an inner file's bytes."""
+    s = _session_with_container()
+    s.container.get_archive.return_value = (iter([_tar_of_dir("somedir/")]), {"size": 0})
+    with pytest.raises(IsADirectoryError):
+        s.read_file_bytes("/scratch/somedir")
+
+
+def test_delete_file_absent_returns_false():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_ABSENT_EXIT, output=""))
+    assert s.delete_file("/scratch/missing") is False
+
+
+def test_delete_file_directory_raises_is_a_directory():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_WRONG_TYPE_EXIT, output=""))
+    with pytest.raises(IsADirectoryError):
+        s.delete_file("/scratch/adir")
+
+
+def test_delete_file_removed_returns_true():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    assert s.delete_file("/scratch/x") is True
