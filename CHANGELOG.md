@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DAIV_SANDBOX_COMMAND_TIMEOUT` setting to configure a server-wide default per-command timeout (default `0`, no timeout).
 - Optional Redis-backed per-session locking (`DAIV_SANDBOX_REDIS_URL`) to prevent concurrent requests from racing on the same session across replicas; a busy session returns `409 Conflict`. Tunable via `DAIV_SANDBOX_SESSION_LOCK_TTL_SECONDS`, `DAIV_SANDBOX_SESSION_LOCK_WAIT_SECONDS`, and `DAIV_SANDBOX_SESSION_LOCK_REFRESH_SECONDS`.
 - `scripts/dump_schemas.py` to export request/response JSON schemas for downstream `daiv` consumers.
+- `DAIV_SANDBOX_NETWORK` setting: network-enabled sessions (`network_enabled=true`) are attached to the named Docker network when set; when unset they use Docker's default network, and sessions without networking remain isolated with `network_mode=none`.
 
 ### Changed
 
