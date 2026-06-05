@@ -704,7 +704,8 @@ def test_fs_write_rejects_path_outside_workspace_repo_sibling(mock_session, clie
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["ok"] is False
-    assert "under" in resp.json()["error"]
+    assert resp.json()["error"]["code"] == "invalid_path"
+    assert "under" in resp.json()["error"]["message"]
     mock_session.write_file.assert_not_called()
 
 
@@ -722,7 +723,8 @@ def test_fs_write_conflict_returns_quiet_error(mock_session, client):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["ok"] is False
-    assert "already exists" in body["error"]
+    assert body["error"]["code"] == "already_exists"
+    assert "already exists" in body["error"]["message"]
 
 
 def test_fs_write_passes_create_only(mock_session, client):
@@ -745,12 +747,14 @@ def test_fs_ls_returns_entries(mock_session, client):
 
 @pytest.mark.parametrize("op", ["ls", "grep", "glob"])
 def test_fs_dir_endpoints_reject_traversal(mock_session, client, op):
-    """ls/grep/glob must reject `..` traversal (rejected lexically, before any path resolution)."""
+    """ls/grep/glob reject `..` traversal as a 200 body with error.code=invalid_path (unified with
+    the file ops, which already returned 200)."""
     payload = {"path": "/workspace/tmp/../repo"}
     if op in ("grep", "glob"):
         payload["pattern"] = "x"
     resp = client.post(f"/session/{mock_session.session_id}/fs/{op}", json=payload)
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"]["code"] == "invalid_path"
 
 
 def test_fs_ls_surfaces_command_error(mock_session, client):
@@ -759,18 +763,57 @@ def test_fs_ls_surfaces_command_error(mock_session, client):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["entries"] == []
-    assert body["error"] is not None
+    assert body["error"]["code"] == "exec_failed"
 
 
-def test_fs_ls_missing_directory_returns_empty(mock_session, client):
-    """A missing directory is a quiet, non-error case: empty entries, no error (so callers
-    probing optional dirs — e.g. skills locations most repos lack — get no failure)."""
-    mock_session.list_dir.side_effect = FileNotFoundError("/workspace/repo/.claude/skills")
-    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/workspace/repo/.claude/skills"})
+def test_fs_ls_missing_returns_not_found(mock_session, client):
+    mock_session.list_dir.side_effect = FileNotFoundError("/workspace/repo/nope")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/workspace/repo/nope"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["entries"] == []
-    assert body["error"] is None
+    assert body["error"]["code"] == "not_found"
+
+
+def test_fs_ls_on_file_returns_not_a_directory(mock_session, client):
+    mock_session.list_dir.side_effect = NotADirectoryError("/workspace/repo/f.txt")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/workspace/repo/f.txt"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"]["code"] == "not_a_directory"
+
+
+def test_fs_ls_invalid_path_returns_200_invalid_path(mock_session, client):
+    resp = client.post(f"/session/{mock_session.session_id}/fs/ls", json={"path": "/workspace/tmp/../repo"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"]["code"] == "invalid_path"
+    mock_session.list_dir.assert_not_called()
+
+
+def test_fs_read_directory_returns_is_a_directory(mock_session, client):
+    mock_session.read_file_bytes.side_effect = IsADirectoryError("/workspace/repo/src")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/repo/src", "offset": 0, "limit": 2000}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"]["code"] == "is_a_directory"
+
+
+def test_fs_delete_reports_removed_flag(mock_session, client):
+    mock_session.delete_file.return_value = False
+    resp = client.post(f"/session/{mock_session.session_id}/fs/delete", json={"path": "/workspace/tmp/gone.txt"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["removed"] is False
+
+
+def test_fs_delete_directory_returns_is_a_directory(mock_session, client):
+    mock_session.delete_file.side_effect = IsADirectoryError("/workspace/tmp/adir")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/delete", json={"path": "/workspace/tmp/adir"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["error"]["code"] == "is_a_directory"
 
 
 def test_fs_grep_surfaces_command_error(mock_session, client):
@@ -779,11 +822,11 @@ def test_fs_grep_surfaces_command_error(mock_session, client):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["matches"] == []
-    assert body["error"] is not None
+    assert body["error"]["code"] == "exec_failed"
 
 
 def test_fs_grep_missing_directory_returns_empty(mock_session, client):
-    """A missing search path is a quiet, non-error case: no matches, no error."""
+    """A missing search path is now surfaced as not_found."""
     mock_session.grep.side_effect = FileNotFoundError("/workspace/repo/.claude/skills")
     resp = client.post(
         f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/repo/.claude/skills", "pattern": "x"}
@@ -791,7 +834,7 @@ def test_fs_grep_missing_directory_returns_empty(mock_session, client):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["matches"] == []
-    assert body["error"] is None
+    assert body["error"]["code"] == "not_found"
 
 
 def test_fs_glob_unbalanced_bracket_is_literal(mock_session, client):
@@ -854,11 +897,11 @@ def test_fs_glob_surfaces_find_error(mock_session, client):
     mock_session.find_paths.side_effect = RuntimeError("find failed")
     resp = client.post(f"/session/{mock_session.session_id}/fs/glob", json={"path": "/workspace/tmp/x", "pattern": "*"})
     assert resp.status_code == 200, resp.text
-    assert resp.json()["error"] is not None
+    assert resp.json()["error"]["code"] == "exec_failed"
 
 
 def test_fs_glob_missing_directory_returns_empty(mock_session, client):
-    """A missing base directory is a quiet, non-error case: no matches, no error."""
+    """A missing base directory is now surfaced as not_found."""
     mock_session.find_paths.side_effect = FileNotFoundError("/workspace/repo/.cursor/skills")
     resp = client.post(
         f"/session/{mock_session.session_id}/fs/glob",
@@ -867,7 +910,7 @@ def test_fs_glob_missing_directory_returns_empty(mock_session, client):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["matches"] == []
-    assert body["error"] is None
+    assert body["error"]["code"] == "not_found"
 
 
 def test_fs_glob_results_are_sorted(mock_session, client):
@@ -895,7 +938,7 @@ def test_fs_read_missing_file(mock_session, client):
     mock_session.read_file_bytes.side_effect = FileNotFoundError("/workspace/tmp/x")
     resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/x"})
     assert resp.status_code == 200, resp.text
-    assert resp.json()["error"] == "file_not_found"
+    assert resp.json()["error"]["code"] == "not_found"
 
 
 def test_fs_read_empty_file(mock_session, client):
@@ -919,7 +962,8 @@ def test_fs_read_offset_beyond_eof(mock_session, client):
     resp = client.post(
         f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt", "offset": 50, "limit": 10}
     )
-    assert "offset" in resp.json()["error"].lower()
+    assert resp.json()["error"]["code"] == "invalid_offset"
+    assert "offset" in resp.json()["error"]["message"].lower()
 
 
 def test_fs_read_text_truncated_at_cap(mock_session, client):
@@ -953,7 +997,8 @@ def test_fs_read_binary_over_cap_is_error(mock_session, client):
     resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/big.bin"})
     body = resp.json()
     assert body["content"] is None
-    assert "exceeds maximum preview size" in body["error"]
+    assert body["error"]["code"] == "too_large"
+    assert "exceeds maximum preview size" in body["error"]["message"]
 
 
 def test_fs_read_text_truncated_on_multibyte_boundary(mock_session, client):
@@ -999,13 +1044,13 @@ def test_fs_read_binary_exactly_at_cap_is_base64(mock_session, client):
 
 
 def test_fs_edit_multiple_occurrences(mock_session, client):
-    mock_session.edit_file.side_effect = ValueError("multiple_occurrences")
+    mock_session.edit_file.side_effect = ValueError("String appears multiple times")
     resp = client.post(
         f"/session/{mock_session.session_id}/fs/edit",
         json={"path": "/workspace/tmp/a.txt", "old": "x", "new": "y", "replace_all": False},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["error"] == "multiple_occurrences"
+    assert resp.json()["error"]["code"] == "multiple_occurrences"
 
 
 def test_fs_edit_not_a_text_file(mock_session, client):
@@ -1013,7 +1058,7 @@ def test_fs_edit_not_a_text_file(mock_session, client):
     resp = client.post(
         f"/session/{mock_session.session_id}/fs/edit", json={"path": "/workspace/tmp/a.txt", "old": "x", "new": "y"}
     )
-    assert resp.json()["error"] == "not_a_text_file"
+    assert resp.json()["error"]["code"] == "not_a_text_file"
 
 
 def test_fs_edit_success_returns_count(mock_session, client):
@@ -1026,10 +1071,13 @@ def test_fs_edit_success_returns_count(mock_session, client):
 
 
 def test_fs_delete_success(mock_session, client):
-    mock_session.delete_file.return_value = None
+    mock_session.delete_file.return_value = True
     resp = client.post(f"/session/{mock_session.session_id}/fs/delete", json={"path": "/workspace/tmp/a.txt"})
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"ok": True, "error": None}
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["error"] is None
+    assert body["removed"] is True
     mock_session.delete_file.assert_called_once()
 
 
@@ -1056,7 +1104,7 @@ def test_fs_delete_surfaces_runtime_error(mock_session, client):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["ok"] is False
-    assert body["error"] is not None
+    assert body["error"]["code"] == "exec_failed"
 
 
 def test_fs_endpoints_404_when_container_missing(mock_session, client):

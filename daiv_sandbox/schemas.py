@@ -1,3 +1,4 @@
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import Base64Bytes, BaseModel, Field
@@ -55,6 +56,26 @@ class ErrorMessage(BaseModel):
 # --- /workspace file-op wire schemas -----------------------------------------
 
 
+class FsErrorCode(StrEnum):
+    INVALID_PATH = "invalid_path"
+    NOT_FOUND = "not_found"
+    NOT_A_DIRECTORY = "not_a_directory"
+    IS_A_DIRECTORY = "is_a_directory"
+    NOT_A_TEXT_FILE = "not_a_text_file"
+    STRING_NOT_FOUND = "string_not_found"
+    MULTIPLE_OCCURRENCES = "multiple_occurrences"
+    ALREADY_EXISTS = "already_exists"
+    TOO_LARGE = "too_large"
+    INVALID_OFFSET = "invalid_offset"
+    PERMISSION_DENIED = "permission_denied"
+    EXEC_FAILED = "exec_failed"
+
+
+class FsError(BaseModel):
+    code: FsErrorCode = Field(description="Stable, machine-branchable error code.")
+    message: str = Field(description="Human-readable hint the agent can act on.")
+
+
 class FsLsRequest(BaseModel):
     path: str = Field(description="Absolute directory path under /workspace.")
 
@@ -66,7 +87,7 @@ class FsEntry(BaseModel):
 
 class FsLsResponse(BaseModel):
     entries: list[FsEntry] = Field(default_factory=list, description="Directory entries (empty on error).")
-    error: str | None = Field(default=None, description="Error message when the listing failed.")
+    error: FsError | None = Field(default=None, description="Structured error; null on success.")
 
 
 class FsReadRequest(BaseModel):
@@ -86,7 +107,7 @@ class FsReadResponse(BaseModel):
     encoding: Literal["utf-8", "base64"] | None = Field(
         default=None, description="Encoding of `content`: 'utf-8' for text, 'base64' for binary."
     )
-    error: str | None = Field(default=None, description="Error message when the read failed.")
+    error: FsError | None = Field(default=None, description="Structured error; null on success.")
 
 
 class FsGrepRequest(BaseModel):
@@ -103,7 +124,7 @@ class FsGrepMatch(BaseModel):
 
 class FsGrepResponse(BaseModel):
     matches: list[FsGrepMatch] = Field(default_factory=list, description="Matches found (empty on error).")
-    error: str | None = Field(default=None, description="Error message when the search failed.")
+    error: FsError | None = Field(default=None, description="Structured error; null on success.")
 
 
 class FsGlobRequest(BaseModel):
@@ -113,7 +134,7 @@ class FsGlobRequest(BaseModel):
 
 class FsGlobResponse(BaseModel):
     matches: list[FsEntry] = Field(default_factory=list, description="Matching entries (empty on error).")
-    error: str | None = Field(default=None, description="Error message when the glob failed.")
+    error: FsError | None = Field(default=None, description="Structured error; null on success.")
 
 
 class FsWriteRequest(BaseModel):
@@ -124,7 +145,7 @@ class FsWriteRequest(BaseModel):
 
 class FsWriteResponse(BaseModel):
     ok: bool
-    error: str | None = None
+    error: FsError | None = Field(default=None, description="Structured error; null on success.")
 
 
 class FsEditRequest(BaseModel):
@@ -136,7 +157,7 @@ class FsEditRequest(BaseModel):
 
 class FsEditResponse(BaseModel):
     occurrences: int | None = Field(default=None, description="Number of replacements made.")
-    error: str | None = Field(default=None, description="Error code/message on failure.")
+    error: FsError | None = Field(default=None, description="Structured error; null on success.")
 
 
 class FsDeleteRequest(BaseModel):
@@ -145,4 +166,7 @@ class FsDeleteRequest(BaseModel):
 
 class FsDeleteResponse(BaseModel):
     ok: bool
-    error: str | None = None
+    removed: bool = Field(
+        default=False, description="True if a file was actually removed; False if it was already absent."
+    )
+    error: FsError | None = Field(default=None, description="Structured error; null on success.")

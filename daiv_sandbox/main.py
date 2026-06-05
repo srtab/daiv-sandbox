@@ -24,6 +24,8 @@ from daiv_sandbox.schemas import (
     FsEditRequest,
     FsEditResponse,
     FsEntry,
+    FsError,
+    FsErrorCode,
     FsGlobRequest,
     FsGlobResponse,
     FsGrepMatch,
@@ -421,17 +423,13 @@ _WORKSPACE_ROOTS = (WORKSPACE_ROOT,)
 
 
 def _validate_workspace_dir(path: str) -> None:
-    """Validate a directory/file path for ls/grep/glob: the workspace root itself or anything under it.
+    """Validate a directory path for ls/grep/glob: the workspace root itself or anything under it.
 
-    Thin HTTP wrapper over ``_validate_sandbox_path(..., allow_root=True)``: unlike the file ops
-    (which forbid the bare root), ls/grep/glob legitimately target ``/workspace`` itself. The shared
-    validator still rejects ``..`` traversal, NUL, and newlines — otherwise the kernel would resolve
-    ``/workspace/../etc`` and the search would escape WORKSPACE_ROOT.
+    Raises ``ValueError`` (which the endpoints surface as a 200 body with ``error.code=invalid_path``,
+    consistent with the file ops) on ``..`` traversal, NUL, newline, or a path that escapes
+    WORKSPACE_ROOT. ``allow_root=True`` because ls/grep/glob legitimately target ``/workspace`` itself.
     """
-    try:
-        _validate_sandbox_path(path, allowed_roots=_WORKSPACE_ROOTS, allow_root=True)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    _validate_sandbox_path(path, allowed_roots=_WORKSPACE_ROOTS, allow_root=True)
 
 
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
@@ -463,7 +461,7 @@ async def fs_write(
     try:
         _validate_sandbox_path(request.path, allowed_roots=_WORKSPACE_ROOTS)
     except ValueError as exc:
-        return FsWriteResponse(ok=False, error=str(exc))
+        return FsWriteResponse(ok=False, error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             await asyncio.to_thread(
@@ -475,14 +473,10 @@ async def fs_write(
                 create_only=True,
             )
         except FileExistsError as exc:
-            # Expected create-only conflict: surface it quietly (no ERROR-level traceback).
-            return FsWriteResponse(ok=False, error=str(exc))
+            return FsWriteResponse(ok=False, error=FsError(code=FsErrorCode.ALREADY_EXISTS, message=str(exc)))
         except RuntimeError as exc:
-            # Expected operational failure (copy/probe). Anything else (programming error, Docker
-            # transport fault) propagates to a real 500 so it surfaces in metrics/Sentry rather than
-            # hiding behind a 200 with an error string.
             logger.exception("fs_write failed for %s", request.path)
-            return FsWriteResponse(ok=False, error=str(exc))
+            return FsWriteResponse(ok=False, error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
         return FsWriteResponse(ok=True)
 
 
@@ -493,18 +487,27 @@ async def fs_read(
     try:
         _validate_sandbox_path(request.path, allowed_roots=_WORKSPACE_ROOTS)
     except ValueError as exc:
-        return FsReadResponse(error=str(exc))
+        return FsReadResponse(error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             raw = await asyncio.to_thread(cmd.read_file_bytes, request.path)
+        except IsADirectoryError:
+            return FsReadResponse(
+                error=FsError(
+                    code=FsErrorCode.IS_A_DIRECTORY, message=f"Is a directory: {request.path} (use fs/ls to list it)"
+                )
+            )
         except FileNotFoundError:
-            return FsReadResponse(error="file_not_found")
+            return FsReadResponse(error=FsError(code=FsErrorCode.NOT_FOUND, message=f"No such file: {request.path}"))
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             if len(raw) > READ_MAX_OUTPUT_BYTES:
                 return FsReadResponse(
-                    error=f"Binary file exceeds maximum preview size of {READ_MAX_OUTPUT_BYTES} bytes"
+                    error=FsError(
+                        code=FsErrorCode.TOO_LARGE,
+                        message=f"Binary file exceeds maximum preview size of {READ_MAX_OUTPUT_BYTES} bytes",
+                    )
                 )
             return FsReadResponse(content=base64.b64encode(raw).decode("ascii"), encoding="base64")
         if not text:
@@ -512,12 +515,16 @@ async def fs_read(
         lines = text.splitlines()
         page = lines[request.offset : request.offset + request.limit]
         if request.offset and not page:
-            return FsReadResponse(error=f"Line offset {request.offset} exceeds file length ({len(lines)} lines)")
+            return FsReadResponse(
+                error=FsError(
+                    code=FsErrorCode.INVALID_OFFSET,
+                    message=f"Line offset {request.offset} exceeds file length ({len(lines)} lines)",
+                )
+            )
         content = "\n".join(page)
         encoded = content.encode("utf-8")
         if len(encoded) > READ_MAX_OUTPUT_BYTES:
             marker_bytes = len(READ_TRUNCATION_MARKER.encode("utf-8"))
-            # Reserve room for the marker so the total stays within the cap (deepagents' effective_limit).
             truncated = encoded[: READ_MAX_OUTPUT_BYTES - marker_bytes].decode("utf-8", errors="ignore")
             content = truncated + READ_TRUNCATION_MARKER
         return FsReadResponse(content=content, encoding="utf-8")
@@ -527,18 +534,26 @@ async def fs_read(
 async def fs_ls(
     http_request: Request, session_id: str, request: FsLsRequest, api_key: str = Depends(get_api_key)
 ) -> FsLsResponse:
-    _validate_workspace_dir(request.path)
+    try:
+        _validate_workspace_dir(request.path)
+    except ValueError as exc:
+        return FsLsResponse(error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             entries = await asyncio.to_thread(cmd.list_dir, request.path)
         except FileNotFoundError:
-            # A missing directory is not an error for a listing probe (e.g. callers checking
-            # optional skills dirs most repos lack); return an empty listing quietly.
-            return FsLsResponse(entries=[])
+            return FsLsResponse(error=FsError(code=FsErrorCode.NOT_FOUND, message=f"No such directory: {request.path}"))
+        except NotADirectoryError:
+            return FsLsResponse(
+                error=FsError(code=FsErrorCode.NOT_A_DIRECTORY, message=f"Not a directory: {request.path}")
+            )
+        except PermissionError:
+            return FsLsResponse(
+                error=FsError(code=FsErrorCode.PERMISSION_DENIED, message=f"Permission denied: {request.path}")
+            )
         except RuntimeError as exc:
-            # Expected listing failure (e.g. permission denied). Unexpected errors propagate to 500.
             logger.exception("fs_ls failed for %s", request.path)
-            return FsLsResponse(error=str(exc))
+            return FsLsResponse(error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
         return FsLsResponse(entries=[FsEntry(path=p, is_dir=d) for p, d in entries])
 
 
@@ -546,17 +561,22 @@ async def fs_ls(
 async def fs_grep(
     http_request: Request, session_id: str, request: FsGrepRequest, api_key: str = Depends(get_api_key)
 ) -> FsGrepResponse:
-    _validate_workspace_dir(request.path)
+    try:
+        _validate_workspace_dir(request.path)
+    except ValueError as exc:
+        return FsGrepResponse(error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob)
         except FileNotFoundError:
-            # A missing search path is not an error for a probe; return no matches quietly.
-            return FsGrepResponse(matches=[])
+            return FsGrepResponse(error=FsError(code=FsErrorCode.NOT_FOUND, message=f"No such path: {request.path}"))
+        except PermissionError:
+            return FsGrepResponse(
+                error=FsError(code=FsErrorCode.PERMISSION_DENIED, message=f"Permission denied: {request.path}")
+            )
         except RuntimeError as exc:
-            # Expected search failure (e.g. grep exit >= 2). Unexpected errors propagate to 500.
             logger.exception("fs_grep failed for %s", request.path)
-            return FsGrepResponse(error=str(exc))
+            return FsGrepResponse(error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
         return FsGrepResponse(matches=[FsGrepMatch(path=p, line=n, text=t) for p, n, t in matches])
 
 
@@ -564,27 +584,35 @@ async def fs_grep(
 async def fs_glob(
     http_request: Request, session_id: str, request: FsGlobRequest, api_key: str = Depends(get_api_key)
 ) -> FsGlobResponse:
-    _validate_workspace_dir(request.path)
-    # glob.translate treats malformed bracket classes as literals (shell-like), so this never raises.
+    try:
+        _validate_workspace_dir(request.path)
+    except ValueError as exc:
+        return FsGlobResponse(error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
     regex = _glob_to_regex(request.pattern)
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             all_entries = await asyncio.to_thread(cmd.find_paths, request.path)
         except FileNotFoundError:
-            # A missing base directory is not an error for a probe; return no matches quietly.
-            return FsGlobResponse(matches=[])
+            return FsGlobResponse(
+                error=FsError(code=FsErrorCode.NOT_FOUND, message=f"No such directory: {request.path}")
+            )
+        except NotADirectoryError:
+            return FsGlobResponse(
+                error=FsError(code=FsErrorCode.NOT_A_DIRECTORY, message=f"Not a directory: {request.path}")
+            )
+        except PermissionError:
+            return FsGlobResponse(
+                error=FsError(code=FsErrorCode.PERMISSION_DENIED, message=f"Permission denied: {request.path}")
+            )
         except RuntimeError as exc:
-            # Expected traversal failure (e.g. find exit != 0). Unexpected errors propagate to 500.
             logger.exception("fs_glob failed for %s", request.path)
-            return FsGlobResponse(error=str(exc))
+            return FsGlobResponse(error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
         base = request.path.rstrip("/")
-        # Match the base-relative portion of each absolute entry under base.
         matched = [
             FsEntry(path=p, is_dir=d)
             for (p, d) in all_entries
             if p.startswith(f"{base}/") and regex.match(p[len(base) + 1 :])
         ]
-        # Deterministic order (matches deepagents' sorted glob) so client-side truncation is stable.
         matched.sort(key=lambda e: e.path)
         return FsGlobResponse(matches=matched)
 
@@ -596,7 +624,7 @@ async def fs_edit(
     try:
         _validate_sandbox_path(request.path, allowed_roots=_WORKSPACE_ROOTS)
     except ValueError as exc:
-        return FsEditResponse(error=str(exc))
+        return FsEditResponse(error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             count = await asyncio.to_thread(
@@ -607,12 +635,22 @@ async def fs_edit(
                 request.replace_all,
                 allowed_roots=_WORKSPACE_ROOTS,
             )
+        except IsADirectoryError:
+            return FsEditResponse(
+                error=FsError(code=FsErrorCode.IS_A_DIRECTORY, message=f"Is a directory: {request.path}")
+            )
         except FileNotFoundError:
-            return FsEditResponse(error="file_not_found")
+            return FsEditResponse(error=FsError(code=FsErrorCode.NOT_FOUND, message=f"No such file: {request.path}"))
         except UnicodeDecodeError:
-            return FsEditResponse(error="not_a_text_file")
+            return FsEditResponse(
+                error=FsError(code=FsErrorCode.NOT_A_TEXT_FILE, message=f"Not a text file: {request.path}")
+            )
         except ValueError as exc:
-            return FsEditResponse(error=str(exc))
+            msg = str(exc)
+            code = (
+                FsErrorCode.MULTIPLE_OCCURRENCES if msg.startswith("String appears") else FsErrorCode.STRING_NOT_FOUND
+            )
+            return FsEditResponse(error=FsError(code=code, message=msg))
         return FsEditResponse(occurrences=count)
 
 
@@ -623,16 +661,18 @@ async def fs_delete(
     try:
         _validate_sandbox_path(request.path, allowed_roots=_WORKSPACE_ROOTS)
     except ValueError as exc:
-        return FsDeleteResponse(ok=False, error=str(exc))
+        return FsDeleteResponse(ok=False, error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
-            await asyncio.to_thread(cmd.delete_file, request.path)
+            removed = await asyncio.to_thread(cmd.delete_file, request.path)
+        except IsADirectoryError:
+            return FsDeleteResponse(
+                ok=False, error=FsError(code=FsErrorCode.IS_A_DIRECTORY, message=f"Is a directory: {request.path}")
+            )
         except RuntimeError as exc:
-            # Expected rm failure (e.g. target is a non-empty directory). Unexpected errors propagate
-            # to a real 500 rather than hiding behind a 200 with an error string.
             logger.exception("fs_delete failed for %s", request.path)
-            return FsDeleteResponse(ok=False, error=str(exc))
-        return FsDeleteResponse(ok=True)
+            return FsDeleteResponse(ok=False, error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
+        return FsDeleteResponse(ok=True, removed=removed)
 
 
 if __name__ == "__main__":
