@@ -635,9 +635,11 @@ class SandboxDockerSession:
     def list_dir(self, path: str) -> list[DirEntry]:
         """List one directory level. Uses `ls -1Ap` (portable; dirs get a trailing '/').
 
-        Raises FileNotFoundError when the path does not exist (callers may treat that as an
-        empty listing), and RuntimeError when the listing genuinely fails (e.g. permission
-        denied) — both distinct from a real but empty directory, which returns [].
+        Goes through the path guard (require="dir"), so it raises FileNotFoundError when the path
+        does not exist, NotADirectoryError when it exists but is not a directory, and PermissionError
+        when the directory is not readable/traversable by the sandbox user. RuntimeError is raised
+        only when `ls` itself fails for some other reason after the guard passes. All are distinct
+        from a real but empty directory, which returns [].
         """
         quoted = _sh_quote(path)
         result = self._run_path_guarded(path, f"ls -1Ap -- {quoted} 2>/dev/null", require="dir")
@@ -660,8 +662,9 @@ class SandboxDockerSession:
         `glob`, when given, restricts results to files whose basename matches it. The
         filtering is applied host-side (busybox `grep` on minimal images like alpine has
         no `--include`). grep exit code 1 means "no matches" (returns []); exit >= 2 is a
-        real error and raises RuntimeError. A genuinely absent path raises FileNotFoundError
-        (callers may treat that as no matches), distinct from grep's own exit 2.
+        real error and raises RuntimeError. The path guard runs first, so a genuinely absent
+        path raises FileNotFoundError and an existing-but-unreadable path raises PermissionError
+        (both distinct from grep's own exit 2); callers may treat FileNotFoundError as no matches.
         """
         quoted = _sh_quote(path)
         result = self._run_path_guarded(path, f"grep -rHnF -e {_sh_quote(pattern)} -- {quoted} 2>/dev/null")
@@ -681,8 +684,10 @@ class SandboxDockerSession:
 
         Uses a busybox-safe type-marker scheme (GNU `find -printf` is unavailable on
         images like alpine): directories are suffixed with ``/D`` and files with ``/F``.
-        Raises FileNotFoundError when the path does not exist (callers may treat that as no
-        matches), and RuntimeError when the traversal genuinely fails.
+        Goes through the path guard (require="dir"), so it raises FileNotFoundError when the path
+        does not exist, NotADirectoryError when it exists but is not a directory, and PermissionError
+        when it is not readable/traversable. RuntimeError is raised only when the traversal itself
+        genuinely fails after the guard passes.
         """
         quoted = _sh_quote(path)
         body = (

@@ -816,7 +816,7 @@ def test_grep_parses_matches():
 def test_delete_file_runs_rm():
     s = _session_with_container()
     s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
-    s.delete_file("/scratch/x")
+    assert s.delete_file("/scratch/x") is True
     s.execute_command.assert_called_once()
     assert "rm -f" in s.execute_command.call_args.args[0]
 
