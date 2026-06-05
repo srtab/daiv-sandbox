@@ -1034,6 +1034,9 @@ def test_list_dir_wrong_type_raises_not_a_directory():
     s.execute_command = Mock(return_value=Mock(exit_code=_PATH_WRONG_TYPE_EXIT, output=""))
     with pytest.raises(NotADirectoryError):
         s.list_dir("/scratch/a-file")
+    # Assert the require="dir" prologue actually emits the type test (not just that the mock exit maps).
+    cmd = s.execute_command.call_args.args[0]
+    assert "[ -d " in cmd and f"exit {_PATH_WRONG_TYPE_EXIT}" in cmd
 
 
 def test_list_dir_permission_denied_raises():
@@ -1042,6 +1045,30 @@ def test_list_dir_permission_denied_raises():
     s.execute_command = Mock(return_value=Mock(exit_code=_PATH_DENIED_EXIT, output=""))
     with pytest.raises(PermissionError):
         s.list_dir("/scratch/denied")
+    cmd = s.execute_command.call_args.args[0]
+    assert f"exit {_PATH_DENIED_EXIT}" in cmd and "[ -x " in cmd
+
+
+def test_find_paths_wrong_type_raises_not_a_directory():
+    """find_paths also uses require="dir", so a non-directory base exits 8 -> NotADirectoryError."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_WRONG_TYPE_EXIT, output=""))
+    with pytest.raises(NotADirectoryError):
+        s.find_paths("/scratch/a-file")
+    cmd = s.execute_command.call_args.args[0]
+    assert "[ -d " in cmd and f"exit {_PATH_WRONG_TYPE_EXIT}" in cmd
+
+
+def test_grep_permission_denied_raises():
+    """grep uses the default guard (require=None): existence + readability only. An unreadable path
+    exits 9 -> PermissionError, and the prologue must NOT emit the dir-only wrong-type test."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_DENIED_EXIT, output=""))
+    with pytest.raises(PermissionError):
+        s.grep("x", "/scratch/denied", glob=None)
+    cmd = s.execute_command.call_args.args[0]
+    assert f"exit {_PATH_DENIED_EXIT}" in cmd
+    assert f"exit {_PATH_WRONG_TYPE_EXIT}" not in cmd  # require=None -> no directory type test
 
 
 def test_read_file_bytes_directory_raises_is_a_directory():
