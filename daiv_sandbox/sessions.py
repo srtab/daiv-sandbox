@@ -74,6 +74,12 @@ PIPEFAIL_WRAPPER = (
 # exit 0/1/2), so it can't collide.
 _PATH_ABSENT_EXIT = 7
 
+# Sentinel exits the classifying path guard emits, alongside _PATH_ABSENT_EXIT (7), to disambiguate
+# a real absence from a type mismatch or an access failure (the tools discard stderr and reuse exit 2
+# for several conditions). 8 and 9 are unused by test/ls/grep/find, so they can't collide.
+_PATH_WRONG_TYPE_EXIT = 8
+_PATH_DENIED_EXIT = 9
+
 
 def _sh_quote(value: str) -> str:
     """
@@ -525,17 +531,31 @@ class SandboxDockerSession:
 
         return RunResult(command=command, output=output, exit_code=result.exit_code, workdir=command_workdir)
 
-    def _run_path_guarded(self, path: str, body: str) -> RunResult:
-        """Run *body* only if *path* exists, mapping a true absence to FileNotFoundError.
+    def _run_path_guarded(self, path: str, body: str, *, require: str | None = None) -> RunResult:
+        """Run *body* only if *path* exists (and, when *require* is given, has the expected type and
+        is accessible), mapping each failure to a distinct exception.
 
-        Prepends an explicit `[ -e ]` existence test that exits with `_PATH_ABSENT_EXIT` when the
-        path is missing, then raises FileNotFoundError on that sentinel. This disambiguates a real
-        absence from a tool's own "cannot access" exit (`ls`/`grep` use 2 for both missing and
-        permission denied) since stderr is discarded. *body* must already quote *path* itself.
+        Prepends shell tests that exit with sentinel codes: missing -> _PATH_ABSENT_EXIT
+        (FileNotFoundError); ``require="dir"`` but not a directory -> _PATH_WRONG_TYPE_EXIT
+        (NotADirectoryError); existing-but-inaccessible -> _PATH_DENIED_EXIT (PermissionError). This
+        disambiguates a true absence/type-mismatch from a tool's own "cannot access" exit since stderr
+        is discarded. *body* must already quote *path* itself. Permission detection is best-effort:
+        deeper nested failures fall through to the tool's own non-zero exit.
         """
-        result = self.execute_command(f"[ -e {_sh_quote(path)} ] || exit {_PATH_ABSENT_EXIT}; {body}")
+        quoted = _sh_quote(path)
+        prologue = f"[ -e {quoted} ] || exit {_PATH_ABSENT_EXIT}; "
+        if require == "dir":
+            prologue += f"[ -d {quoted} ] || exit {_PATH_WRONG_TYPE_EXIT}; "
+            prologue += f"{{ [ -r {quoted} ] && [ -x {quoted} ]; }} || exit {_PATH_DENIED_EXIT}; "
+        else:
+            prologue += f"[ -r {quoted} ] || exit {_PATH_DENIED_EXIT}; "
+        result = self.execute_command(prologue + body)
         if result.exit_code == _PATH_ABSENT_EXIT:
             raise FileNotFoundError(path)
+        if result.exit_code == _PATH_WRONG_TYPE_EXIT:
+            raise NotADirectoryError(path)
+        if result.exit_code == _PATH_DENIED_EXIT:
+            raise PermissionError(path)
         return result
 
     def write_file(
@@ -588,8 +608,8 @@ class SandboxDockerSession:
     def read_file_bytes(self, path: str) -> bytes:
         """Return the raw bytes of a single file via the Docker archive API.
 
-        Raises FileNotFoundError when the path does not exist. A genuinely empty file
-        returns ``b""`` (it is not treated as missing).
+        Raises FileNotFoundError when the path does not exist, and IsADirectoryError when it is a
+        directory. A genuinely empty file returns ``b""`` (it is not treated as missing).
         """
         try:
             bits, _stat = self.container.get_archive(path)
@@ -599,10 +619,15 @@ class SandboxDockerSession:
             raise FileNotFoundError(path) from exc
         raw = b"".join(bits)
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tf:
-            members = [m for m in tf.getmembers() if m.isfile()]
-            if not members:
+            members = tf.getmembers()
+            if members and members[0].isdir():
+                # get_archive on a directory returns its whole subtree; refuse rather than return an
+                # arbitrary inner file's bytes as if they were this path's content.
+                raise IsADirectoryError(path)
+            files = [m for m in members if m.isfile()]
+            if not files:
                 raise FileNotFoundError(path)
-            extracted = tf.extractfile(members[0])
+            extracted = tf.extractfile(files[0])
             if extracted is None:
                 raise FileNotFoundError(path)
             return extracted.read()
@@ -615,7 +640,7 @@ class SandboxDockerSession:
         denied) — both distinct from a real but empty directory, which returns [].
         """
         quoted = _sh_quote(path)
-        result = self._run_path_guarded(path, f"ls -1Ap -- {quoted} 2>/dev/null")
+        result = self._run_path_guarded(path, f"ls -1Ap -- {quoted} 2>/dev/null", require="dir")
         if result.exit_code != 0:
             raise RuntimeError(f"ls failed (exit {result.exit_code}) for {path!r}")
         entries: list[DirEntry] = []
@@ -664,7 +689,7 @@ class SandboxDockerSession:
             f"{{ find {quoted} -mindepth 1 -type d 2>/dev/null | sed 's/$/\\/D/'; "
             f"find {quoted} -mindepth 1 ! -type d 2>/dev/null | sed 's/$/\\/F/'; }}"
         )
-        result = self._run_path_guarded(path, body)
+        result = self._run_path_guarded(path, body, require="dir")
         if result.exit_code != 0:
             raise RuntimeError(f"find failed (exit {result.exit_code}) for {path!r}")
         out: list[DirEntry] = []
@@ -727,11 +752,23 @@ class SandboxDockerSession:
         self.write_file(path, result.encode("utf-8"), mode=0o644, allowed_roots=allowed_roots)
         return count
 
-    def delete_file(self, path: str) -> None:
-        """Remove a file. Idempotent (`rm -f`)."""
-        result = self.execute_command(f"rm -f -- {_sh_quote(path)}")
+    def delete_file(self, path: str) -> bool:
+        """Remove a regular file. Returns True if a file was removed, False if it was already absent
+        (idempotent). Raises IsADirectoryError when the path is a directory — delete is file-only.
+        """
+        quoted = _sh_quote(path)
+        result = self.execute_command(
+            f"if [ -d {quoted} ]; then exit {_PATH_WRONG_TYPE_EXIT}; "
+            f"elif [ -e {quoted} ]; then rm -f -- {quoted}; "
+            f"else exit {_PATH_ABSENT_EXIT}; fi"
+        )
+        if result.exit_code == _PATH_WRONG_TYPE_EXIT:
+            raise IsADirectoryError(path)
+        if result.exit_code == _PATH_ABSENT_EXIT:
+            return False
         if result.exit_code != 0:
             raise RuntimeError(f"rm failed: {result.output}")
+        return True
 
     def _get_user(self) -> str:
         """
