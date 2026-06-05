@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unified the container filesystem under `/workspace` (`repo/`, `skills/`, `tmp/`). Repo archives now extract into `/workspace/repo`, skills into `/workspace/skills`, and commands run in `/workspace/repo`. **Breaking change** — paths moved from `/repo` and `/skills`.
 - Blocking Docker operations now run off the async event loop, so multiple sessions can be served in parallel.
 - Archive sanitization and the container copy now stream end-to-end through a `SpooledTemporaryFile`; archives larger than 8 MiB no longer require a full in-memory copy on the server.
+- `fs/*` endpoints now return a structured `error` object (`{code, message}`) drawn from a stable
+  `FsErrorCode` enum instead of a free-form string, so agents can branch on a machine-readable code.
+- `fs/ls`, `fs/grep`, and `fs/glob` now surface a missing path as `error.code=not_found` (with an
+  empty `entries`/`matches` list) rather than an empty result with no error — a missing path is no
+  longer indistinguishable from an empty directory or a no-match.
+- `fs/read` (and `fs/edit`) now return `error.code=is_a_directory` for a directory path instead of
+  returning the bytes of an arbitrary file inside it. `fs/ls` returns `not_a_directory` for a file.
+- `fs/delete` now returns a `removed` boolean (`true` if a file was deleted, `false` if it was
+  already absent) and `error.code=is_a_directory` when the target is a directory.
+- Malformed paths (`..`, NUL, newline, outside `/workspace`) now return HTTP `200` with
+  `error.code=invalid_path` for `fs/ls`/`fs/grep`/`fs/glob` too (previously HTTP `400`), unifying
+  them with the other fs ops.
 
 ### Removed
 
