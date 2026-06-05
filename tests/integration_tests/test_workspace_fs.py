@@ -89,30 +89,27 @@ def test_ls_and_glob_roundtrip(client, workspace_session):
     assert {"/workspace/tmp/top.py", "/workspace/tmp/sub/deep.py"} <= glob_paths, gl.json()
 
 
-def test_ls_missing_directory_is_empty_not_error(client, workspace_session):
-    """Listing an absent directory (e.g. an optional skills dir most repos lack) returns an
-    empty listing with no error, rather than surfacing a failure. Exercises the real busybox
-    shell guard that distinguishes a missing path from a genuine `ls` failure."""
+def test_ls_missing_directory_reports_not_found(client, workspace_session):
+    """Listing an absent directory is now a distinct, surfaced outcome (not_found), so an agent can't
+    mistake 'absent' for 'exists but empty'."""
     sid = workspace_session
     ls = client.post(f"/session/{sid}/fs/ls", json={"path": "/workspace/repo/.claude/skills"})
     assert ls.status_code == 200, ls.text
     body = ls.json()
     assert body["entries"] == []
-    assert body["error"] is None, body
+    assert body["error"]["code"] == "not_found"
 
 
-def test_glob_missing_directory_is_empty_not_error(client, workspace_session):
-    """Globbing under an absent base directory returns no matches with no error (real busybox)."""
+def test_glob_missing_directory_reports_not_found(client, workspace_session):
     sid = workspace_session
     gl = client.post(f"/session/{sid}/fs/glob", json={"path": "/workspace/repo/.cursor/skills", "pattern": "**/*"})
     assert gl.status_code == 200, gl.text
     body = gl.json()
     assert body["matches"] == []
-    assert body["error"] is None, body
+    assert body["error"]["code"] == "not_found"
 
 
-def test_grep_missing_directory_is_empty_not_error(client, workspace_session):
-    """Grepping an absent path returns no matches with no error rather than surfacing a failure."""
+def test_grep_missing_directory_reports_not_found(client, workspace_session):
     sid = workspace_session
     g = client.post(
         f"/session/{sid}/fs/grep", json={"pattern": "anything", "path": "/workspace/repo/.agents/skills", "glob": None}
@@ -120,7 +117,7 @@ def test_grep_missing_directory_is_empty_not_error(client, workspace_session):
     assert g.status_code == 200, g.text
     body = g.json()
     assert body["matches"] == []
-    assert body["error"] is None, body
+    assert body["error"]["code"] == "not_found"
 
 
 def test_edit_roundtrip_and_bash_sees_it(client, workspace_session):
@@ -147,10 +144,11 @@ def test_edit_roundtrip_and_bash_sees_it(client, workspace_session):
 
 
 def test_ls_traversal_above_tmp_is_rejected(client, workspace_session):
-    """`..` is refused. `/workspace/tmp/../repo` stays under /workspace but `..` is rejected lexically."""
+    """`..` is refused as a 200 body with error.code=invalid_path (unified across all fs ops)."""
     sid = workspace_session
     resp = client.post(f"/session/{sid}/fs/ls", json={"path": "/workspace/tmp/../repo"})
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"]["code"] == "invalid_path"
 
 
 def test_fs_ops_span_repo_skills_tmp(client, workspace_session):
@@ -186,4 +184,5 @@ def test_fs_ops_span_repo_skills_tmp(client, workspace_session):
 def test_traversal_above_workspace_is_rejected(client, workspace_session):
     sid = workspace_session
     resp = client.post(f"/session/{sid}/fs/ls", json={"path": "/workspace/../etc"})
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"]["code"] == "invalid_path"
