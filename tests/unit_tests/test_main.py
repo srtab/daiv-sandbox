@@ -415,6 +415,40 @@ def test_start_session_passes_resource_limits(client):
         assert "network_mode" not in kwargs  # network_enabled=True -> no isolation
 
 
+def test_start_session_attaches_configured_network_when_enabled(client, monkeypatch):
+    """A network-enabled session attaches to the Docker network named by DAIV_SANDBOX_NETWORK when
+    one is configured (and never sets network_mode, which would conflict with an explicit network)."""
+    monkeypatch.setattr(settings, "NETWORK", "daiv-net")
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.session_id = "id"
+        mock_session_class.start.return_value = mock_cmd_executor
+
+        response = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
+
+        assert response.status_code == 200, response.text
+        kwargs = mock_session_class.start.call_args.kwargs
+        assert kwargs.get("network") == "daiv-net"
+        assert "network_mode" not in kwargs
+
+
+def test_start_session_enabled_without_configured_network_uses_default(client, monkeypatch):
+    """A network-enabled session with no DAIV_SANDBOX_NETWORK configured falls back to Docker's
+    default network: neither an explicit `network` nor a `network_mode` kwarg is passed."""
+    monkeypatch.setattr(settings, "NETWORK", None)
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.session_id = "id"
+        mock_session_class.start.return_value = mock_cmd_executor
+
+        response = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
+
+        assert response.status_code == 200, response.text
+        kwargs = mock_session_class.start.call_args.kwargs
+        assert "network" not in kwargs
+        assert "network_mode" not in kwargs
+
+
 def test_close_session_stops_container_by_default(client):
     """Closing a session stops (not removes) the container, preserving it for warm reuse."""
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
