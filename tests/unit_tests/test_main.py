@@ -449,6 +449,24 @@ def test_start_session_enabled_without_configured_network_uses_default(client, m
         assert "network_mode" not in kwargs
 
 
+def test_start_session_disabled_network_ignores_configured_network(client, monkeypatch):
+    """Security corner: a session that does NOT enable networking stays isolated with
+    network_mode='none' even when DAIV_SANDBOX_NETWORK is configured — isolation takes precedence and
+    the named network is not attached."""
+    monkeypatch.setattr(settings, "NETWORK", "daiv-net")
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.session_id = "id"
+        mock_session_class.start.return_value = mock_cmd_executor
+
+        response = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": False})
+
+        assert response.status_code == 200, response.text
+        kwargs = mock_session_class.start.call_args.kwargs
+        assert kwargs["network_mode"] == "none"
+        assert "network" not in kwargs
+
+
 def test_close_session_stops_container_by_default(client):
     """Closing a session stops (not removes) the container, preserving it for warm reuse."""
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
@@ -1087,6 +1105,28 @@ def test_fs_edit_string_not_found(mock_session, client):
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["error"]["code"] == "string_not_found"
+
+
+def test_fs_edit_directory_returns_is_a_directory(mock_session, client):
+    """Editing a directory path surfaces is_a_directory (inherited from read_file_bytes)."""
+    mock_session.edit_file.side_effect = IsADirectoryError("/workspace/repo/src")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/edit",
+        json={"path": "/workspace/repo/src", "old": "x", "new": "y", "replace_all": False},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"]["code"] == "is_a_directory"
+
+
+def test_fs_edit_missing_file_returns_not_found(mock_session, client):
+    """Editing a missing file surfaces not_found (normalized from the old 'file_not_found' string)."""
+    mock_session.edit_file.side_effect = FileNotFoundError("/workspace/tmp/nope")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/edit",
+        json={"path": "/workspace/tmp/nope", "old": "x", "new": "y", "replace_all": False},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"]["code"] == "not_found"
 
 
 def test_fs_edit_multiple_occurrences(mock_session, client):

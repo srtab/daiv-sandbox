@@ -74,9 +74,10 @@ PIPEFAIL_WRAPPER = (
 # exit 0/1/2), so it can't collide.
 _PATH_ABSENT_EXIT = 7
 
-# Sentinel exits the classifying path guard emits, alongside _PATH_ABSENT_EXIT (7), to disambiguate
-# a real absence from a type mismatch or an access failure (the tools discard stderr and reuse exit 2
-# for several conditions). 8 and 9 are unused by test/ls/grep/find, so they can't collide.
+# Sentinel exits emitted by the fs-primitive shell guards (`_run_path_guarded`, and `delete_file`'s
+# own inline test), alongside _PATH_ABSENT_EXIT (7), to disambiguate a real absence from a type
+# mismatch or an access failure (the tools discard stderr and reuse exit 2 for several conditions).
+# 8 and 9 are unused by test/ls/grep/find, so they can't collide.
 _PATH_WRONG_TYPE_EXIT = 8
 _PATH_DENIED_EXIT = 9
 
@@ -662,9 +663,11 @@ class SandboxDockerSession:
         `glob`, when given, restricts results to files whose basename matches it. The
         filtering is applied host-side (busybox `grep` on minimal images like alpine has
         no `--include`). grep exit code 1 means "no matches" (returns []); exit >= 2 is a
-        real error and raises RuntimeError. The path guard runs first, so a genuinely absent
-        path raises FileNotFoundError and an existing-but-unreadable path raises PermissionError
-        (both distinct from grep's own exit 2); callers may treat FileNotFoundError as no matches.
+        real error and raises RuntimeError. The path guard runs first (existence + readability
+        only, since grep accepts a file or a directory): a genuinely absent path raises
+        FileNotFoundError and an unreadable target raises PermissionError, both distinct from
+        grep's own exit 2. Note grep is recursive with stderr discarded, so an unreadable
+        *subdirectory* under a readable root is silently skipped rather than reported as an error.
         """
         quoted = _sh_quote(path)
         result = self._run_path_guarded(path, f"grep -rHnF -e {_sh_quote(pattern)} -- {quoted} 2>/dev/null")
@@ -758,8 +761,9 @@ class SandboxDockerSession:
         return count
 
     def delete_file(self, path: str) -> bool:
-        """Remove a regular file. Returns True if a file was removed, False if it was already absent
-        (idempotent). Raises IsADirectoryError when the path is a directory — delete is file-only.
+        """Remove a non-directory path (regular file, symlink, FIFO, etc.). Returns True if something
+        was removed, False if the path was already absent (idempotent). Raises IsADirectoryError when
+        the path is a directory — delete refuses directories.
         """
         quoted = _sh_quote(path)
         result = self.execute_command(

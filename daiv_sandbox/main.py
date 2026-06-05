@@ -467,7 +467,7 @@ async def fs_write(
     try:
         _validate_sandbox_path(request.path, allowed_roots=_WORKSPACE_ROOTS)
     except ValueError as exc:
-        return FsWriteResponse(ok=False, error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
+        return FsWriteResponse(error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             await asyncio.to_thread(
@@ -479,14 +479,14 @@ async def fs_write(
                 create_only=True,
             )
         except FileExistsError as exc:
-            return FsWriteResponse(ok=False, error=FsError(code=FsErrorCode.ALREADY_EXISTS, message=str(exc)))
+            return FsWriteResponse(error=FsError(code=FsErrorCode.ALREADY_EXISTS, message=str(exc)))
         except RuntimeError as exc:
             # Expected operational failure (copy/probe). Any *other* exception (programming error,
             # Docker transport fault) is NOT caught here so it propagates to a real 500 — surfacing in
             # metrics/Sentry rather than hiding behind a 200 with an error body.
             logger.exception("fs_write failed for %s", request.path)
-            return FsWriteResponse(ok=False, error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
-        return FsWriteResponse(ok=True)
+            return FsWriteResponse(error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
+        return FsWriteResponse()
 
 
 @app.post("/session/{session_id}/fs/read", responses=_fs_responses, name="Read a workspace file")
@@ -671,18 +671,18 @@ async def fs_delete(
     try:
         _validate_sandbox_path(request.path, allowed_roots=_WORKSPACE_ROOTS)
     except ValueError as exc:
-        return FsDeleteResponse(ok=False, error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
+        return FsDeleteResponse(error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             removed = await asyncio.to_thread(cmd.delete_file, request.path)
         except IsADirectoryError:
             return FsDeleteResponse(
-                ok=False, error=FsError(code=FsErrorCode.IS_A_DIRECTORY, message=f"Is a directory: {request.path}")
+                error=FsError(code=FsErrorCode.IS_A_DIRECTORY, message=f"Is a directory: {request.path}")
             )
         except RuntimeError as exc:
             logger.exception("fs_delete failed for %s", request.path)
-            return FsDeleteResponse(ok=False, error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
-        return FsDeleteResponse(ok=True, removed=removed)
+            return FsDeleteResponse(error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
+        return FsDeleteResponse(removed=removed)
 
 
 if __name__ == "__main__":

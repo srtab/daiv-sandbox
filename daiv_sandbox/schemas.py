@@ -1,7 +1,7 @@
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import Base64Bytes, BaseModel, Field
+from pydantic import Base64Bytes, BaseModel, Field, computed_field, model_validator
 
 
 class StartSessionRequest(BaseModel):
@@ -73,7 +73,7 @@ class FsErrorCode(StrEnum):
 
 class FsError(BaseModel):
     code: FsErrorCode = Field(description="Stable, machine-branchable error code.")
-    message: str = Field(description="Human-readable hint the agent can act on.")
+    message: str = Field(min_length=1, description="Human-readable hint the agent can act on.")
 
 
 class FsLsRequest(BaseModel):
@@ -144,8 +144,12 @@ class FsWriteRequest(BaseModel):
 
 
 class FsWriteResponse(BaseModel):
-    ok: bool
     error: FsError | None = Field(default=None, description="Structured error; null on success.")
+
+    @computed_field(description="True on success; derived from `error` (success ⇔ no error).")
+    @property
+    def ok(self) -> bool:
+        return self.error is None
 
 
 class FsEditRequest(BaseModel):
@@ -165,8 +169,19 @@ class FsDeleteRequest(BaseModel):
 
 
 class FsDeleteResponse(BaseModel):
-    ok: bool
     removed: bool = Field(
         default=False, description="True if a file was actually removed; False if it was already absent."
     )
     error: FsError | None = Field(default=None, description="Structured error; null on success.")
+
+    @computed_field(description="True on success; derived from `error` (success ⇔ no error).")
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+    @model_validator(mode="after")
+    def _check_removed_consistency(self) -> FsDeleteResponse:
+        # A failed delete never removed anything: keep `removed` and `error` from contradicting.
+        if self.error is not None and self.removed:
+            raise ValueError("removed must be False when an error is present")
+        return self
