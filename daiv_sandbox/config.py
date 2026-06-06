@@ -1,8 +1,8 @@
 import warnings
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, HttpUrl, SecretStr  # noqa: TC002
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, HttpUrl, SecretStr, field_validator  # noqa: TC002
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 warnings.filterwarnings(
     "ignore", message=r'directory "/run/secrets" does not exist', module="pydantic_settings.sources.providers.secrets"
@@ -42,11 +42,34 @@ class Settings(BaseSettings):
     # default bridge (no compose-service DNS). Set to a compose/user-defined network (e.g.
     # "daiv_default") so containers can resolve & reach sibling services like "gitlab:8929".
     NETWORK: str | None = None
+    # DNS resolvers written into a network-enabled cmd-executor's /etc/resolv.conf under the gVisor
+    # (runsc) runtime. gVisor's netstack can't reach the embedded Docker resolver (127.0.0.11) that a
+    # user-defined NETWORK injects, so name resolution is pointed at real upstreams instead. Ignored
+    # under runc (its embedded resolver works). Comma-separated env value, e.g. "1.1.1.1,8.8.8.8".
+    DNS: Annotated[list[str], NoDecode] = ["1.1.1.1", "8.8.8.8"]
+    # Sibling service hostnames (comma-separated, e.g. "gitlab") resolved at session start and injected
+    # as static /etc/hosts entries in network-enabled gVisor cmd-executors. This restores the
+    # compose-service name resolution that overriding resolv.conf (see DNS) would otherwise drop.
+    # Ignored under runc. Names that fail to resolve are skipped with a warning.
+    EXTRA_HOSTS: Annotated[list[str], NoDecode] = []
+
+    @field_validator("DNS", "EXTRA_HOSTS", mode="before")
+    @classmethod
+    def _split_csv(cls, value: object) -> object:
+        """Accept comma-separated env strings (e.g. "1.1.1.1,8.8.8.8") for list settings."""
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
 
     # Session locking
     REDIS_URL: str | None = None
     SESSION_LOCK_TTL_SECONDS: int = 900
-    SESSION_LOCK_WAIT_SECONDS: float = 1.0
+    # How long a request blocks for the per-session lock before returning 409 "Session is busy".
+    # A single client's batched file/exec ops are dispatched concurrently but the session can only
+    # serve one at a time, so the wait must comfortably outlast a typical op (e.g. a recursive grep
+    # over /workspace on a cold container) to let the loser queue instead of failing. Kept well under
+    # the client's request timeout so the waiter never outlives the caller.
+    SESSION_LOCK_WAIT_SECONDS: float = 30.0
     SESSION_LOCK_REFRESH_SECONDS: float = 30.0
 
     # Session reaper / lifecycle

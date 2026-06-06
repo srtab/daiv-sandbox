@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional Redis-backed per-session locking (`DAIV_SANDBOX_REDIS_URL`) to prevent concurrent requests from racing on the same session across replicas; a busy session returns `409 Conflict`. Tunable via `DAIV_SANDBOX_SESSION_LOCK_TTL_SECONDS`, `DAIV_SANDBOX_SESSION_LOCK_WAIT_SECONDS`, and `DAIV_SANDBOX_SESSION_LOCK_REFRESH_SECONDS`.
 - `scripts/dump_schemas.py` to export request/response JSON schemas for downstream `daiv` consumers.
 - `DAIV_SANDBOX_NETWORK` setting: network-enabled sessions (`network_enabled=true`) are attached to the named Docker network when set; when unset they use Docker's default network, and sessions without networking remain isolated with `network_mode=none`.
+- `DAIV_SANDBOX_DNS` and `DAIV_SANDBOX_EXTRA_HOSTS` settings to make DNS work for network-enabled sessions under the gVisor (`runsc`) runtime. gVisor's netstack can't reach Docker's embedded resolver (`127.0.0.11`) that a user-defined `DAIV_SANDBOX_NETWORK` injects, so name resolution failed outright (e.g. `Could not resolve host: github.com`). Such sessions now have `/etc/resolv.conf` repointed at `DAIV_SANDBOX_DNS` (comma-separated, default `1.1.1.1,8.8.8.8`), and the comma-separated sibling hostnames in `DAIV_SANDBOX_EXTRA_HOSTS` (e.g. `gitlab`) are resolved at session start and injected as static `/etc/hosts` entries. Both are ignored under `runc`.
 
 ### Changed
 
