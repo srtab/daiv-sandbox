@@ -7,42 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### Fixed
-
-- `POST /session/{id}/seed/` now initialises the patch-extractor meta repo whenever the session was started with `extract_patch=True`, even when only `skills_archive` is provided (no `repo_archive`). Without this, the first `apply_file_mutations` or `run` call in a repoless flow failed with HTTP 500 because `/workdir/meta` was missing.
-
-## [0.5.0] - 2026-05-04
-
 ### Added
 
-- `POST /session/{id}/seed/` — one-shot per session, accepts archives as `multipart/form-data` fields (`repo_archive`, `skills_archive`). At least one field must be provided; `repo_archive` is extracted into `/repo` and initialises the patch-extractor's meta repo; `skills_archive` is extracted into `/skills`. **Breaking change** — clients must update from the former JSON body.
-- `POST /session/{id}/files/` — applies a batch of file mutations and advances the meta HEAD; per-item validation, returns `MutationResult[]`.
-- `SKILLS_ROOT = "/skills"` reserved at session start (`mkdir -p` + `chown`) for skill seeding.
-- Added `timeout` parameter to run commands request to set a per-command execution timeout in seconds. Overrides the server default (`DAIV_SANDBOX_COMMAND_TIMEOUT`). Commands that exceed the timeout are terminated with exit code `124` and remaining commands are skipped.
-- Added `COMMAND_TIMEOUT` setting to configure a server-wide default per-command timeout. Defaults to `0` (no timeout).
-- Added optional Redis-backed per-session locking (`REDIS_URL` setting) to prevent concurrent requests from racing on the same session across replicas. Returns `409 Conflict` when a session is busy.
-- Added `scripts/dump_schemas.py` to export request/response JSON schemas for downstream `daiv` consumers.
+- `POST /session/{id}/seed/` — one-shot per session (409 if re-seeded), accepts archives as `multipart/form-data` fields (`repo_archive`, `skills_archive`). At least one field must be provided; `repo_archive` extracts into `/workspace/repo` and `skills_archive` into `/workspace/skills`. Replaces the former `RunRequest.archive` flow for establishing initial session state. **Breaking change**
+- `POST /session/{id}/fs/{op}` — Python-free workspace file operations (`ls`, `read`, `grep`, `glob`, `write`, `edit`, `delete`) that act anywhere under `/workspace`. `read` paginates text with `offset`/`limit` and returns binary as base64; `grep` matches a literal substring; `glob` supports `*`, `**`, `?`, and `[abc]`.
+- `GET /session/{id}/` — returns `204` if the session's container exists (restarting it if stopped, warming it for reuse) or `404` if it does not.
+- `?force=true` query parameter on `DELETE /session/{id}/` to remove the container immediately instead of stopping it.
+- Background session reaper that removes stopped containers `DAIV_SANDBOX_SESSION_GRACE_SECONDS` after they stopped (default 12h), with an LRU cap of `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` retained stopped containers (default 50). Configurable via `DAIV_SANDBOX_REAPER_ENABLED`, `DAIV_SANDBOX_REAPER_INTERVAL_SECONDS`, and `DAIV_SANDBOX_STOP_TIMEOUT_SECONDS`.
+- `timeout` parameter on the run-commands request to set a per-command execution timeout in seconds, overriding the `DAIV_SANDBOX_COMMAND_TIMEOUT` server default. Commands that exceed the timeout are terminated with exit code `124` and remaining commands are skipped.
+- `DAIV_SANDBOX_COMMAND_TIMEOUT` setting to configure a server-wide default per-command timeout (default `0`, no timeout).
+- Optional Redis-backed per-session locking (`DAIV_SANDBOX_REDIS_URL`) to prevent concurrent requests from racing on the same session across replicas; a busy session returns `409 Conflict`. Tunable via `DAIV_SANDBOX_SESSION_LOCK_TTL_SECONDS`, `DAIV_SANDBOX_SESSION_LOCK_WAIT_SECONDS`, and `DAIV_SANDBOX_SESSION_LOCK_REFRESH_SECONDS`.
+- `scripts/dump_schemas.py` to export request/response JSON schemas for downstream `daiv` consumers.
+- `DAIV_SANDBOX_NETWORK` setting: network-enabled sessions (`network_enabled=true`) are attached to the named Docker network when set; when unset they use Docker's default network, and sessions without networking remain isolated with `network_mode=none`.
+- `DAIV_SANDBOX_DNS` and `DAIV_SANDBOX_EXTRA_HOSTS` settings to make DNS work for network-enabled sessions under the gVisor (`runsc`) runtime. gVisor's netstack can't reach Docker's embedded resolver (`127.0.0.11`) that a user-defined `DAIV_SANDBOX_NETWORK` injects, so name resolution failed outright (e.g. `Could not resolve host: github.com`). Such sessions now have `/etc/resolv.conf` repointed at `DAIV_SANDBOX_DNS` (comma-separated, default `1.1.1.1,8.8.8.8`), and the comma-separated sibling hostnames in `DAIV_SANDBOX_EXTRA_HOSTS` (e.g. `gitlab`) are resolved at session start and injected as static `/etc/hosts` entries. Both are ignored under `runc`.
 
 ### Changed
 
-- `run_on_session` is commands-only; per-call patch is `HEAD~1..HEAD` against the stateful meta repo (advanced after every `apply_file_mutations` call and every `run_commands` call).
-- Archive sanitization and `copy_to_container` now stream end-to-end through a `SpooledTemporaryFile`; archives larger than 8 MiB no longer require a full in-memory copy on the server.
-- Improved server concurrency: all blocking Docker operations are now executed off the async event loop, allowing multiple sessions to be served in parallel.
-- Improved session close performance: when a patch extractor is present, both containers are now removed concurrently.
-- Closing an already-removed session now returns `204` instead of raising an error.
-
-### Fixed
-
-- Fixed pipeline exit codes being masked by the last command; commands are now executed with `pipefail` enabled so a failing stage in a pipeline (e.g. `cmd1 | cmd2`) correctly propagates a non-zero exit code.
-- Fixed potential resource leak when session creation fails after the volume or patch extractor container were already created.
-- Fixed `ValueError` raised when an uploaded archive contains symlinks, hardlinks, or other non-regular entries (e.g. `CLAUDE.md` as a symlink); such entries are now silently skipped instead of aborting the request.
-- Fixed `UnicodeDecodeError` raised when an output contains invalid characters; such characters are now replaced with U+FFFD.
-- Fixed seed endpoint to return a proper error response when archive extraction or meta-repo initialisation fails, instead of leaving the session in an inconsistent state.
+- `DELETE /session/{id}/` now _stops_ the container instead of removing it, preserving it for warm reuse; it is reclaimed later by the reaper, or immediately when `?force=true` is passed. **Breaking change** — the container is no longer removed on close by default.
+- Unified the container filesystem under `/workspace` (`repo/`, `skills/`, `tmp/`). Repo archives now extract into `/workspace/repo`, skills into `/workspace/skills`, and commands run in `/workspace/repo`. **Breaking change** — paths moved from `/repo` and `/skills`.
+- Blocking Docker operations now run off the async event loop, so multiple sessions can be served in parallel.
+- Archive sanitization and the container copy now stream end-to-end through a `SpooledTemporaryFile`; archives larger than 8 MiB no longer require a full in-memory copy on the server.
+- `fs/*` endpoints now return a structured `error` object (`{code, message}`) drawn from a stable
+  `FsErrorCode` enum instead of a free-form string, so agents can branch on a machine-readable code.
+- `fs/ls`, `fs/grep`, and `fs/glob` now surface a missing path as `error.code=not_found` (with an
+  empty `entries`/`matches` list) rather than an empty result with no error — a missing path is no
+  longer indistinguishable from an empty directory or a no-match.
+- `fs/read` (and `fs/edit`) now return `error.code=is_a_directory` for a directory path instead of
+  returning the bytes of an arbitrary file inside it. `fs/ls` returns `not_a_directory` for a file.
+- `fs/delete` now returns a `removed` boolean (`true` if a file was deleted, `false` if it was
+  already absent) and `error.code=is_a_directory` when the target is a directory.
+- Malformed paths (`..`, NUL, newline, outside `/workspace`) now return HTTP `200` with
+  `error.code=invalid_path` for `fs/ls`/`fs/grep`/`fs/glob` too (previously HTTP `400`), unifying
+  them with the other fs ops.
 
 ### Removed
 
-- Removed `StartSessionRequest.ephemeral` and the `DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL` mechanism. **Breaking change**
-- Removed `RunRequest.archive`; initial session state is now established via `POST /session/{id}/seed/`. **Breaking change**
+- Patch extraction. Removed the patch-extractor side-car container, the `extract_patch` parameter from the start-session request, the `patch` field from the run-commands response, and the `DAIV_SANDBOX_GIT_IMAGE` setting. Recover changes by running git (e.g. `git diff`, `git status`) inside `/workspace/repo` through the run-commands endpoint. **Breaking change**
+- `RunRequest.archive`; initial session state is now established via `POST /session/{id}/seed/`. **Breaking change**
+- `StartSessionRequest.ephemeral` and the `DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL` mechanism. **Breaking change**
+
+### Fixed
+
+- Pipeline exit codes were masked by the last command; commands now run with `pipefail` enabled so a failing stage in a pipeline (e.g. `cmd1 | cmd2`) correctly propagates a non-zero exit code.
+- Invalid bytes in a command's output raised `UnicodeDecodeError`; such bytes are now replaced with U+FFFD instead of failing the request.
 
 ## [0.4.0] - 2026-02-22
 
@@ -335,8 +342,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/srtab/daiv-sandbox/compare/v0.4.0...v0.5.0
+[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.4.0...HEAD
 [0.4.0]: https://github.com/srtab/daiv-sandbox/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/srtab/daiv-sandbox/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/srtab/daiv-sandbox/compare/v0.2.0...v0.3.0

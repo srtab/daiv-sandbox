@@ -1,22 +1,29 @@
 import io
 import tarfile
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
-from docker.errors import ImageNotFound, NotFound
+from docker.errors import APIError, ImageNotFound, NotFound
 from docker.models.containers import ExecResult
 from docker.models.images import Image
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.sessions import (
+    _PATH_ABSENT_EXIT,
+    _PATH_DENIED_EXIT,
+    _PATH_WRONG_TYPE_EXIT,
     PIPEFAIL_WRAPPER,
     SANDBOX_HOME,
     SANDBOX_ROOT,
+    SCRATCH_ROOT,
     SKILLS_ROOT,
-    WORKDIR_ROOT,
+    WORKSPACE_ROOT,
     SandboxDockerSession,
+    SessionUnavailableError,
     _build_single_file_tar_stream,
     _sanitize_archive_stream,
+    _sh_quote,
+    _validate_sandbox_path,
 )
 
 EXPECTED_EXEC_ENV = {
@@ -90,11 +97,10 @@ def test__start_container(mock_docker_client):
     mock_docker_client.containers.run.assert_called_once_with(
         "test-image",
         entrypoint="/bin/sh",
-        command=["-lc", "sleep 3600"],
+        command=["-lc", "sleep infinity"],
         detach=True,
         tty=True,
         runtime=settings.RUNTIME,
-        remove=True,
         user=f"{settings.RUN_UID}:{settings.RUN_GID}",
     )
     assert session.container is not None
@@ -102,20 +108,147 @@ def test__start_container(mock_docker_client):
     assert session.session_id == mock_docker_client.containers.run.return_value.id
     # Should create sandbox directories and chown them
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
+        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
     )
     mock_container.exec_run.assert_any_call(
         [
             "chown",
             f"{settings.RUN_UID}:{settings.RUN_GID}",
             "--",
+            WORKSPACE_ROOT,
             SANDBOX_ROOT,
-            WORKDIR_ROOT,
             SANDBOX_HOME,
             SKILLS_ROOT,
+            SCRATCH_ROOT,
         ],
         user="root",
     )
+
+
+def test_start_container_force_removes_on_bootstrap_failure(mock_docker_client):
+    """If mkdir/chown fails after the container starts, force-remove it.
+
+    The container runs `sleep infinity` with no auto-remove, so it stays alive on failure;
+    `_start_container` must force-remove it so a failed start() leaks nothing.
+    """
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=1, output=b"boom")
+
+    with pytest.raises(RuntimeError):
+        session._start_container("img:latest")
+
+    mock_container.remove.assert_called_once_with(force=True)
+
+
+def _resolv_exec_cmd(nameservers):
+    """Mirror _override_resolv_conf's exec command so assertions don't hardcode shell quoting."""
+    content = "".join(f"nameserver {ns}\n" for ns in nameservers)
+    return ["sh", "-c", f"printf '%s' {_sh_quote(content)} > /etc/resolv.conf"]
+
+
+def test_start_container_fixes_gvisor_dns_on_custom_network(mock_docker_client, monkeypatch):
+    """Under runsc on a user-defined network, gVisor can't reach Docker's embedded resolver
+    (127.0.0.11): inject EXTRA_HOSTS as static /etc/hosts entries and repoint resolv.conf at DNS."""
+    monkeypatch.setattr(settings, "RUNTIME", "runsc")
+    monkeypatch.setattr(settings, "DNS", ["1.1.1.1", "8.8.8.8"])
+    monkeypatch.setattr(settings, "EXTRA_HOSTS", ["gitlab"])
+    monkeypatch.setattr("daiv_sandbox.sessions.socket.gethostbyname", lambda name: "172.19.0.3")
+
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+
+    session._start_container("img", network="daiv-net")
+
+    run_kwargs = mock_docker_client.containers.run.call_args.kwargs
+    assert run_kwargs["network"] == "daiv-net"
+    assert run_kwargs["extra_hosts"] == {"gitlab": "172.19.0.3"}
+    mock_container.exec_run.assert_any_call(_resolv_exec_cmd(["1.1.1.1", "8.8.8.8"]), user="root")
+
+
+def test_start_container_overrides_resolv_conf_without_extra_hosts(mock_docker_client, monkeypatch):
+    """resolv.conf is repointed even when EXTRA_HOSTS is empty; no extra_hosts kwarg is added."""
+    monkeypatch.setattr(settings, "RUNTIME", "runsc")
+    monkeypatch.setattr(settings, "DNS", ["9.9.9.9"])
+    monkeypatch.setattr(settings, "EXTRA_HOSTS", [])
+
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+
+    session._start_container("img", network="daiv-net")
+
+    assert "extra_hosts" not in mock_docker_client.containers.run.call_args.kwargs
+    mock_container.exec_run.assert_any_call(_resolv_exec_cmd(["9.9.9.9"]), user="root")
+
+
+def test_start_container_skips_dns_fix_under_runc(mock_docker_client, monkeypatch):
+    """runc honours Docker's embedded resolver, so the gVisor workaround must not fire (no
+    resolv.conf rewrite, no extra_hosts) — otherwise we'd break working service-name DNS."""
+    monkeypatch.setattr(settings, "RUNTIME", "runc")
+    monkeypatch.setattr(settings, "EXTRA_HOSTS", ["gitlab"])
+
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+
+    session._start_container("img", network="daiv-net")
+
+    assert "extra_hosts" not in mock_docker_client.containers.run.call_args.kwargs
+    assert not any("resolv.conf" in str(call) for call in mock_container.exec_run.call_args_list)
+
+
+def test_start_container_skips_dns_fix_without_custom_network(mock_docker_client, monkeypatch):
+    """Without an explicit network (Docker's default bridge) resolv.conf already carries real
+    upstreams under gVisor, so the workaround must not fire."""
+    monkeypatch.setattr(settings, "RUNTIME", "runsc")
+    monkeypatch.setattr(settings, "EXTRA_HOSTS", ["gitlab"])
+
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+
+    session._start_container("img")
+
+    assert "extra_hosts" not in mock_docker_client.containers.run.call_args.kwargs
+    assert not any("resolv.conf" in str(call) for call in mock_container.exec_run.call_args_list)
+
+
+def test_start_container_force_removes_when_resolv_conf_override_fails(mock_docker_client, monkeypatch):
+    """A failed resolv.conf rewrite is a bootstrap failure: surface it and leak no container."""
+    monkeypatch.setattr(settings, "RUNTIME", "runsc")
+    monkeypatch.setattr(settings, "DNS", ["1.1.1.1"])
+    monkeypatch.setattr(settings, "EXTRA_HOSTS", [])
+
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+
+    def exec_run(cmd, **_):
+        if "resolv.conf" in cmd[-1]:
+            return ExecResult(exit_code=1, output=b"boom")
+        return ExecResult(exit_code=0, output=b"")
+
+    mock_container.exec_run.side_effect = exec_run
+
+    with pytest.raises(RuntimeError, match="resolv.conf"):
+        session._start_container("img", network="daiv-net")
+
+    mock_container.remove.assert_called_once_with(force=True)
+
+
+def test_resolve_extra_hosts_skips_unresolvable(mock_docker_client, monkeypatch):
+    """Sibling names that don't resolve are dropped (and logged), not fatal to session start."""
+
+    def gethostbyname(name):
+        if name == "gitlab":
+            return "172.19.0.3"
+        raise OSError("name or service not known")
+
+    monkeypatch.setattr("daiv_sandbox.sessions.socket.gethostbyname", gethostbyname)
+    session = SandboxDockerSession()
+
+    assert session._resolve_extra_hosts(["gitlab", "ghost"]) == {"gitlab": "172.19.0.3"}
 
 
 def test_remove_container(mock_docker_client):
@@ -131,6 +264,114 @@ def test_remove_container_with_container_not_found(mock_docker_client):
     session.remove_container()
     mock_docker_client.containers.get.assert_called_with(session.session_id)
     mock_docker_client.containers.get.return_value.remove.assert_not_called()
+
+
+def test_session_type_label_constants():
+    from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, TYPE_CMD_EXECUTOR
+
+    assert DAIV_SANDBOX_TYPE_LABEL == "daiv.sandbox.type"
+    assert TYPE_CMD_EXECUTOR == "cmd_executor"
+
+
+def test_stop_container(mock_docker_client):
+    from daiv_sandbox.config import settings as cfg
+
+    session = SandboxDockerSession(session_id="test-session-id")
+    session.stop_container()
+    mock_docker_client.containers.get.assert_called_with("test-session-id")
+    mock_docker_client.containers.get.return_value.stop.assert_called_once_with(timeout=cfg.STOP_TIMEOUT_SECONDS)
+
+
+def test_stop_container_with_container_not_found(mock_docker_client):
+    session = SandboxDockerSession(session_id="test-session-id")
+    mock_docker_client.containers.get.side_effect = NotFound(session.session_id)
+    session.stop_container()  # must not raise
+    mock_docker_client.containers.get.return_value.stop.assert_not_called()
+
+
+def test_stop_container_vanished_before_stop_is_noop(mock_docker_client):
+    """A container removed between the lookup and the stop counts as already-stopped (no raise)."""
+    session = SandboxDockerSession(session_id="test-session-id")
+    mock_docker_client.containers.get.return_value.stop.side_effect = NotFound("gone")
+    session.stop_container()  # must not raise
+
+
+def test_stop_container_raises_session_unavailable_on_api_error(mock_docker_client):
+    """A Docker API fault on stop surfaces as SessionUnavailableError (mapped to 503), not a bare
+    500 — the session may still be running and the client must be able to tell."""
+    session = SandboxDockerSession(session_id="test-session-id")
+    mock_docker_client.containers.get.return_value.stop.side_effect = APIError("daemon busy")
+    with pytest.raises(SessionUnavailableError):
+        session.stop_container()
+
+
+def _bare_session(client):
+    """A session whose __init__ is bypassed so _get_container can be driven against *client*."""
+    s = SandboxDockerSession.__new__(SandboxDockerSession)
+    s.client = client
+    s.session_id = "sid"
+    s.container = None
+    return s
+
+
+def test_get_container_returns_running_container():
+    container = Mock(status="running")
+    client = Mock()
+    client.containers.get.return_value = container
+    assert _bare_session(client)._get_container("sid") is container
+    container.restart.assert_not_called()
+
+
+def test_get_container_restarts_stopped_container():
+    """A stopped container is restarted and reloaded; once running it is returned (warm reuse)."""
+    container = Mock(status="exited")
+
+    def _warm():
+        container.status = "running"
+
+    container.reload.side_effect = _warm
+    client = Mock()
+    client.containers.get.return_value = container
+
+    result = _bare_session(client)._get_container("sid")
+
+    container.restart.assert_called_once()
+    container.reload.assert_called_once()
+    assert result is container
+
+
+def test_get_container_returns_none_when_missing():
+    client = Mock()
+    client.containers.get.side_effect = NotFound("nope")
+    assert _bare_session(client)._get_container("sid") is None
+
+
+def test_get_container_returns_none_when_restart_does_not_take():
+    """A restart that does not raise but leaves the container not-running is a benign 404, not a
+    503 — keep returning None."""
+    container = Mock(status="exited")  # reload leaves it stopped
+    client = Mock()
+    client.containers.get.return_value = container
+    assert _bare_session(client)._get_container("sid") is None
+
+
+def test_get_container_returns_none_when_vanishes_during_restart():
+    container = Mock(status="exited")
+    container.restart.side_effect = NotFound("gone")
+    client = Mock()
+    client.containers.get.return_value = container
+    assert _bare_session(client)._get_container("sid") is None
+
+
+def test_get_container_raises_session_unavailable_on_restart_fault():
+    """A Docker fault while restarting is infrastructure, not a missing session: raise so the
+    endpoint returns 503 instead of masking it as a 404."""
+    container = Mock(status="exited")
+    container.restart.side_effect = APIError("daemon down")
+    client = Mock()
+    client.containers.get.return_value = container
+    with pytest.raises(SessionUnavailableError):
+        _bare_session(client)._get_container("sid")
 
 
 def test_copy_to_runtime_creates_directory(mock_docker_client):
@@ -158,16 +399,6 @@ def test_copy_to_runtime_creates_directory(mock_docker_client):
     session.container.exec_run.assert_any_call(
         ["chown", "-R", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", SANDBOX_ROOT], user="root"
     )
-
-
-def test_copy_from_runtime_raises_error_if_file_not_found(mock_docker_client):
-    session = SandboxDockerSession()
-    session.container = MagicMock()
-    session.container.get_archive.return_value = ([], {"size": 0})
-    with pytest.raises(FileNotFoundError):
-        session.copy_from_container("/path/to/src")
-    # Absolute paths should be used as-is
-    session.container.get_archive.assert_called_once_with("/path/to/src")
 
 
 def test_execute_command(mock_docker_client):
@@ -229,16 +460,6 @@ def test_copy_to_container_with_relative_dest(mock_docker_client):
     session.container.exec_run.assert_any_call(
         ["chown", "-R", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", expected_path], user="root"
     )
-
-
-def test_copy_from_container_with_relative_path(mock_docker_client):
-    """Test that relative paths are resolved under SANDBOX_ROOT"""
-    session = SandboxDockerSession()
-    session.container = MagicMock()
-    session.container.get_archive.return_value = ([b"data"], {"size": 100})
-    session.copy_from_container("subdir")
-    expected_path = f"{SANDBOX_ROOT}/subdir"
-    session.container.get_archive.assert_called_once_with(expected_path)
 
 
 def test_execute_command_with_relative_workdir(mock_docker_client):
@@ -435,6 +656,55 @@ def test_write_file_rejects_nul_in_path(mock_docker_client):
         session.write_file(f"{SANDBOX_ROOT}/foo\x00bar", b"x", mode=0o644)
 
 
+def test_write_file_create_only_rejects_existing(mock_docker_client):
+    """create_only=True refuses to overwrite: an existence probe that finds the file raises
+    FileExistsError before any archive is copied."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="EXISTS"))
+    s.copy_to_container = Mock()
+    with pytest.raises(FileExistsError, match="already exists"):
+        s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
+    s.copy_to_container.assert_not_called()
+
+
+def test_write_file_create_only_allows_new(mock_docker_client):
+    """create_only=True writes when the probe reports the path is absent."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="ABSENT"))
+    s.copy_to_container = Mock()
+    s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
+    s.copy_to_container.assert_called_once()
+
+
+def test_write_file_create_only_probe_failure_raises(mock_docker_client):
+    """A malfunctioning probe (unrecognised marker / non-zero exit) fails closed: it raises
+    RuntimeError instead of being mistaken for 'absent' and silently overwriting the file."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="sh: printf: not found"))
+    s.copy_to_container = Mock()
+    with pytest.raises(RuntimeError, match="existence probe failed"):
+        s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
+    s.copy_to_container.assert_not_called()
+
+
+def test_write_file_default_skips_existence_probe(mock_docker_client):
+    """The create_only=False default overwrites without probing — edit_file's write-back relies on
+    this, so the probe must be skipped entirely (no execute_command call)."""
+    s = _session_with_container()
+    s.execute_command = Mock()
+    s.copy_to_container = Mock()
+    s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,))
+    s.execute_command.assert_not_called()
+    s.copy_to_container.assert_called_once()
+
+
+def test_edit_file_write_back_does_not_use_create_only():
+    """edit's write-back must overwrite the file it just read (create_only must stay falsy)."""
+    s = _edit_session(b"hello world\n")
+    s.edit_file("/scratch/a.txt", "world", "there", replace_all=False, allowed_roots=("/scratch",))
+    assert not s.write_file.call_args.kwargs.get("create_only")
+
+
 def test_copy_to_container_allows_skills_root(mock_docker_client):
     """copy_to_container accepts /skills (and subdirs) as a destination."""
     session = SandboxDockerSession()
@@ -473,6 +743,65 @@ def test_copy_to_container_rejects_non_reserved_root(mock_docker_client):
         session.copy_to_container(buf, dest="/etc/passwd", clear_before_copy=False)
 
 
+def test_copy_to_container_allows_bare_workspace_root(mock_docker_client):
+    """A bare /workspace dest is accepted (its subdirs repo/skills/tmp all live under it)."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session.container.put_archive.return_value = True
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="x")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
+
+    session.copy_to_container(buf, dest=WORKSPACE_ROOT, clear_before_copy=False)
+
+
+def test_copy_to_container_chmod_failure_skips_chown(mock_docker_client):
+    """A failed chmod is raised before chown runs, so the error is attributed correctly and chown
+    is not run against a still-mis-permissioned tree."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+    session.container.put_archive.return_value = True
+    session.container.exec_run.side_effect = [
+        ExecResult(exit_code=0, output=b""),  # rm (clear_before_copy default)
+        ExecResult(exit_code=0, output=b""),  # mkdir
+        ExecResult(exit_code=1, output=b"chmod: boom"),  # chmod fails
+    ]
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="a.txt")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
+
+    with pytest.raises(RuntimeError, match="normalize permissions"):
+        session.copy_to_container(buf)
+
+    chown_calls = [c for c in session.container.exec_run.call_args_list if c.args and c.args[0][0] == "chown"]
+    assert chown_calls == []
+
+
+def test_copy_to_container_rejects_dest_traversal(mock_docker_client):
+    """A `..` in an absolute dest is rejected at the boundary (defense-in-depth, not caller-dependent)."""
+    session = SandboxDockerSession()
+    session.container = MagicMock()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="x")
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
+    buf.seek(0)
+
+    with pytest.raises(ValueError, match="Refusing to extract"):
+        session.copy_to_container(buf, dest=f"{WORKSPACE_ROOT}/../etc", clear_before_copy=False)
+
+
 def test_start_container_creates_skills_root(mock_docker_client):
     """A freshly-started container has /skills owned by the sandbox user."""
     session = SandboxDockerSession()
@@ -482,7 +811,7 @@ def test_start_container_creates_skills_root(mock_docker_client):
 
     # mkdir -p was called including SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", SANDBOX_ROOT, WORKDIR_ROOT, SANDBOX_HOME, SKILLS_ROOT], user="root"
+        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
     )
     # chown was called for SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
@@ -490,10 +819,11 @@ def test_start_container_creates_skills_root(mock_docker_client):
             "chown",
             f"{settings.RUN_UID}:{settings.RUN_GID}",
             "--",
+            WORKSPACE_ROOT,
             SANDBOX_ROOT,
-            WORKDIR_ROOT,
             SANDBOX_HOME,
             SKILLS_ROOT,
+            SCRATCH_ROOT,
         ],
         user="root",
     )
@@ -541,3 +871,339 @@ def test_sanitize_archive_stream_raises_on_traversal_member():
     out_buf = io.BytesIO()
     with pytest.raises(ValueError, match="traversal"):
         _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+
+
+def test_start_container_creates_scratch_root(mock_docker_client):
+    """The container bootstrap must mkdir + chown /scratch alongside the other roots."""
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session._start_container("img:latest")
+
+    mkdir_calls = [c for c in mock_container.exec_run.call_args_list if c.args and c.args[0][0] == "mkdir"]
+    assert any(SCRATCH_ROOT in c.args[0] for c in mkdir_calls), "scratch root not created"
+    chown_calls = [c for c in mock_container.exec_run.call_args_list if c.args and c.args[0][0] == "chown"]
+    assert any(SCRATCH_ROOT in c.args[0] for c in chown_calls), "scratch root not chowned"
+
+
+def _session_with_container():
+    s = SandboxDockerSession.__new__(SandboxDockerSession)
+    s.container = Mock()
+    s.client = Mock()
+    s.session_id = "sid"
+    return s
+
+
+def _tar_of(path_in_tar: str, content: bytes) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name=path_in_tar)
+        info.size = len(content)
+        tf.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def test_read_file_bytes_extracts_single_member():
+    s = _session_with_container()
+    s.container.get_archive.return_value = (iter([_tar_of("foo.txt", b"hello\n")]), {"size": 6})
+    assert s.read_file_bytes("/scratch/foo.txt") == b"hello\n"
+
+
+def test_list_dir_parses_ls_output():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="sub/\nfile.py\n"))
+    entries = s.list_dir("/scratch")
+    assert ("/scratch/sub", True) in entries
+    assert ("/scratch/file.py", False) in entries
+
+
+def test_grep_parses_matches():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="/scratch/a.py:3:found here\n"))
+    matches = s.grep("found", "/scratch", glob=None)
+    assert matches == [("/scratch/a.py", 3, "found here")]
+
+
+def test_delete_file_runs_rm():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    assert s.delete_file("/scratch/x") is True
+    s.execute_command.assert_called_once()
+    assert "rm -f" in s.execute_command.call_args.args[0]
+
+
+def test_read_file_bytes_missing_path_raises_file_not_found():
+    """docker get_archive raises NotFound for a missing path; surface it as FileNotFoundError."""
+    s = _session_with_container()
+    s.container.get_archive.side_effect = NotFound("no such path")
+    with pytest.raises(FileNotFoundError):
+        s.read_file_bytes("/scratch/missing.txt")
+
+
+def test_read_file_bytes_empty_file_returns_empty_bytes():
+    """A genuinely empty file must return b'' (not be reported as missing)."""
+    s = _session_with_container()
+    s.container.get_archive.return_value = (iter([_tar_of("empty.txt", b"")]), {"size": 0})
+    assert s.read_file_bytes("/scratch/empty.txt") == b""
+
+
+def test_grep_filters_by_basename_glob():
+    """grep with a glob filters results host-side by basename (busybox grep has no --include)."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="/scratch/a.py:1:hit\n/scratch/sub/b.txt:2:hit\n"))
+    matches = s.grep("hit", "/scratch", glob="*.py")
+    assert matches == [("/scratch/a.py", 1, "hit")]
+    # --include must NOT be used (busybox lacks it).
+    assert "--include" not in s.execute_command.call_args.args[0]
+
+
+def test_grep_raises_on_real_error_exit():
+    """grep exit code >= 2 (other than the absent-path sentinel) is a real error, so surface it."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="grep: bad things"))
+    with pytest.raises(RuntimeError):
+        s.grep("x", "/scratch", glob=None)
+
+
+def test_grep_no_matches_exit_1_is_ok():
+    """grep exit code 1 means 'no matches' and must return an empty list, not raise."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=1, output=""))
+    assert s.grep("x", "/scratch", glob=None) == []
+
+
+def test_grep_missing_path_raises_file_not_found():
+    """A genuinely absent search path is reported via FileNotFoundError (sentinel exit), distinct
+    from grep's own exit 2 — so fs_grep can treat it as 'no matches' rather than an error."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_ABSENT_EXIT, output=""))
+    with pytest.raises(FileNotFoundError):
+        s.grep("x", "/scratch/missing", glob=None)
+    assert f"|| exit {_PATH_ABSENT_EXIT}" in s.execute_command.call_args.args[0]
+
+
+def test_list_dir_raises_on_error_exit():
+    """A non-zero exit that is NOT the absent-path sentinel (e.g. ls's exit 2 for permission
+    denied on an existing path) is a genuine failure and must raise RuntimeError."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="ls: cannot access"))
+    with pytest.raises(RuntimeError):
+        s.list_dir("/scratch/denied")
+
+
+def test_list_dir_missing_path_raises_file_not_found():
+    """A genuinely absent path is reported via FileNotFoundError (the shell guard's sentinel
+    exit code), distinct from a real listing failure — so fs_ls can treat it as an empty listing."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_ABSENT_EXIT, output=""))
+    with pytest.raises(FileNotFoundError):
+        s.list_dir("/scratch/missing")
+    # The listing must probe existence so a true absence is distinguishable from a real error.
+    assert f"|| exit {_PATH_ABSENT_EXIT}" in s.execute_command.call_args.args[0]
+
+
+def test_find_paths_parses_type_markers():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="/scratch/sub/D\n/scratch/f.py/F\n"))
+    entries = s.find_paths("/scratch")
+    assert ("/scratch/sub", True) in entries
+    assert ("/scratch/f.py", False) in entries
+
+
+def test_find_paths_raises_on_error_exit():
+    """A non-zero exit that is NOT the absent-path sentinel (e.g. a genuine traversal failure on an
+    existing tree) must raise RuntimeError."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=1, output="find: bad things"))
+    with pytest.raises(RuntimeError):
+        s.find_paths("/scratch/denied")
+
+
+def test_find_paths_missing_path_raises_file_not_found():
+    """A genuinely absent path is reported via FileNotFoundError (sentinel exit), distinct from a
+    real traversal failure — so fs_glob can treat it as no matches."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_ABSENT_EXIT, output=""))
+    with pytest.raises(FileNotFoundError):
+        s.find_paths("/scratch/missing")
+    assert f"|| exit {_PATH_ABSENT_EXIT}" in s.execute_command.call_args.args[0]
+
+
+def _edit_session(initial: bytes):
+    s = _session_with_container()
+    s.read_file_bytes = Mock(return_value=initial)
+    s.write_file = Mock()
+    return s
+
+
+def test_edit_file_single_replacement():
+    s = _edit_session(b"hello world\n")
+    assert s.edit_file("/scratch/a.txt", "world", "there", replace_all=False, allowed_roots=("/scratch",)) == 1
+    written = s.write_file.call_args.args[1]
+    assert written == b"hello there\n"
+
+
+def test_edit_file_string_not_found():
+    s = _edit_session(b"hello\n")
+    with pytest.raises(ValueError, match="string_not_found"):
+        s.edit_file("/scratch/a.txt", "absent", "x", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_multiple_occurrences_without_replace_all():
+    s = _edit_session(b"x x x\n")
+    with pytest.raises(ValueError, match="appears 3 times"):
+        s.edit_file("/scratch/a.txt", "x", "y", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_eof_newline_unique_hint():
+    """old ends with a newline the file lacks at EOF, and the stripped key is unique → precise hint."""
+    s = _edit_session(b"abcdefkey")
+    with pytest.raises(ValueError, match="trailing newline removed"):
+        s.edit_file("/scratch/a.txt", "key\n", "KEY\n", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_eof_newline_ambiguous_hint():
+    """old ends with a newline the file lacks at EOF, and the stripped key is ambiguous →
+    hint to drop the newline AND add surrounding context."""
+    s = _edit_session(b"abckeydefkey")
+    with pytest.raises(ValueError, match="add surrounding context"):
+        s.edit_file("/scratch/a.txt", "key\n", "KEY\n", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_eof_newline_hint_normalizes_crlf():
+    """The hint LF-normalizes the file, so a CRLF body with no trailing newline still triggers the
+    unique 'trailing newline removed' hint — guards the text_lf normalization in the hint branch."""
+    s = _edit_session(b"abcdef\r\nkey")
+    with pytest.raises(ValueError, match="trailing newline removed"):
+        s.edit_file("/scratch/a.txt", "key\n", "KEY\n", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_single_newline_old_not_eof_hint():
+    """A lone-newline `old` must not enter the hint branch (the len(old_lf) > 1 guard): it falls
+    through to the plain string_not_found rather than a misleading EOF hint."""
+    s = _edit_session(b"abcdef")
+    with pytest.raises(ValueError, match="string_not_found"):
+        s.edit_file("/scratch/a.txt", "\n", "X", replace_all=False, allowed_roots=("/scratch",))
+    s.write_file.assert_not_called()
+
+
+def test_edit_file_replace_all_counts_all():
+    s = _edit_session(b"x x x\n")
+    assert s.edit_file("/scratch/a.txt", "x", "y", replace_all=True, allowed_roots=("/scratch",)) == 3
+    assert s.write_file.call_args.args[1] == b"y y y\n"
+
+
+def test_edit_file_matches_lf_old_against_crlf_file():
+    """An LF-supplied `old` should match a CRLF file and write back CRLF-preserving content."""
+    s = _edit_session(b"a\r\nb\r\n")
+    count = s.edit_file("/scratch/a.txt", "a\nb", "a\nB", replace_all=False, allowed_roots=("/scratch",))
+    assert count == 1
+    assert s.write_file.call_args.args[1] == b"a\r\nB\r\n"
+
+
+def test_roots_are_under_workspace():
+    assert WORKSPACE_ROOT == "/workspace"
+    assert SANDBOX_ROOT == "/workspace/repo"
+    assert SKILLS_ROOT == "/workspace/skills"
+    assert SCRATCH_ROOT == "/workspace/tmp"
+
+
+@pytest.mark.parametrize("path", ["/workspace/repo/main.py", "/workspace/skills/x/SKILL.md", "/workspace/tmp/note.txt"])
+def test_validate_accepts_anything_under_workspace(path):
+    assert _validate_sandbox_path(path, allowed_roots=(WORKSPACE_ROOT,)) == path
+
+
+def test_validate_allows_workspace_root_only_with_allow_root():
+    assert _validate_sandbox_path("/workspace", allowed_roots=(WORKSPACE_ROOT,), allow_root=True) == "/workspace"
+    with pytest.raises(ValueError):
+        _validate_sandbox_path("/workspace", allowed_roots=(WORKSPACE_ROOT,))
+
+
+@pytest.mark.parametrize("path", ["/etc/passwd", "/workspace/../etc", "/repo/main.py", "relative/x"])
+def test_validate_rejects_outside_workspace(path):
+    with pytest.raises(ValueError):
+        _validate_sandbox_path(path, allowed_roots=(WORKSPACE_ROOT,))
+
+
+def _tar_of_dir(dir_name: str) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name=dir_name)
+        info.type = tarfile.DIRTYPE
+        tf.addfile(info)
+    return buf.getvalue()
+
+
+def test_list_dir_wrong_type_raises_not_a_directory():
+    """The classifying guard exits 8 when the path exists but is not a directory."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_WRONG_TYPE_EXIT, output=""))
+    with pytest.raises(NotADirectoryError):
+        s.list_dir("/scratch/a-file")
+    # Assert the require="dir" prologue actually emits the type test (not just that the mock exit maps).
+    cmd = s.execute_command.call_args.args[0]
+    assert "[ -d " in cmd and f"exit {_PATH_WRONG_TYPE_EXIT}" in cmd
+
+
+def test_list_dir_permission_denied_raises():
+    """The guard exits 9 when an existing directory is not readable/traversable by the sandbox user."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_DENIED_EXIT, output=""))
+    with pytest.raises(PermissionError):
+        s.list_dir("/scratch/denied")
+    cmd = s.execute_command.call_args.args[0]
+    assert f"exit {_PATH_DENIED_EXIT}" in cmd and "[ -x " in cmd
+
+
+def test_find_paths_wrong_type_raises_not_a_directory():
+    """find_paths also uses require="dir", so a non-directory base exits 8 -> NotADirectoryError."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_WRONG_TYPE_EXIT, output=""))
+    with pytest.raises(NotADirectoryError):
+        s.find_paths("/scratch/a-file")
+    cmd = s.execute_command.call_args.args[0]
+    assert "[ -d " in cmd and f"exit {_PATH_WRONG_TYPE_EXIT}" in cmd
+
+
+def test_grep_permission_denied_raises():
+    """grep uses the default guard (require=None): existence + readability only. An unreadable path
+    exits 9 -> PermissionError, and the prologue must NOT emit the dir-only wrong-type test."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_DENIED_EXIT, output=""))
+    with pytest.raises(PermissionError):
+        s.grep("x", "/scratch/denied", glob=None)
+    cmd = s.execute_command.call_args.args[0]
+    assert f"exit {_PATH_DENIED_EXIT}" in cmd
+    assert f"exit {_PATH_WRONG_TYPE_EXIT}" not in cmd  # require=None -> no directory type test
+
+
+def test_read_file_bytes_directory_raises_is_a_directory():
+    """Reading a directory must raise IsADirectoryError, not return an inner file's bytes."""
+    s = _session_with_container()
+    s.container.get_archive.return_value = (iter([_tar_of_dir("somedir/")]), {"size": 0})
+    with pytest.raises(IsADirectoryError):
+        s.read_file_bytes("/scratch/somedir")
+
+
+def test_delete_file_absent_returns_false():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_ABSENT_EXIT, output=""))
+    assert s.delete_file("/scratch/missing") is False
+
+
+def test_delete_file_directory_raises_is_a_directory():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_PATH_WRONG_TYPE_EXIT, output=""))
+    with pytest.raises(IsADirectoryError):
+        s.delete_file("/scratch/adir")
+
+
+def test_delete_file_removed_returns_true():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    assert s.delete_file("/scratch/x") is True

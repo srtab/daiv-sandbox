@@ -1,36 +1,3 @@
-import base64
-
-import pytest
-
-
-def test_put_mutation_validates_mode_range():
-    from daiv_sandbox.schemas import PutMutation
-
-    # Valid modes accepted.
-    PutMutation(path="/repo/foo.py", content=base64.b64encode(b"x"), mode=0o644)
-    PutMutation(path="/repo/script.sh", content=base64.b64encode(b"#!/bin/sh"), mode=0o755)
-    PutMutation(path="/repo/.gitkeep", content=base64.b64encode(b""), mode=0)
-
-    # Out-of-range rejected.
-    with pytest.raises(ValueError):
-        PutMutation(path="/repo/foo.py", content=base64.b64encode(b"x"), mode=-1)
-    with pytest.raises(ValueError):
-        PutMutation(path="/repo/foo.py", content=base64.b64encode(b"x"), mode=0o10000)
-
-
-def test_apply_mutations_request_size_limits():
-    from daiv_sandbox.schemas import ApplyMutationsRequest, PutMutation
-
-    one = PutMutation(path="/repo/a.py", content=base64.b64encode(b""), mode=0o644)
-    # Empty list rejected by min_length=1.
-    with pytest.raises(ValueError):
-        ApplyMutationsRequest(mutations=[])
-    # Up to 64 entries accepted; 65+ rejected by max_length=64.
-    ApplyMutationsRequest(mutations=[one] * 64)
-    with pytest.raises(ValueError):
-        ApplyMutationsRequest(mutations=[one] * 65)
-
-
 def test_run_request_no_longer_accepts_archive():
     from daiv_sandbox.schemas import RunRequest
 
@@ -41,3 +8,37 @@ def test_start_session_request_no_longer_accepts_ephemeral():
     from daiv_sandbox.schemas import StartSessionRequest
 
     assert "ephemeral" not in StartSessionRequest.model_fields
+
+
+def test_fs_error_rejects_empty_message():
+    """FsError.message is the agent-actionable hint and must be non-empty."""
+    import pytest
+    from pydantic import ValidationError
+
+    from daiv_sandbox.schemas import FsError, FsErrorCode
+
+    with pytest.raises(ValidationError):
+        FsError(code=FsErrorCode.NOT_FOUND, message="")
+
+
+def test_fs_write_response_ok_is_derived_from_error():
+    """`ok` is a computed field: success ⇔ no error, so the two can never disagree."""
+    from daiv_sandbox.schemas import FsError, FsErrorCode, FsWriteResponse
+
+    assert FsWriteResponse().ok is True
+    assert FsWriteResponse(error=FsError(code=FsErrorCode.EXEC_FAILED, message="boom")).ok is False
+
+
+def test_fs_delete_response_rejects_removed_with_error():
+    """A failed delete cannot also report removed=True — the model_validator forbids the contradiction."""
+    import pytest
+    from pydantic import ValidationError
+
+    from daiv_sandbox.schemas import FsDeleteResponse, FsError, FsErrorCode
+
+    with pytest.raises(ValidationError):
+        FsDeleteResponse(removed=True, error=FsError(code=FsErrorCode.IS_A_DIRECTORY, message="is a directory"))
+
+    # The valid combinations still construct fine.
+    assert FsDeleteResponse(removed=True).ok is True
+    assert FsDeleteResponse(error=FsError(code=FsErrorCode.NOT_FOUND, message="nope")).removed is False

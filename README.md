@@ -47,38 +47,46 @@ $ docker run --rm -d -p 8000:8000 -e DAIV_SANDBOX_API_KEY=my-secret-api-key -e D
 
 All settings are configurable via environment variables. The available settings are:
 
-| Environment Variable                          | Description                                                                                              | Options/Default                                                             |
-| --------------------------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| **DAIV_SANDBOX_API_KEY**                      | The API key required to access the sandbox API.                                                          |                                                                             |
-| **DAIV_SANDBOX_API_V1_STR**                   | Base path for API routes.                                                                                | Default: "/api/v1"                                                          |
-| **DAIV_SANDBOX_ENVIRONMENT**                  | The deployment environment.                                                                              | Options: `local`, `production`<br>Default: "production"                     |
-| **DAIV_SANDBOX_SENTRY_DSN**                   | The DSN for Sentry error tracking.                                                                       | Optional                                                                    |
-| **DAIV_SANDBOX_SENTRY_ENABLE_LOGS**           | Whether to enable Sentry log forwarding.                                                                 | Default: False                                                              |
-| **DAIV_SANDBOX_SENTRY_TRACES_SAMPLE_RATE**    | Sentry traces sampling rate.                                                                             | Default: 0.0                                                                |
-| **DAIV_SANDBOX_SENTRY_PROFILES_SAMPLE_RATE**  | Sentry profiles sampling rate.                                                                           | Default: 0.0                                                                |
-| **DAIV_SANDBOX_SENTRY_SEND_DEFAULT_PII**      | Send default PII to Sentry.                                                                              | Default: False                                                              |
-| **DAIV_SANDBOX_RUNTIME**                      | The container runtime to use.                                                                            | Options: `runc`, `runsc`<br>Default: "runc"                                 |
-| **DAIV_SANDBOX_RUN_UID**                      | UID for sandbox command execution.                                                                       | Default: 1000                                                               |
-| **DAIV_SANDBOX_RUN_GID**                      | GID for sandbox command execution.                                                                       | Default: 1000                                                               |
-| **DAIV_SANDBOX_COMMAND_TIMEOUT**              | Default per-command timeout in seconds. `0` disables the default. Overridable per request via `timeout`. | Default: 0                                                                  |
-| **DAIV_SANDBOX_REDIS_URL**                    | Redis URL used for cross-replica per-session locking. When unset, an in-process lock is used.            | Optional                                                                    |
-| **DAIV_SANDBOX_SESSION_LOCK_TTL_SECONDS**     | TTL (seconds) of the per-session lock when Redis-backed.                                                 | Default: 900                                                                |
-| **DAIV_SANDBOX_SESSION_LOCK_WAIT_SECONDS**    | Max time (seconds) a request waits to acquire a busy session lock before returning `409`.                | Default: 1.0                                                                |
-| **DAIV_SANDBOX_SESSION_LOCK_REFRESH_SECONDS** | Interval (seconds) at which a held session lock is refreshed.                                            | Default: 30.0                                                               |
-| **DAIV_SANDBOX_GIT_IMAGE**                    | Image used to extract patches.                                                                           | Default: "alpine/git:2.52.0"                                                |
-| **DAIV_SANDBOX_HOST**                         | The host to bind the service to.                                                                         | Default: "0.0.0.0"                                                          |
-| **DAIV_SANDBOX_PORT**                         | The port to bind the service to.                                                                         | Default: 8000                                                               |
-| **DAIV_SANDBOX_LOG_LEVEL**                    | The log level to use.                                                                                    | Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`<br>Default: "INFO" |
+| Environment Variable                          | Description                                                                                                                                                                                                                                                       | Options/Default                                                             |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| **DAIV_SANDBOX_API_KEY**                      | The API key required to access the sandbox API.                                                                                                                                                                                                                   |                                                                             |
+| **DAIV_SANDBOX_API_V1_STR**                   | Base path for API routes.                                                                                                                                                                                                                                         | Default: "/api/v1"                                                          |
+| **DAIV_SANDBOX_ENVIRONMENT**                  | The deployment environment.                                                                                                                                                                                                                                       | Options: `local`, `production`<br>Default: "production"                     |
+| **DAIV_SANDBOX_SENTRY_DSN**                   | The DSN for Sentry error tracking.                                                                                                                                                                                                                                | Optional                                                                    |
+| **DAIV_SANDBOX_SENTRY_ENABLE_LOGS**           | Whether to enable Sentry log forwarding.                                                                                                                                                                                                                          | Default: False                                                              |
+| **DAIV_SANDBOX_SENTRY_TRACES_SAMPLE_RATE**    | Sentry traces sampling rate.                                                                                                                                                                                                                                      | Default: 0.0                                                                |
+| **DAIV_SANDBOX_SENTRY_PROFILES_SAMPLE_RATE**  | Sentry profiles sampling rate.                                                                                                                                                                                                                                    | Default: 0.0                                                                |
+| **DAIV_SANDBOX_SENTRY_SEND_DEFAULT_PII**      | Send default PII to Sentry.                                                                                                                                                                                                                                       | Default: False                                                              |
+| **DAIV_SANDBOX_RUNTIME**                      | The container runtime to use.                                                                                                                                                                                                                                     | Options: `runc`, `runsc`<br>Default: "runc"                                 |
+| **DAIV_SANDBOX_RUN_UID**                      | UID for sandbox command execution.                                                                                                                                                                                                                                | Default: 1000                                                               |
+| **DAIV_SANDBOX_RUN_GID**                      | GID for sandbox command execution.                                                                                                                                                                                                                                | Default: 1000                                                               |
+| **DAIV_SANDBOX_NETWORK**                      | Docker network that network-enabled sessions attach to. Sessions without networking stay isolated (`network_mode=none`); when unset, network-enabled sessions use Docker's default network.                                                                       | Optional                                                                    |
+| **DAIV_SANDBOX_DNS**                          | Comma-separated DNS resolvers written into a network-enabled session's `/etc/resolv.conf` under `runsc`, since gVisor can't reach Docker's embedded resolver (`127.0.0.11`). Ignored under `runc`.                                                                | Default: `1.1.1.1,8.8.8.8`                                                  |
+| **DAIV_SANDBOX_EXTRA_HOSTS**                  | Comma-separated sibling hostnames (e.g. `gitlab`) resolved at session start and injected as static `/etc/hosts` entries in network-enabled `runsc` sessions, restoring compose-service name resolution dropped by the resolv.conf override. Ignored under `runc`. | Optional                                                                    |
+| **DAIV_SANDBOX_COMMAND_TIMEOUT**              | Default per-command timeout in seconds. `0` disables the default. Overridable per request via `timeout`.                                                                                                                                                          | Default: 0                                                                  |
+| **DAIV_SANDBOX_REDIS_URL**                    | Redis URL used for cross-replica per-session locking. When unset, an in-process lock is used.                                                                                                                                                                     | Optional                                                                    |
+| **DAIV_SANDBOX_SESSION_LOCK_TTL_SECONDS**     | TTL (seconds) of the per-session lock when Redis-backed.                                                                                                                                                                                                          | Default: 900                                                                |
+| **DAIV_SANDBOX_SESSION_LOCK_WAIT_SECONDS**    | Max time (seconds) a request waits to acquire a busy session lock before returning `409`. Should comfortably outlast a typical op so a client's concurrently-dispatched ops queue instead of failing, while staying under the client's request timeout.           | Default: 30.0                                                               |
+| **DAIV_SANDBOX_SESSION_LOCK_REFRESH_SECONDS** | Interval (seconds) at which a held session lock is refreshed.                                                                                                                                                                                                     | Default: 30.0                                                               |
+| **DAIV_SANDBOX_REAPER_ENABLED**               | Enable the background reaper that removes stopped session containers.                                                                                                                                                                                             | Default: true                                                               |
+| **DAIV_SANDBOX_REAPER_INTERVAL_SECONDS**      | Reaper sweep cadence in seconds.                                                                                                                                                                                                                                  | Default: 600                                                                |
+| **DAIV_SANDBOX_SESSION_GRACE_SECONDS**        | Age (since stop) after which a stopped session container is removed.                                                                                                                                                                                              | Default: 43200 (12h)                                                        |
+| **DAIV_SANDBOX_MAX_STOPPED_SESSIONS**         | LRU cap on retained stopped session containers.                                                                                                                                                                                                                   | Default: 50                                                                 |
+| **DAIV_SANDBOX_STOP_TIMEOUT_SECONDS**         | `docker stop` grace before SIGKILL when stopping a session.                                                                                                                                                                                                       | Default: 2                                                                  |
+| **DAIV_SANDBOX_HOST**                         | The host to bind the service to.                                                                                                                                                                                                                                  | Default: "0.0.0.0"                                                          |
+| **DAIV_SANDBOX_PORT**                         | The port to bind the service to.                                                                                                                                                                                                                                  | Default: 8000                                                               |
+| **DAIV_SANDBOX_LOG_LEVEL**                    | The log level to use.                                                                                                                                                                                                                                             | Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`<br>Default: "INFO" |
 
 ## Usage
 
 `daiv-sandbox` provides a REST API to interact with. Here is a quick overview of the available endpoints:
 
 - `POST /session/`: Start a sandbox session.
-- `POST /session/{session_id}/seed/`: Seed the initial `/repo` and/or `/skills` state from tar archives (one-shot per session).
-- `POST /session/{session_id}/files/`: Apply a batch of file mutations to `/repo`.
+- `POST /session/{session_id}/seed/`: Seed the initial `/workspace/repo` and/or `/workspace/skills` state from tar archives (one-shot per session).
+- `POST /session/{session_id}/fs/{op}`: Python-free file operations across `/workspace` (`ls`, `read`, `grep`, `glob`, `write`, `edit`, `delete`).
 - `POST /session/{session_id}/`: Run commands on the sandbox session.
-- `DELETE /session/{session_id}/`: Close the sandbox session.
+- `GET /session/{session_id}/`: Check session status — `204` if it exists (restarting it if stopped), else `404`.
+- `DELETE /session/{session_id}/`: Close the sandbox session (stops the container by default; `?force=true` removes it).
 - `GET /-/health/`: Healthcheck endpoint.
 - `GET /-/version/`: Current application version.
 
@@ -86,7 +94,7 @@ All settings are configurable via environment variables. The available settings 
 
 To start a sandbox session, you need to call the `POST /session/` endpoint. A Docker image is pulled from the registry and used to create the sandbox container.
 
-After image is pulled or built, the container will be created and started, along with an helper container that will be used to extract the patch of the changed files.
+After the image is pulled, the container is created and started.
 
 Here is an example using `curl`:
 
@@ -108,14 +116,13 @@ The response will be a JSON object with the following structure containing the s
 
 The following table describes the parameters for the `session/` endpoint:
 
-| Parameter         | Description                                                     | Required | Valid Values                         |
-| ----------------- | --------------------------------------------------------------- | -------- | ------------------------------------ |
-| `base_image`      | The base image to use for the container.                        | Yes      | Any valid Docker image               |
-| `extract_patch`   | Extract a patch with the changes made by the executed commands. | No       | `true` or `false` (default: `false`) |
-| `network_enabled` | Enable network access inside the container.                     | No       | `true` or `false` (default: `false`) |
-| `environment`     | Environment variables to set at container start.                | No       | Object of string pairs               |
-| `memory_bytes`    | Memory limit for the container (bytes).                         | No       | Integer (bytes)                      |
-| `cpus`            | CPU quota for the container.                                    | No       | Float (e.g. `0.5`, `1.0`)            |
+| Parameter         | Description                                      | Required | Valid Values                         |
+| ----------------- | ------------------------------------------------ | -------- | ------------------------------------ |
+| `base_image`      | The base image to use for the container.         | Yes      | Any valid Docker image               |
+| `network_enabled` | Enable network access inside the container.      | No       | `true` or `false` (default: `false`) |
+| `environment`     | Environment variables to set at container start. | No       | Object of string pairs               |
+| `memory_bytes`    | Memory limit for the container (bytes).          | No       | Integer (bytes)                      |
+| `cpus`            | CPU quota for the container.                     | No       | Float (e.g. `0.5`, `1.0`)            |
 
 > [!NOTE]
 > For security reasons, building images from arbitrary Dockerfiles is not supported by this service. Provide a `base_image`.
@@ -140,17 +147,17 @@ print(resp["session_id"])
 
 ### Seeding a Session
 
-A freshly-started session has empty `/repo` and `/skills` directories. Before running commands or applying file mutations, seed the workspace by calling `POST /session/{session_id}/seed/` with one or both archives as `multipart/form-data` fields. `repo_archive` is extracted into `/repo` (e.g. a repository snapshot) and `skills_archive` is extracted into `/skills` (auxiliary tooling, prompts, etc.). When `extract_patch` was enabled at session start and `repo_archive` is provided, the patch-extractor's meta repo is initialised against this state.
+A freshly-started session has empty `/workspace/repo` and `/workspace/skills` directories. Before running commands or operating on files, seed the workspace by calling `POST /session/{session_id}/seed/` with one or both archives as `multipart/form-data` fields. `repo_archive` is extracted into `/workspace/repo` (e.g. a repository snapshot) and `skills_archive` is extracted into `/workspace/skills` (auxiliary tooling, prompts, etc.).
 
 Both fields are optional individually, but **at least one must be provided** — a request with neither returns `422`. Seeding is **one-shot per session** — a second call returns `409 Conflict`.
 
-Archives may be plain `tar` or gzip-compressed (`tar.gz`); they are sanitised and streamed into the container without being fully buffered in memory.
+Archives may be plain `tar` or compressed with gzip, bzip2, xz, or zstd; the compression is auto-detected. They are sanitised and streamed into the container without being fully buffered in memory.
 
-| Parameter        | Description                                              | Required          | Valid Values               |
-| ---------------- | -------------------------------------------------------- | ----------------- | -------------------------- |
-| `repo_archive`   | Tar archive that becomes the initial state of `/repo`.   | At least one of   | `tar` or `tar.gz` (binary) |
-| `skills_archive` | Tar archive that becomes the initial state of `/skills`. | `repo_archive` or | `tar` or `tar.gz` (binary) |
-|                  |                                                          | `skills_archive`  |                            |
+| Parameter        | Description                                                        | Required          | Valid Values                     |
+| ---------------- | ------------------------------------------------------------------ | ----------------- | -------------------------------- |
+| `repo_archive`   | Tar archive that becomes the initial state of `/workspace/repo`.   | At least one of   | `tar` (optionally gz/bz2/xz/zst) |
+| `skills_archive` | Tar archive that becomes the initial state of `/workspace/skills`. | `repo_archive` or | `tar` (optionally gz/bz2/xz/zst) |
+|                  |                                                                    | `skills_archive`  |                                  |
 
 ```sh
 $ curl -X POST \
@@ -162,41 +169,70 @@ $ curl -X POST \
 
 The response is an empty body with status `204`.
 
-### Applying File Mutations
+### Workspace File Operations
 
-To write or overwrite files in `/repo` without spawning a shell, use `POST /session/{session_id}/files/`. Each mutation specifies an absolute path under `/repo`, base64-encoded content, and POSIX mode bits. When `extract_patch` was enabled at session start, the meta-repo HEAD is advanced after a successful batch so the next `POST /session/{session_id}/` returns a patch that includes these changes.
+To inspect or modify files without spawning a shell, use the `POST /session/{session_id}/fs/{op}` endpoints. They operate anywhere under `/workspace` (`repo/`, `skills/`, `tmp/`) and are Python-free — content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so they work even on base images without a Python interpreter (e.g. `alpine`).
 
-Per-item errors (e.g. invalid path) are returned in `results[]` with `ok=false`; request-level errors (auth, schema, unknown session) return a 4xx status.
+| Op       | Body                             | Returns                                |
+| -------- | -------------------------------- | -------------------------------------- |
+| `ls`     | `{path}`                         | directory entries + `error?`           |
+| `read`   | `{path, offset?, limit?}`        | utf-8 text or base64 binary + `error?` |
+| `grep`   | `{pattern, path, glob?}`         | literal-substring matches + `error?`   |
+| `glob`   | `{pattern, path}`                | paths matching the glob + `error?`     |
+| `write`  | `{path, content, mode?}`         | `{ok, error?}`                         |
+| `edit`   | `{path, old, new, replace_all?}` | `{occurrences, error?}`                |
+| `delete` | `{path}`                         | `{ok, removed, error?}`                |
 
-| Parameter   | Description                              | Required | Valid Values                     |
-| ----------- | ---------------------------------------- | -------- | -------------------------------- |
-| `mutations` | Batch of file mutations to apply (1–64). | Yes      | Array of `{path, content, mode}` |
+`path` must be absolute and under `/workspace`; the file ops (`write`/`edit`/`read`/`delete`) target a file, while the directory ops (`ls`/`grep`/`glob`) may also target the `/workspace` root itself. `content` is base64-encoded.
 
-`mutations[].path` must be absolute and under `/repo`; `mutations[].content` is base64-encoded full file content; `mutations[].mode` is an integer in the POSIX mode range (e.g. `0o644`).
+Every response carries an `error` field with the shape `{code, message}` when the operation fails — `null` on success. `code` is one of the stable `FsErrorCode` values:
+
+| Code                   | Meaning                                                              |
+| ---------------------- | -------------------------------------------------------------------- |
+| `invalid_path`         | Path is malformed (`..`, NUL, newline) or outside `/workspace`.      |
+| `not_found`            | Path does not exist (distinct from an empty directory / no-match).   |
+| `not_a_directory`      | `ls` or `glob` was called on a file path.                            |
+| `is_a_directory`       | `read`, `edit`, or `delete` was called on a directory path.          |
+| `not_a_text_file`      | `edit` target is not valid UTF-8 text.                               |
+| `string_not_found`     | `edit` found no occurrence of `old`.                                 |
+| `multiple_occurrences` | `edit` found more than one occurrence and `replace_all` was not set. |
+| `already_exists`       | `write` target already exists (create-only).                         |
+| `too_large`            | Content exceeds the 512 KB read cap.                                 |
+| `invalid_offset`       | `read` `offset` is beyond the file length.                           |
+| `permission_denied`    | Filesystem permission error inside the container.                    |
+| `exec_failed`          | The underlying shell command failed unexpectedly.                    |
+
+`fs/delete` additionally returns a `removed` boolean: `true` if the file was deleted, `false` if it was already absent.
+
+`fs/ls`, `fs/grep`, and `fs/glob` return HTTP `200` with `error.code=invalid_path` for malformed paths (no longer `400`), keeping all fs ops consistent: HTTP status codes are reserved for session/transport concerns (404 missing session, 409 lock, 503 infra, 403 auth).
+
+`read` has a few additional behaviors: an empty file returns a human-readable sentinel string (with `encoding: "utf-8"`); an `offset` beyond the file length returns an `error`; a single response is capped at 512000 bytes — a larger text page is truncated with a marker (continue with a larger `offset`/smaller `limit`), and a binary file over the cap returns an `error` rather than a base64 blob.
+
+The sandbox is the single source of truth: edits under `/workspace/repo` (via bash or `fs/*`) land directly on the container's workspace, while `skills/` and `tmp/` stay container-local.
+
+> **Path confinement is lexical.** The `path` validator rejects `..` traversal, NUL, and newlines and requires the path to be under `/workspace`, but it does not resolve symlinks. Code executed in the container (via `POST /session/{id}/`) can create a symlink under `/workspace` pointing elsewhere, which `fs/read` would then follow. This grants no capability beyond running commands in the container — the **container** (gVisor / non-root) is the trust boundary, not the `/workspace` prefix.
 
 ```sh
 $ curl -X POST \
   -H "Content-Type: application/json" \
   -H "X-API-Key: notsosecret" \
-  -d '{"mutations": [{"path": "/repo/hello.txt", "content": "aGVsbG8=", "mode": 420}]}' \
-  http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/files/
+  -d '{"path": "/workspace/repo/hello.txt", "content": "aGVsbG8=", "mode": 420}' \
+  http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/fs/write
 ```
 
 ```json
-{
-  "results": [{ "path": "/repo/hello.txt", "ok": true, "error": null }]
-}
+{ "ok": true, "error": null }
 ```
 
 ### Running Commands
 
-To run commands on a sandbox session, call `POST /session/{session_id}/` using the session ID returned when starting the session. Commands execute against the container's persistent `/repo` workspace, which carries state across calls in the same session (seed → mutations → commands → more commands…).
+To run commands on a sandbox session, call `POST /session/{session_id}/` using the session ID returned when starting the session. Commands execute against the container's persistent `/workspace/repo` workspace, which carries state across calls in the same session (seed → file ops → commands → more commands…).
 
 By default, all commands are executed sequentially regardless of their exit codes. Set `fail_fast` to `true` to stop on the first non-zero exit code. Pipelines run with `pipefail`, so a failing stage in `cmd1 | cmd2` correctly propagates a non-zero exit code.
 
 Set `timeout` (seconds) to cap each command's wall-clock time. A command that exceeds the timeout is terminated with exit code `124` and any remaining commands in the request are skipped. Omitting `timeout` falls back to the server default (`DAIV_SANDBOX_COMMAND_TIMEOUT`, `0` = no timeout).
 
-When `extract_patch` was enabled on session creation, the `patch` field in the response is a base64-encoded unified diff covering the changes since the previous turn (`HEAD~1..HEAD` against the meta repo). It is `null` when no changes were detected.
+Commands mutate the container workspace in place. To recover the changes made during a session, run git (or any diff tool) inside `/workspace/repo` — e.g. `git diff` / `git status` — through this same endpoint; the workspace is the single source of truth.
 
 | Parameter   | Description                                                                                 | Required | Valid Values                         |
 | ----------- | ------------------------------------------------------------------------------------------- | -------- | ------------------------------------ |
@@ -224,15 +260,13 @@ The response will be a JSON object with the following structure:
       "output": "total 12\ndrwxr-xr-x 3 root root 4096 Nov 20 20:28 .\ndrwxrwxrwt 1 root root 4096 Nov 20 20:28 ..\ndrwxrwxr-x 3 root root 4096 Nov 14 14:39 django-webhooks-master\n",
       "exit_code": 0
     }
-  ],
-  "patch": null // Base64-encoded diff; null when no changes were detected
+  ]
 }
 ```
 
 Here is an example using `python` that seeds a session and then runs commands:
 
 ```python
-import base64
 import io
 import tarfile
 
@@ -241,15 +275,15 @@ import httpx
 API = "http://localhost:8000/api/v1"
 HEADERS = {"X-API-Key": "notsosecret"}
 
-# 1. Start a session with extract_patch enabled.
+# 1. Start a session.
 session_id = (
     httpx
-    .post(f"{API}/session/", headers=HEADERS, json={"base_image": "python:3.12", "extract_patch": True})
+    .post(f"{API}/session/", headers=HEADERS, json={"base_image": "python:3.12"})
     .raise_for_status()
     .json()["session_id"]
 )
 
-# 2. Seed /repo (and optionally /skills) from tar archives via multipart upload.
+# 2. Seed /workspace/repo (and optionally /workspace/skills) from tar archives via multipart upload.
 tarstream = io.BytesIO()
 with tarfile.open(fileobj=tarstream, mode="w:gz") as tar:
     # Add files to tar...
@@ -261,7 +295,7 @@ httpx.post(
     files={"repo_archive": ("repo.tar.gz", tarstream, "application/gzip")},
 ).raise_for_status()
 
-# 3. Run commands. Returns a patch covering this turn's changes.
+# 3. Run commands. Changes mutate the container workspace in place.
 resp = (
     httpx
     .post(
@@ -272,23 +306,16 @@ resp = (
 )
 
 print(resp["results"][0]["output"])
-if resp["patch"]:
-    print(base64.b64decode(resp["patch"]).decode())
 ```
 
 > [!NOTE]
 > When `DAIV_SANDBOX_REDIS_URL` is set, requests against the same session are serialised across replicas. A request that cannot acquire the per-session lock within `DAIV_SANDBOX_SESSION_LOCK_WAIT_SECONDS` returns `409 Conflict`.
 
-> [!TIP]
-> To apply the patch to the original repository/directory, you can use the `git apply` command. Don't need to be a git repository, it can be any directory.
->
-> ```sh
-> $ git apply --whitespace=nowarn --reject < patch.diff
-> ```
-
 ### Closing a Sandbox Session
 
 To close a sandbox session, you need to call the `DELETE /session/{session_id}/` endpoint using the session ID returned when starting the session.
+
+`DELETE /session/{id}/` stops the container (kept warm for reuse); pass `?force=true` to remove it immediately. A background reaper removes stopped containers after `DAIV_SANDBOX_SESSION_GRACE_SECONDS` (default 12h) or once the `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` LRU cap is exceeded.
 
 ```sh
 $ curl -X DELETE \
@@ -299,7 +326,7 @@ $ curl -X DELETE \
 The response will be an empty body with a status code of 204.
 
 > [!TIP]
-> Why closing a sandbox session is important? Because it will remove the container from the host machine, freeing up resources.
+> Why closing a sandbox session is important? By default it stops the container so the next turn can reuse it warm; the background reaper later removes it to free resources. Pass `?force=true` to remove it right away.
 
 ## Contributing
 
