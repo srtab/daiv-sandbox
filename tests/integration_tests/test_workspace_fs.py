@@ -248,3 +248,114 @@ def test_delete_directory_reports_is_a_directory(client, workspace_session):
     body = d.json()
     assert body["ok"] is False
     assert body["error"]["code"] == "is_a_directory"
+
+
+def test_glob_prunes_caches_but_keeps_dependency_source(client, workspace_session):
+    """Default pruning skips cache/VCS junk (incl. __pycache__ inside deps) but still returns
+    dependency source under node_modules (not a default-pruned dir)."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "mkdir -p /workspace/tmp/pkg/__pycache__ /workspace/tmp/.ruff_cache "
+                "/workspace/tmp/node_modules/dep/__pycache__",
+                "printf 'real\\n' > /workspace/tmp/pkg/real.py",
+                # `.py` (not `.pyc`) so it WOULD match **/*.py if __pycache__ were not pruned — proves
+                # the pruning, not just that the glob skips .pyc. One sits inside a kept dependency tree.
+                "printf 'cached\\n' > /workspace/tmp/pkg/__pycache__/cached.py",
+                "printf 'depcache\\n' > /workspace/tmp/node_modules/dep/__pycache__/dep_cached.py",
+                "printf 'junk\\n' > /workspace/tmp/.ruff_cache/x.py",
+                "printf 'depsrc\\n' > /workspace/tmp/node_modules/dep/index.py",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    gl = client.post(f"/session/{sid}/fs/glob", json={"path": "/workspace/tmp", "pattern": "**/*.py"})
+    assert gl.status_code == 200, gl.text
+    paths = {m["path"] for m in gl.json()["matches"]}
+    assert "/workspace/tmp/pkg/real.py" in paths  # real source kept
+    assert "/workspace/tmp/node_modules/dep/index.py" in paths  # dependency source kept
+    assert not any("/__pycache__/" in p for p in paths)  # bytecode dir pruned (incl. inside node_modules)
+    assert not any("/.ruff_cache/" in p for p in paths)  # cache dir pruned
+
+
+def test_glob_request_exclude_prunes_dependency_dir(client, workspace_session):
+    """A per-request exclude adds to the defaults (here: prune node_modules too)."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "mkdir -p /workspace/tmp/node_modules/dep",
+                "printf 'a\\n' > /workspace/tmp/keep.py",
+                "printf 'b\\n' > /workspace/tmp/node_modules/dep/index.py",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    gl = client.post(
+        f"/session/{sid}/fs/glob", json={"path": "/workspace/tmp", "pattern": "**/*.py", "exclude": ["node_modules"]}
+    )
+    assert gl.status_code == 200, gl.text
+    paths = {m["path"] for m in gl.json()["matches"]}
+    assert "/workspace/tmp/keep.py" in paths
+    assert not any("/node_modules/" in p for p in paths)
+
+
+def test_grep_prunes_caches_but_keeps_dependency_source(client, workspace_session):
+    """grep skips reading default-pruned dirs (no NEEDLE from .ruff_cache) but still searches
+    node_modules dependency source; a request exclude can prune node_modules too."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "mkdir -p /workspace/tmp/.ruff_cache /workspace/tmp/node_modules/dep",
+                "printf 'NEEDLE\\n' > /workspace/tmp/real.txt",
+                "printf 'NEEDLE\\n' > /workspace/tmp/.ruff_cache/c.txt",
+                "printf 'NEEDLE\\n' > /workspace/tmp/node_modules/dep/d.txt",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None})
+    assert g.status_code == 200, g.text
+    paths = {m["path"] for m in g.json()["matches"]}
+    assert "/workspace/tmp/real.txt" in paths
+    assert "/workspace/tmp/node_modules/dep/d.txt" in paths  # dependency source searched
+    assert not any("/.ruff_cache/" in p for p in paths)  # cache dir not read
+
+    g2 = client.post(
+        f"/session/{sid}/fs/grep",
+        json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None, "exclude": ["node_modules"]},
+    )
+    assert g2.status_code == 200, g2.text
+    paths2 = {m["path"] for m in g2.json()["matches"]}
+    assert "/workspace/tmp/real.txt" in paths2
+    assert not any("/node_modules/" in p for p in paths2)
+
+
+def test_grep_no_match_in_pruned_tree_returns_empty_not_error(client, workspace_session):
+    """A search whose only candidate files are under pruned dirs returns [] cleanly (the xargs
+    exit-code normalization must not surface a no-match as exec_failed)."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "mkdir -p /workspace/tmp/.ruff_cache",
+                "printf 'NEEDLE\\n' > /workspace/tmp/.ruff_cache/only.txt",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None})
+    assert g.status_code == 200, g.text
+    body = g.json()
+    assert body["error"] is None, body
+    assert body["matches"] == [], body
