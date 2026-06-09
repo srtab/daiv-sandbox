@@ -745,20 +745,23 @@ class SandboxDockerSession:
                     matches.append(GrepHit(file_path, line_no, text))
         return matches
 
-    def find_paths(self, path: str) -> list[DirEntry]:
+    def find_paths(self, path: str, excludes: tuple[str, ...] = ()) -> list[DirEntry]:
         """Recursively enumerate entries under `path` via POSIX `find` (for glob matching).
 
         Uses a busybox-safe type-marker scheme (GNU `find -printf` is unavailable on
         images like alpine): directories are suffixed with ``/D`` and files with ``/F``.
-        Goes through the path guard (require="dir"), so it raises FileNotFoundError when the path
-        does not exist, NotADirectoryError when it exists but is not a directory, and PermissionError
-        when it is not readable/traversable. RuntimeError is raised only when the traversal itself
-        genuinely fails after the guard passes.
+        *excludes* (directory basenames/globs) are pruned via ``_prune_predicate`` so their
+        subtrees are never descended, enumerated, or transported. Goes through the path guard
+        (require="dir"), so it raises FileNotFoundError when the path does not exist,
+        NotADirectoryError when it exists but is not a directory, and PermissionError when it is
+        not readable/traversable. RuntimeError is raised only when the traversal itself genuinely
+        fails after the guard passes.
         """
         quoted = _sh_quote(path)
+        prune = _prune_predicate(excludes)
         body = (
-            f"{{ find {quoted} -mindepth 1 -type d 2>/dev/null | sed 's/$/\\/D/'; "
-            f"find {quoted} -mindepth 1 ! -type d 2>/dev/null | sed 's/$/\\/F/'; }}"
+            f"{{ find {quoted} -mindepth 1 {prune} -type d -print 2>/dev/null | sed 's/$/\\/D/'; "
+            f"find {quoted} -mindepth 1 {prune} ! -type d -print 2>/dev/null | sed 's/$/\\/F/'; }}"
         )
         result = self._run_path_guarded(path, body, require="dir")
         if result.exit_code != 0:

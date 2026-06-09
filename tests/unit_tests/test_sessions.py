@@ -1170,6 +1170,27 @@ def test_find_paths_wrong_type_raises_not_a_directory():
     assert "[ -d " in cmd and f"exit {_PATH_WRONG_TYPE_EXIT}" in cmd
 
 
+def test_find_paths_includes_prune_fragment_in_command():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    s.find_paths("/scratch", excludes=(".git", "__pycache__"))
+    cmd = s.execute_command.call_args.args[0]
+    assert r"-type d \( -name '.git' -o -name '__pycache__' \) -prune -o" in cmd
+    assert "-print" in cmd
+
+
+def test_find_paths_without_excludes_omits_prune_fragment():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    s.find_paths("/scratch")
+    cmd = s.execute_command.call_args.args[0]
+    assert "-prune" not in cmd  # empty predicate => no prune fragment
+    assert "-type d -print" in cmd  # dir pass still present (find's default action made explicit)
+    assert "! -type d -print" in cmd  # file pass still present
+    # NOTE: assert on these fragments, NOT "-mindepth 1 -type d -print": an empty predicate leaves a
+    # double space ("-mindepth 1  -type d") in the command, so a single-space match would falsely fail.
+
+
 def test_grep_permission_denied_raises():
     """grep uses the default guard (require=None): existence + readability only. An unreadable path
     exits 9 -> PermissionError, and the prologue must NOT emit the dir-only wrong-type test."""
