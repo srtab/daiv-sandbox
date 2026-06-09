@@ -576,7 +576,8 @@ async def fs_grep(
         return FsGrepResponse(error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
-            matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob)
+            excludes = (*settings.FS_PRUNE_DIRS, *request.exclude)
+            matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob, excludes)
         except FileNotFoundError:
             return FsGrepResponse(error=FsError(code=FsErrorCode.NOT_FOUND, message=f"No such path: {request.path}"))
         except PermissionError:
@@ -601,7 +602,8 @@ async def fs_glob(
     regex = _glob_to_regex(request.pattern)
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
-            all_entries = await asyncio.to_thread(cmd.find_paths, request.path)
+            excludes = (*settings.FS_PRUNE_DIRS, *request.exclude)
+            all_entries = await asyncio.to_thread(cmd.find_paths, request.path, excludes)
         except FileNotFoundError:
             return FsGlobResponse(
                 error=FsError(code=FsErrorCode.NOT_FOUND, message=f"No such directory: {request.path}")
