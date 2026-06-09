@@ -93,6 +93,23 @@ def _sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def _prune_predicate(excludes: tuple[str, ...]) -> str:
+    """
+    Build a busybox-safe ``find`` fragment that prunes directories matching *excludes* by basename.
+
+    Returns ``-type d \\( -name '<a>' -o -name '<b>' … \\) -prune -o`` (each name ``_sh_quote``'d, so
+    arbitrary input is shell-safe), or ``""`` when *excludes* is empty so callers fall back to their
+    original ``find`` expression. Names are passed to ``find -name``, so each entry is a *basename
+    glob* (e.g. ``*.egg-info`` prunes any such directory at any depth). ``-type d`` is placed before
+    the name group so non-directory nodes short-circuit the whole conjunction and never run the
+    ``-name`` tests (nor the no-op ``-prune``).
+    """
+    if not excludes:
+        return ""
+    names = " -o ".join(f"-name {_sh_quote(name)}" for name in excludes)
+    return rf"-type d \( {names} \) -prune -o"
+
+
 def _validate_sandbox_path(path: str, allowed_roots: tuple[str, ...], *, allow_root: bool = False) -> str:
     """
     Lexically validate that *path* is a safe absolute path under one of *allowed_roots*.

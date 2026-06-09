@@ -1207,3 +1207,32 @@ def test_delete_file_removed_returns_true():
     s = _session_with_container()
     s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
     assert s.delete_file("/scratch/x") is True
+
+
+def test_prune_predicate_empty_returns_empty_string():
+    from daiv_sandbox.sessions import _prune_predicate
+
+    assert _prune_predicate(()) == ""
+
+
+def test_prune_predicate_single_name_has_no_alternation():
+    from daiv_sandbox.sessions import _prune_predicate
+
+    # A single exclude must not emit a dangling `-o`.
+    frag = _prune_predicate(("node_modules",))
+    assert frag == r"-type d \( -name 'node_modules' \) -prune -o"
+
+
+def test_prune_predicate_builds_quoted_name_alternation():
+    from daiv_sandbox.sessions import _prune_predicate
+
+    frag = _prune_predicate((".git", "__pycache__", "*.egg-info"))
+    assert frag == r"-type d \( -name '.git' -o -name '__pycache__' -o -name '*.egg-info' \) -prune -o"
+
+
+def test_prune_predicate_shell_quotes_each_name():
+    from daiv_sandbox.sessions import _prune_predicate
+
+    # A name containing a single quote must be POSIX-escaped, never break out of quoting.
+    frag = _prune_predicate(("a'b",))
+    assert frag == r"""-type d \( -name 'a'"'"'b' \) -prune -o"""
