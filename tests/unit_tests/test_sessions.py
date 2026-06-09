@@ -1203,6 +1203,30 @@ def test_grep_permission_denied_raises():
     assert f"exit {_PATH_WRONG_TYPE_EXIT}" not in cmd  # require=None -> no directory type test
 
 
+def test_grep_directory_branch_uses_find_xargs_with_prune_and_sentinel():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    s.grep("needle", "/scratch", glob=None, excludes=(".git",))
+    cmd = s.execute_command.call_args.args[0]
+    assert "if [ -d '/scratch' ]" in cmd  # directory branch
+    assert r"\( -name '.git' \) -prune -o" in cmd  # pruning applied
+    assert "-type f -print0" in cmd
+    assert "xargs -0 grep -HnF -e 'needle' /dev/null" in cmd  # /dev/null sentinel, literal pattern
+    assert "else grep -HnF -e 'needle' --" in cmd  # single-file fallback branch
+    # Lock the exit-code normalization (xargs collapses grep 1/2 -> 123): only integration tests
+    # exercise it for real, so pin its presence here so a refactor can't silently drop it.
+    assert 'ec=$?; [ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2;' in cmd
+
+
+def test_grep_without_excludes_still_builds_directory_branch():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    s.grep("x", "/scratch", glob=None)
+    cmd = s.execute_command.call_args.args[0]
+    assert "if [ -d '/scratch' ]" in cmd
+    assert "-prune" not in cmd  # empty predicate => no prune fragment
+
+
 def test_read_file_bytes_directory_raises_is_a_directory():
     """Reading a directory must raise IsADirectoryError, not return an inner file's bytes."""
     s = _session_with_container()

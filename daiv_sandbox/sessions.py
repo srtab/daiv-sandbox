@@ -720,20 +720,40 @@ class SandboxDockerSession:
             entries.append(DirEntry(f"{base}/{clean}", is_dir))
         return entries
 
-    def grep(self, pattern: str, path: str, glob: str | None) -> list[GrepHit]:
-        """Literal recursive search via `grep -rHnF`. Returns GrepHit(path, line, text).
+    def grep(self, pattern: str, path: str, glob: str | None, excludes: tuple[str, ...] = ()) -> list[GrepHit]:
+        """Literal recursive search. Returns GrepHit(path, line, text).
 
-        `glob`, when given, restricts results to files whose basename matches it. The
-        filtering is applied host-side (busybox `grep` on minimal images like alpine has
-        no `--include`). grep exit code 1 means "no matches" (returns []); exit >= 2 is a
-        real error and raises RuntimeError. The path guard runs first (existence + readability
-        only, since grep accepts a file or a directory): a genuinely absent path raises
-        FileNotFoundError and an unreadable target raises PermissionError, both distinct from
-        grep's own exit 2. Note grep is recursive with stderr discarded, so an unreadable
-        *subdirectory* under a readable root is silently skipped rather than reported as an error.
+        For a directory target, files are enumerated with a prune-aware ``find`` and piped to
+        ``grep`` (``--exclude-dir`` is GNU-only, so busybox can't prune in grep itself); this makes
+        grep skip *opening* files under excluded directories rather than reading and discarding them.
+        For a single-file target, grep runs directly.
+
+        `glob`, when given, restricts results to files whose basename matches it (applied host-side;
+        busybox grep has no `--include`). `excludes` (directory basenames/globs) are pruned via
+        ``_prune_predicate``.
+
+        Exit handling: the directory branch normalizes ``xargs``'s exit (which collapses grep's `1`
+        "no match" and `2` "read error" into `123`) so the command exits `0` for both match and
+        no-match and only ``>= 2`` for a genuine failure (e.g. grep missing). `grep()` then keeps the
+        original contract: exit ``>= 2`` raises RuntimeError; otherwise output is parsed (empty output
+        → []). A no-match and a rare per-file read error therefore both yield [], consistent with the
+        documented "an unreadable subdirectory under a readable root is silently skipped". The path
+        guard (require=None) still raises FileNotFoundError on a true absence and PermissionError on an
+        unreadable target, distinct from grep's own exits.
         """
         quoted = _sh_quote(path)
-        result = self._run_path_guarded(path, f"grep -rHnF -e {_sh_quote(pattern)} -- {quoted} 2>/dev/null")
+        quoted_pattern = _sh_quote(pattern)
+        prune = _prune_predicate(excludes)
+        body = (
+            f"if [ -d {quoted} ]; then "
+            f"{{ find {quoted} -mindepth 1 {prune} -type f -print0 2>/dev/null || true; }} "
+            f"| xargs -0 grep -HnF -e {quoted_pattern} /dev/null 2>/dev/null; "
+            # xargs collapses grep's 1 (no match) and 2 (read error) into 123, so treat 0/123 as
+            # success and surface anything else (e.g. 127 grep-missing) as exit 2 -> RuntimeError.
+            f'ec=$?; [ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2; '
+            f"else grep -HnF -e {quoted_pattern} -- {quoted} 2>/dev/null; fi"
+        )
+        result = self._run_path_guarded(path, body)
         if result.exit_code >= 2:
             raise RuntimeError(f"grep failed (exit {result.exit_code}) for {path!r}")
         matches: list[GrepHit] = []
