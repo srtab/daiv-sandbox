@@ -86,6 +86,11 @@ codes from `FsErrorCode` in `schemas.py`): absence is `not_found` (distinct from
 listing/no-match), a type mismatch is `not_a_directory`/`is_a_directory`, a malformed path is
 `invalid_path`, and `fs/delete` reports a `removed` boolean. HTTP status codes remain reserved for
 session/transport concerns (404 missing session, 409 lock, 503 infra, 403 auth, 500 unexpected).
+`fs/glob` and `fs/grep` prune a built-in denylist of cache/build dirs (`DAIV_SANDBOX_FS_PRUNE_DIRS`:
+`.git`, `__pycache__`, `.ruff_cache`, `target`, `obj`, …) plus any per-request `exclude`, via a
+basename `find -name … -prune`; dependency _source_ dirs (`node_modules`, `.venv`, `vendor`, `packages`) are
+deliberately kept readable so agents can inspect dependencies. `fs/grep` enumerates files with
+`find … -print0 | xargs -0 grep` (not `grep -r`) so pruned dirs are never opened.
 
 **Untrusted-input handling.** Uploaded archives are sanitised before extraction (`_sanitize_archive_stream`):
 symlinks/hardlinks/device nodes/FIFOs and absolute/`..` paths are rejected, ownership is normalised to
