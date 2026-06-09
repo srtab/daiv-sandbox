@@ -1213,9 +1213,13 @@ def test_grep_directory_branch_uses_find_xargs_with_prune_and_sentinel():
     assert "-type f -print0" in cmd
     assert "xargs -0 grep -HnF -e 'needle' /dev/null" in cmd  # /dev/null sentinel, literal pattern
     assert "else grep -HnF -e 'needle' --" in cmd  # single-file fallback branch
-    # Lock the exit-code normalization (xargs collapses grep 1/2 -> 123): only integration tests
-    # exercise it for real, so pin its presence here so a refactor can't silently drop it.
-    assert 'ec=$?; [ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2;' in cmd
+    # Lock the read-error contract (only integration tests exercise it for real, so pin its shape
+    # here so a refactor can't silently drop it): grep's stderr is captured via the fd-swap while
+    # matches flow through fd 3, and a non-empty capture surfaces the read error as exit 2.
+    assert "2>&1 1>&3 3>&-) 3>&1;" in cmd  # fd-swap: capture grep stderr, keep matches on stdout
+    assert 'ec=$?; [ -z "$errs" ] || exit 2;' in cmd  # unreadable file -> surface, not swallow
+    # And the xargs exit-code normalization (xargs collapses grep 1/2 -> 123) stays after it.
+    assert '[ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2;' in cmd
 
 
 def test_grep_without_excludes_still_builds_directory_branch():

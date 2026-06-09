@@ -732,25 +732,34 @@ class SandboxDockerSession:
         busybox grep has no `--include`). `excludes` (directory basenames/globs) are pruned via
         ``_prune_predicate``.
 
-        Exit handling: the directory branch normalizes ``xargs``'s exit (which collapses grep's `1`
-        "no match" and `2` "read error" into `123`) so the command exits `0` for both match and
-        no-match and only ``>= 2`` for a genuine failure (e.g. grep missing). `grep()` then keeps the
-        original contract: exit ``>= 2`` raises RuntimeError; otherwise output is parsed (empty output
-        → []). A no-match and a rare per-file read error therefore both yield [], consistent with the
-        documented "an unreadable subdirectory under a readable root is silently skipped". The path
-        guard (require=None) still raises FileNotFoundError on a true absence and PermissionError on an
-        unreadable target, distinct from grep's own exits.
+        Read-error contract: a file ``grep`` is asked to search but cannot read (EACCES, or a file
+        that vanished in the find->grep window) is surfaced, not swallowed. ``xargs`` collapses
+        grep's exit 1 (no match) and 2 (read error) into a single 123, so the read error can't be
+        told apart from the exit code alone; instead grep's stderr is captured into a shell variable
+        (matches still flow to stdout via fd 3) and a non-empty capture forces exit 2 -> RuntimeError.
+        This matches the previous ``grep -rHnF`` (which exited 2 on a per-file read error) and the
+        single-file branch below (which raises on grep's own exit >= 2). An unreadable *subdirectory*
+        met while traversing is still silently skipped: ``find``'s stderr is discarded, so it is
+        never enumerated and never reaches grep. With no read error, exit 0 (match) and 123 (no
+        match) both parse the output (empty -> []); any other code (e.g. 127 grep-missing) raises.
+        The path guard (require=None) still raises FileNotFoundError on a true absence and
+        PermissionError on an unreadable *target*, distinct from grep's own exits.
         """
         quoted = _sh_quote(path)
         quoted_pattern = _sh_quote(pattern)
         prune = _prune_predicate(excludes)
         body = (
             f"if [ -d {quoted} ]; then "
-            f"{{ find {quoted} -mindepth 1 {prune} -type f -print0 2>/dev/null || true; }} "
-            f"| xargs -0 grep -HnF -e {quoted_pattern} /dev/null 2>/dev/null; "
-            # xargs collapses grep's 1 (no match) and 2 (read error) into 123, so treat 0/123 as
-            # success and surface anything else (e.g. 127 grep-missing) as exit 2 -> RuntimeError.
-            f'ec=$?; [ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2; '
+            # Capture grep's stderr (per-file read errors) into `errs` while matches flow to the real
+            # stdout via fd 3; `find`'s own stderr stays discarded, so an unreadable *subdirectory* is
+            # silently skipped, but a file grep cannot read leaves a message in `errs`.
+            f"errs=$({{ {{ find {quoted} -mindepth 1 {prune} -type f -print0 2>/dev/null || true; }} "
+            f"| xargs -0 grep -HnF -e {quoted_pattern} /dev/null; }} 2>&1 1>&3 3>&-) 3>&1; "
+            # A non-empty `errs` means a searched file couldn't be read -> surface it as exit 2.
+            f'ec=$?; [ -z "$errs" ] || exit 2; '
+            # No read error: xargs collapsed grep's 1 (no match) and 2 into 123, so 0/123 are both
+            # success here; anything else (e.g. 127 grep-missing) becomes exit 2 -> RuntimeError.
+            f'[ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2; '
             f"else grep -HnF -e {quoted_pattern} -- {quoted} 2>/dev/null; fi"
         )
         result = self._run_path_guarded(path, body)

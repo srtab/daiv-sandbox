@@ -359,3 +359,77 @@ def test_grep_no_match_in_pruned_tree_returns_empty_not_error(client, workspace_
     body = g.json()
     assert body["error"] is None, body
     assert body["matches"] == [], body
+
+
+def test_grep_surfaces_unreadable_file_as_error(client, workspace_session):
+    """A file grep cannot read must surface as an error, not be silently dropped or returned as a
+    partial result. The old `grep -r` exited 2 on a per-file read error; the find|xargs pipeline
+    must preserve that contract (xargs collapses grep 1/2 into 123, so the read error has to be
+    recovered from grep's stderr). Here a readable match coexists with an unreadable file: the whole
+    grep must surface exec_failed rather than returning only the readable match as if complete."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "printf 'NEEDLE readable\\n' > /workspace/tmp/ok.txt",
+                "printf 'NEEDLE locked\\n' > /workspace/tmp/locked.txt",
+                "chmod 000 /workspace/tmp/locked.txt",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None})
+    assert g.status_code == 200, g.text
+    body = g.json()
+    assert body["error"] is not None, body
+    assert body["error"]["code"] == "exec_failed", body
+
+
+def test_glob_and_grep_prune_egg_info_glob_default_at_depth(client, workspace_session):
+    """The default prune list includes the *glob* entry `*.egg-info` (not a literal name). busybox
+    `find -name '*.egg-info' -prune` must match it at any depth — for both glob and grep — which a
+    mis-quoted `*` (escaped so the shell never expands it) would silently break."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "mkdir -p /workspace/tmp/src/mypkg.egg-info",
+                "printf 'NEEDLE\\n' > /workspace/tmp/src/keep.txt",
+                "printf 'NEEDLE\\n' > /workspace/tmp/src/mypkg.egg-info/PKG-INFO.txt",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    gl = client.post(f"/session/{sid}/fs/glob", json={"path": "/workspace/tmp", "pattern": "**/*.txt"})
+    assert gl.status_code == 200, gl.text
+    gl_paths = {m["path"] for m in gl.json()["matches"]}
+    assert "/workspace/tmp/src/keep.txt" in gl_paths
+    assert not any(".egg-info/" in p for p in gl_paths)  # glob-form default pruned at depth
+
+    g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None})
+    assert g.status_code == 200, g.text
+    g_paths = {m["path"] for m in g.json()["matches"]}
+    assert "/workspace/tmp/src/keep.txt" in g_paths
+    assert not any(".egg-info/" in p for p in g_paths)  # grep never opens files inside it either
+
+
+def test_grep_single_file_target(client, workspace_session):
+    """grep against a file path (not a directory) takes the single-file branch and returns matches
+    with the same path:line:text shape as the directory branch."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/", json={"commands": ["printf 'alpha\\nNEEDLE here\\nomega\\n' > /workspace/tmp/single.txt"]}
+    )
+    assert run.status_code == 200, run.text
+
+    g = client.post(
+        f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp/single.txt", "glob": None}
+    )
+    assert g.status_code == 200, g.text
+    body = g.json()
+    assert body["error"] is None, body
+    assert body["matches"] == [{"path": "/workspace/tmp/single.txt", "line": 2, "text": "NEEDLE here"}], body
