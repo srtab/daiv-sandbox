@@ -1281,3 +1281,12 @@ def test_prune_predicate_shell_quotes_each_name():
     # A name containing a single quote must be POSIX-escaped, never break out of quoting.
     frag = _prune_predicate(("a'b",))
     assert frag == r"""-type d \( -name 'a'"'"'b' \) -prune -o"""
+
+
+def test_fs_glob_grep_requests_default_exclude_to_empty_list():
+    from daiv_sandbox.schemas import FsGlobRequest, FsGrepRequest
+
+    assert FsGlobRequest(path="/workspace", pattern="**/*.py").exclude == []
+    assert FsGrepRequest(path="/workspace", pattern="x").exclude == []
+    assert FsGlobRequest(path="/workspace", pattern="*", exclude=["node_modules"]).exclude == ["node_modules"]
+    assert FsGrepRequest(path="/workspace", pattern="x", exclude=["node_modules"]).exclude == ["node_modules"]
