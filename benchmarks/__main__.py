@@ -38,14 +38,16 @@ def main(argv: list[str] | None = None) -> int:
         print("error: no API key (set DAIV_SANDBOX_API_KEY or pass --api-key)", file=sys.stderr)
         return 2
 
-    corpora = [fetch_repo_corpus(r.owner, r.repo, r.sha, r.name, _CACHE_DIR) for r in REPOS if r.name in args.corpora]
-    if not corpora:
+    selected_repos = [r for r in REPOS if r.name in args.corpora]
+    if not selected_repos:
         print(f"error: no corpora matched {args.corpora}", file=sys.stderr)
         return 2
 
     with BenchClient(args.base_url, args.api_key, root_path=args.root_path) as client:
-        service_version = client.version()  # connectivity smoke check
+        service_version = client.version()  # connectivity smoke check (before downloading corpora)
         print(f"connected to {args.base_url} (service version {service_version})")
+
+        corpora = [fetch_repo_corpus(r.owner, r.repo, r.sha, r.name, _CACHE_DIR) for r in selected_repos]
         for c in corpora:
             print(f"corpus {c.name}: {c.file_count} files")
 
@@ -65,18 +67,18 @@ def main(argv: list[str] | None = None) -> int:
                     fs_results[f"{c.name}/{label}"] = samples
             groups["fs"] = fs_results
 
-    meta = {
-        "service_version": service_version,
-        "base_url": args.base_url,
-        "base_image": args.base_image,
-        "warmup": args.warmup,
-        "iterations": args.iterations,
-        "corpora": {c.name: c.file_count for c in corpora},
-        "repos": {r.name: f"{r.owner}/{r.repo}@{r.sha}" for r in REPOS if r.name in args.corpora},
-    }
-    md_path, json_path = report.write(args.output_dir, meta, groups)
-    print(f"wrote {md_path}")
-    print(f"wrote {json_path}")
+        meta = {
+            "service_version": service_version,
+            "base_url": args.base_url,
+            "base_image": args.base_image,
+            "warmup": args.warmup,
+            "iterations": args.iterations,
+            "corpora": {c.name: c.file_count for c in corpora},
+            "repos": {r.name: f"{r.owner}/{r.repo}@{r.sha}" for r in selected_repos},
+        }
+        md_path, json_path = report.write(args.output_dir, meta, groups)
+        print(f"wrote {md_path}")
+        print(f"wrote {json_path}")
     return 0
 
 
