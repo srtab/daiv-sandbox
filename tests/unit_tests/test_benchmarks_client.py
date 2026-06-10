@@ -1,6 +1,7 @@
 import base64
 
 import httpx
+import pytest
 
 from benchmarks.client import BenchClient
 from daiv_sandbox.schemas import FsWriteRequest
@@ -60,3 +61,22 @@ def test_seed_posts_multipart():
 
     with _client(handler) as client:
         client.seed("sid-9", b"\x1f\x8btarball-bytes")
+
+
+def test_delete_session_tolerates_404():
+    def handler(request):
+        assert request.method == "DELETE"
+        assert request.url.path == "/session/gone/"
+        assert request.url.params["force"] == "true"
+        return httpx.Response(404, json={"detail": "not found"})
+
+    with _client(handler) as client:
+        client.delete_session("gone")  # 404 must NOT raise
+
+
+def test_delete_session_raises_on_server_error():
+    def handler(request):
+        return httpx.Response(500, json={"detail": "boom"})
+
+    with _client(handler) as client, pytest.raises(httpx.HTTPStatusError):
+        client.delete_session("sid-err")

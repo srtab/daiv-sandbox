@@ -65,6 +65,6 @@ class BenchClient:
         return resp.json()
 
     def delete_session(self, session_id: str, *, force: bool = True) -> None:
-        resp = self._client.delete(f"/session/{session_id}/", params={"force": str(force).lower()})
-        if resp.status_code not in (200, 204, 404):
+        resp = self._client.delete(f"/session/{session_id}/", params={"force": force})
+        if resp.status_code not in (200, 204, 404):  # 204 = success, 404 = already gone, 200 = proxy-rewrapped
             resp.raise_for_status()
