@@ -8,6 +8,7 @@ from benchmarks.corpus import Corpus, make_probe_content
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
 from daiv_sandbox.schemas import (
     FsDeleteRequest,
     FsEditRequest,
@@ -78,7 +79,7 @@ def run_fs_suite(
         # Discover the codeload wrapper dir so `ls` targets a realistically populated directory.
         ls_root = client.fs(session_id, "ls", FsLsRequest(path=SANDBOX_REPO))
         entries = ls_root.get("entries", [])
-        ls_target = entries[0]["path"] if entries else SANDBOX_REPO
+        ls_target = next((e["path"] for e in entries if e.get("is_dir")), SANDBOX_REPO)
 
         results["ls"] = measure(
             lambda: client.fs(session_id, "ls", FsLsRequest(path=ls_target)), warmup=warmup, iterations=iterations
@@ -121,11 +122,12 @@ def _measure_read(client, session_id, label, size, *, warmup, iterations) -> lis
 
 def _measure_write(client, session_id, label, size, *, warmup, iterations) -> list[float]:
     content = _b64(make_probe_content(size))
-    counter = {"i": 0}
+    write_count = 0
 
     def call():
-        counter["i"] += 1
-        path = f"{SCRATCH}/write_{label}_{counter['i']}.bin"  # unique path: never hits already_exists
+        nonlocal write_count
+        write_count += 1
+        path = f"{SCRATCH}/write_{label}_{write_count}.bin"  # unique path: never hits already_exists
         client.fs(session_id, "write", FsWriteRequest(path=path, content=content))
 
     return measure(call, warmup=warmup, iterations=iterations)
@@ -133,11 +135,9 @@ def _measure_write(client, session_id, label, size, *, warmup, iterations) -> li
 
 def _measure_edit(client, session_id, label, size, *, warmup, iterations) -> list[float]:
     content = _b64(make_probe_content(size, marker=_EDIT_MARKER))
-    counter = {"i": 0}
     samples: list[float] = []
     for i in range(warmup + iterations):
-        counter["i"] += 1
-        path = f"{SCRATCH}/edit_{label}_{counter['i']}.txt"
+        path = f"{SCRATCH}/edit_{label}_{i}.txt"
         client.fs(session_id, "write", FsWriteRequest(path=path, content=content))  # untimed setup
         start = time.perf_counter()
         client.fs(session_id, "edit", FsEditRequest(path=path, old=_EDIT_MARKER, new="NEW_MARKER"))
