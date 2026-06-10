@@ -125,6 +125,9 @@ def _measure_write(client, session_id, label, size, *, warmup, iterations) -> li
     write_count = 0
 
     def call():
+        # NOTE: the timed region includes client-side base64 (re)serialization of `content`
+        # (~1 ms for the 512 KB probe). Negligible vs write latency, but absolute large-`write`
+        # numbers carry this small, size-correlated client cost.
         nonlocal write_count
         write_count += 1
         path = f"{SCRATCH}/write_{label}_{write_count}.bin"  # unique path: never hits already_exists
