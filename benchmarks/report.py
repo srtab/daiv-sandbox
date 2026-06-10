@@ -55,10 +55,10 @@ def render(meta: dict, groups: dict[str, dict[str, list[float]]]) -> tuple[str, 
 def write(out_dir: Path, meta: dict, groups: dict[str, dict[str, list[float]]]) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    meta = {"generated_at": stamp, **meta}
+    meta = {**meta, "generated_at": stamp}
     markdown, obj = render(meta, groups)
     md_path = out_dir / f"{stamp}.md"
     json_path = out_dir / f"{stamp}.json"
-    md_path.write_text(markdown)
-    json_path.write_text(json.dumps(obj, indent=2))
+    md_path.write_text(markdown, encoding="utf-8")
+    json_path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
     return md_path, json_path

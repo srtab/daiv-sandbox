@@ -25,3 +25,11 @@ def test_write_emits_md_and_json(tmp_path):
     loaded = json.loads(json_path.read_text())
     assert loaded["groups"]["fs"]["grep"]["summary"]["n"] == 3
     assert md_path.stem == json_path.stem  # same timestamp basename
+
+
+def test_write_stamp_wins_over_caller_generated_at(tmp_path):
+    # write() owns the timestamp: a caller-supplied generated_at must not survive.
+    md_path, json_path = write(tmp_path, {"generated_at": "caller-value"}, _groups())
+    loaded = json.loads(json_path.read_text(encoding="utf-8"))
+    assert loaded["meta"]["generated_at"] != "caller-value"
+    assert loaded["meta"]["generated_at"] == md_path.stem  # equals the filename stamp
