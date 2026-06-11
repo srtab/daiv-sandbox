@@ -752,11 +752,18 @@ class SandboxDockerSession:
             f"if [ -d {quoted} ]; then "
             # Capture grep's stderr (per-file read errors) into `errs` while matches flow to the real
             # stdout via fd 3; `find`'s own stderr stays discarded, so an unreadable *subdirectory* is
-            # silently skipped, but a file grep cannot read leaves a message in `errs`.
+            # silently skipped, but a file grep cannot read leaves a message in `errs`. fd 3 is opened
+            # in *this* shell with `exec 3>&1` (then closed afterwards) rather than via a `3>&1`
+            # redirection on the assignment: bash does not make a redirection attached to an
+            # assignment-only command visible inside its command substitution, so the inline form
+            # left fd 3 closed under bash (`1>&3` -> "Bad file descriptor"), swallowing every match
+            # and forcing a spurious exit 2. `exec 3>&1` works identically across bash, dash and
+            # busybox ash. fd 3 must be closed *after* `ec=$?` so the close can't clobber the status.
+            f"exec 3>&1; "
             f"errs=$({{ {{ find {quoted} -mindepth 1 {prune} -type f -print0 2>/dev/null || true; }} "
-            f"| xargs -0 grep -HnF -e {quoted_pattern} /dev/null; }} 2>&1 1>&3 3>&-) 3>&1; "
+            f"| xargs -0 grep -HnF -e {quoted_pattern} /dev/null; }} 2>&1 1>&3 3>&-); ec=$?; exec 3>&-; "
             # A non-empty `errs` means a searched file couldn't be read -> surface it as exit 2.
-            f'ec=$?; [ -z "$errs" ] || exit 2; '
+            f'[ -z "$errs" ] || exit 2; '
             # No read error: xargs collapsed grep's 1 (no match) and 2 into 123, so 0/123 are both
             # success here; anything else (e.g. 127 grep-missing) becomes exit 2 -> RuntimeError.
             f'[ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2; '

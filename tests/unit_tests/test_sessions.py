@@ -1216,8 +1216,14 @@ def test_grep_directory_branch_uses_find_xargs_with_prune_and_sentinel():
     # Lock the read-error contract (only integration tests exercise it for real, so pin its shape
     # here so a refactor can't silently drop it): grep's stderr is captured via the fd-swap while
     # matches flow through fd 3, and a non-empty capture surfaces the read error as exit 2.
-    assert "2>&1 1>&3 3>&-) 3>&1;" in cmd  # fd-swap: capture grep stderr, keep matches on stdout
-    assert 'ec=$?; [ -z "$errs" ] || exit 2;' in cmd  # unreadable file -> surface, not swallow
+    # fd 3 MUST be opened with a standalone `exec 3>&1` (not a `3>&1` redirection on the assignment):
+    # bash does not expose an assignment-command redirection inside its command substitution, so the
+    # inline form left fd 3 closed under bash (`1>&3` -> "Bad file descriptor"), breaking every
+    # directory grep on images that ship /bin/bash. Pin the portable form here so it can't regress.
+    assert "exec 3>&1; errs=$(" in cmd  # fd 3 opened in the parent shell, visible to the substitution
+    assert "2>&1 1>&3 3>&-); ec=$?; exec 3>&-;" in cmd  # capture stderr, keep matches on stdout, then close fd 3
+    assert "3>&1;" not in cmd.replace("exec 3>&1;", "")  # the broken assignment-redirection form is gone
+    assert '[ -z "$errs" ] || exit 2;' in cmd  # unreadable file -> surface, not swallow
     # And the xargs exit-code normalization (xargs collapses grep 1/2 -> 123) stays after it.
     assert '[ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2;' in cmd
 

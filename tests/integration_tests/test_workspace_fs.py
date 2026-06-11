@@ -433,3 +433,27 @@ def test_grep_single_file_target(client, workspace_session):
     body = g.json()
     assert body["error"] is None, body
     assert body["matches"] == [{"path": "/workspace/tmp/single.txt", "line": 2, "text": "NEEDLE here"}], body
+
+
+def test_grep_directory_works_when_pipefail_wrapper_selects_bash(client, sandbox_session):
+    """Regression: the directory-branch stderr capture must work under bash, not just busybox/dash.
+
+    The capture idiom feeds grep's stderr into `errs` while matches flow to the real stdout via fd 3.
+    The original form put the `3>&1` on an assignment-only command (`errs=$(... 1>&3 ...) 3>&1`), which
+    busybox ash and dash honour but bash does NOT: bash never opens fd 3 for the command substitution,
+    so `1>&3` fails with "3: Bad file descriptor". That bogus stderr made `errs` non-empty (-> exit 2 ->
+    exec_failed) AND swallowed every match. `PIPEFAIL_WRAPPER` prefers /bin/bash, so any sandbox image
+    that ships it (python/node/debian/ubuntu) had a wholly broken directory grep — yet the suite only
+    exercised alpine (no /bin/bash), so it slipped through. debian:bookworm-slim ships /bin/bash and
+    reproduces the failure; the fix must return the match here with no error."""
+    sid = sandbox_session(base_image="debian:bookworm-slim")
+    run = client.post(
+        f"/session/{sid}/", json={"commands": ["printf 'import os\\nNEEDLE here\\n' > /workspace/tmp/a.py"]}
+    )
+    assert run.status_code == 200, run.text
+
+    g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None})
+    assert g.status_code == 200, g.text
+    body = g.json()
+    assert body["error"] is None, body
+    assert body["matches"] == [{"path": "/workspace/tmp/a.py", "line": 2, "text": "NEEDLE here"}], body
