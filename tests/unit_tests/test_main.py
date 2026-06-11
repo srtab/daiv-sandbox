@@ -1215,3 +1215,36 @@ def test_glob_to_regex_table():
     ]
     for pat, s, expected in cases:
         assert bool(_glob_to_regex(pat).match(s)) is expected, (pat, s)
+
+
+def test_fs_glob_forwards_default_plus_request_excludes(mock_session, client, monkeypatch):
+    from daiv_sandbox import main
+    from daiv_sandbox.sessions import DirEntry
+
+    monkeypatch.setattr(main.settings, "FS_PRUNE_DIRS", [".git", "__pycache__"])
+    mock_session.find_paths.return_value = [DirEntry("/workspace/tmp/a.py", False)]
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/glob",
+        json={"path": "/workspace/tmp", "pattern": "*.py", "exclude": ["node_modules"]},
+    )
+    assert resp.status_code == 200, resp.text
+    # excludes is index 1 of find_paths(path, excludes); accept a kwarg form too for refactor safety.
+    call = mock_session.find_paths.call_args
+    passed = call.args[1] if len(call.args) > 1 else call.kwargs["excludes"]
+    assert tuple(passed) == (".git", "__pycache__", "node_modules")
+
+
+def test_fs_grep_forwards_default_plus_request_excludes(mock_session, client, monkeypatch):
+    from daiv_sandbox import main
+
+    monkeypatch.setattr(main.settings, "FS_PRUNE_DIRS", [".git"])
+    mock_session.grep.return_value = []
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/grep",
+        json={"path": "/workspace/tmp", "pattern": "x", "exclude": ["vendor"]},
+    )
+    assert resp.status_code == 200, resp.text
+    # excludes is index 3 of grep(pattern, path, glob, excludes); accept a kwarg form too for refactor safety.
+    call = mock_session.grep.call_args
+    passed = call.args[3] if len(call.args) > 3 else call.kwargs["excludes"]
+    assert tuple(passed) == (".git", "vendor")

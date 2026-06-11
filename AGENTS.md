@@ -13,8 +13,7 @@ the Docker SDK, Pydantic, and the `uv` package manager.
 
 ```bash
 make test          # uv run --all-extras pytest -s tests  (unit + integration, with coverage)
-make lint          # ruff check + ruff format --check + pyproject-fmt --check
-make lint-fix      # auto-fix ruff + format + pyproject-fmt
+make lint-fix      # check lint and auto-fix ruff + format + pyproject-fmt
 make lint-typing   # mypy on daiv_sandbox/
 make run           # fastapi dev on port 8888 (reload)
 ```

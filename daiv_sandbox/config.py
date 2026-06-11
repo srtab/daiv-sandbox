@@ -52,8 +52,49 @@ class Settings(BaseSettings):
     # compose-service name resolution that overriding resolv.conf (see DNS) would otherwise drop.
     # Ignored under runc. Names that fail to resolve are skipped with a warning.
     EXTRA_HOSTS: Annotated[list[str], NoDecode] = []
+    # Directory basenames/globs pruned by default from fs/glob and fs/grep traversals (comma-separated
+    # env, e.g. ".git,__pycache__"). These are caches, IDE/VCS metadata, and build output that is never
+    # hand-authored source and never dependency *source* — matching is basename-based via `find -name`,
+    # so each entry prunes that dir at any depth (including inside dependency trees, e.g. a `__pycache__`
+    # nested in `.venv`). Dependency-source dirs (node_modules, .venv, vendor, packages, …) are
+    # deliberately NOT listed so an agent can still read dependency implementations; callers prune those
+    # per-request via the `exclude` field. Setting this env REPLACES the baseline below.
+    FS_PRUNE_DIRS: Annotated[list[str], NoDecode] = [
+        ".git",
+        ".hg",
+        ".svn",
+        ".idea",
+        ".vs",
+        "__pycache__",
+        ".ruff_cache",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".pyre",
+        ".pytype",
+        ".hypothesis",
+        ".ipynb_checkpoints",
+        "*.egg-info",
+        ".eggs",
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+        ".turbo",
+        ".parcel-cache",
+        ".angular",
+        ".vite",
+        ".astro",
+        ".docusaurus",
+        ".cache",
+        ".phpunit.cache",
+        ".gradle",
+        # `target`/`obj` are the only ambiguous bare names here (build output for Maven/Gradle and
+        # .NET MSBuild respectively); included by design despite the small chance of colliding with a
+        # user-named source dir. Everything else above is unambiguous by name.
+        "target",
+        "obj",
+    ]
 
-    @field_validator("DNS", "EXTRA_HOSTS", mode="before")
+    @field_validator("DNS", "EXTRA_HOSTS", "FS_PRUNE_DIRS", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:
         """Accept comma-separated env strings (e.g. "1.1.1.1,8.8.8.8") for list settings."""

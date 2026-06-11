@@ -63,6 +63,7 @@ All settings are configurable via environment variables. The available settings 
 | **DAIV_SANDBOX_NETWORK**                      | Docker network that network-enabled sessions attach to. Sessions without networking stay isolated (`network_mode=none`); when unset, network-enabled sessions use Docker's default network.                                                                       | Optional                                                                    |
 | **DAIV_SANDBOX_DNS**                          | Comma-separated DNS resolvers written into a network-enabled session's `/etc/resolv.conf` under `runsc`, since gVisor can't reach Docker's embedded resolver (`127.0.0.11`). Ignored under `runc`.                                                                | Default: `1.1.1.1,8.8.8.8`                                                  |
 | **DAIV_SANDBOX_EXTRA_HOSTS**                  | Comma-separated sibling hostnames (e.g. `gitlab`) resolved at session start and injected as static `/etc/hosts` entries in network-enabled `runsc` sessions, restoring compose-service name resolution dropped by the resolv.conf override. Ignored under `runc`. | Optional                                                                    |
+| **DAIV_SANDBOX_FS_PRUNE_DIRS**                | Comma-separated directory basenames/globs pruned by default from `fs/glob`/`fs/grep` (caches/metadata/build output). Excludes dependency-source dirs so agents can read deps. Setting this replaces the baseline entirely.                                        | Default: `.git,__pycache__,…`                                               |
 | **DAIV_SANDBOX_COMMAND_TIMEOUT**              | Default per-command timeout in seconds. `0` disables the default. Overridable per request via `timeout`.                                                                                                                                                          | Default: 0                                                                  |
 | **DAIV_SANDBOX_REDIS_URL**                    | Redis URL used for cross-replica per-session locking. When unset, an in-process lock is used.                                                                                                                                                                     | Optional                                                                    |
 | **DAIV_SANDBOX_SESSION_LOCK_TTL_SECONDS**     | TTL (seconds) of the per-session lock when Redis-backed.                                                                                                                                                                                                          | Default: 900                                                                |
@@ -173,17 +174,25 @@ The response is an empty body with status `204`.
 
 To inspect or modify files without spawning a shell, use the `POST /session/{session_id}/fs/{op}` endpoints. They operate anywhere under `/workspace` (`repo/`, `skills/`, `tmp/`) and are Python-free — content moves via the Docker archive API and search/listing uses POSIX `grep`/`find`/`ls`/`rm`, so they work even on base images without a Python interpreter (e.g. `alpine`).
 
-| Op       | Body                             | Returns                                |
-| -------- | -------------------------------- | -------------------------------------- |
-| `ls`     | `{path}`                         | directory entries + `error?`           |
-| `read`   | `{path, offset?, limit?}`        | utf-8 text or base64 binary + `error?` |
-| `grep`   | `{pattern, path, glob?}`         | literal-substring matches + `error?`   |
-| `glob`   | `{pattern, path}`                | paths matching the glob + `error?`     |
-| `write`  | `{path, content, mode?}`         | `{ok, error?}`                         |
-| `edit`   | `{path, old, new, replace_all?}` | `{occurrences, error?}`                |
-| `delete` | `{path}`                         | `{ok, removed, error?}`                |
+| Op       | Body                               | Returns                                |
+| -------- | ---------------------------------- | -------------------------------------- |
+| `ls`     | `{path}`                           | directory entries + `error?`           |
+| `read`   | `{path, offset?, limit?}`          | utf-8 text or base64 binary + `error?` |
+| `grep`   | `{pattern, path, glob?, exclude?}` | literal-substring matches + `error?`   |
+| `glob`   | `{pattern, path, exclude?}`        | paths matching the glob + `error?`     |
+| `write`  | `{path, content, mode?}`           | `{ok, error?}`                         |
+| `edit`   | `{path, old, new, replace_all?}`   | `{occurrences, error?}`                |
+| `delete` | `{path}`                           | `{ok, removed, error?}`                |
 
 `path` must be absolute and under `/workspace`; the file ops (`write`/`edit`/`read`/`delete`) target a file, while the directory ops (`ls`/`grep`/`glob`) may also target the `/workspace` root itself. `content` is base64-encoded.
+
+`fs/grep` and `fs/glob` prune common cache/build directories by default (configurable via
+`DAIV_SANDBOX_FS_PRUNE_DIRS`) so results aren't swamped by `.git`, `__pycache__`, `.ruff_cache`,
+`target`, `obj`, and similar tooling artifacts. Dependency _source_ directories (`node_modules`,
+`.venv`, `vendor`, `packages`) are **not** pruned by default so an agent can still read dependency
+implementations; pass `exclude` (e.g. `["node_modules"]`) to prune them per request. Prune matching
+is by directory basename at any depth, so a glob pattern that descends into a pruned directory
+returns nothing.
 
 Every response carries an `error` field with the shape `{code, message}` when the operation fails — `null` on success. `code` is one of the stable `FsErrorCode` values:
 

@@ -380,25 +380,24 @@ def test_copy_to_runtime_creates_directory(mock_docker_client):
 
     session = SandboxDockerSession()
     session.container = MagicMock()
-    session.container.exec_run.side_effect = [
-        ExecResult(exit_code=0, output=b""),  # rm
-        ExecResult(exit_code=0, output=b""),  # mkdir
-        ExecResult(exit_code=0, output=b""),  # chmod
-        ExecResult(exit_code=0, output=b""),  # chown
-    ]
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session.container.put_archive.return_value = True
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:
         ti = tarfile.TarInfo("a.txt")
         ti.size = 0
         tf.addfile(ti, io.BytesIO(b""))
     session.copy_to_container(buf)
-    # Should use SANDBOX_ROOT by default
+    # Clears (rm), then creates the dest as the sandbox user (so a fresh dir needs no chown), then
+    # ships the sanitized archive. No recursive chmod/chown: the sanitizer stamps uid/gid/mode and
+    # put_archive preserves them.
     session.container.exec_run.assert_any_call(["/bin/sh", "-c", ANY], user="root")
-    session.container.exec_run.assert_any_call(["mkdir", "-p", "--", SANDBOX_ROOT], user="root")
-    session.container.exec_run.assert_any_call(["chmod", "-R", "a+rX,u+w", "--", SANDBOX_ROOT], user="root")
     session.container.exec_run.assert_any_call(
-        ["chown", "-R", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", SANDBOX_ROOT], user="root"
+        ["mkdir", "-p", "--", SANDBOX_ROOT], user=f"{settings.RUN_UID}:{settings.RUN_GID}"
     )
+    assert session.container.put_archive.called
+    verbs = [c.args[0][0] for c in session.container.exec_run.call_args_list if c.args and c.args[0]]
+    assert "chmod" not in verbs and "chown" not in verbs
 
 
 def test_execute_command(mock_docker_client):
@@ -441,12 +440,8 @@ def test_copy_to_container_with_relative_dest(mock_docker_client):
 
     session = SandboxDockerSession()
     session.container = MagicMock()
-    session.container.exec_run.side_effect = [
-        ExecResult(exit_code=0, output=b""),  # rm
-        ExecResult(exit_code=0, output=b""),  # mkdir
-        ExecResult(exit_code=0, output=b""),  # chmod
-        ExecResult(exit_code=0, output=b""),  # chown
-    ]
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
+    session.container.put_archive.return_value = True
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:
         ti = tarfile.TarInfo("a.txt")
@@ -455,11 +450,11 @@ def test_copy_to_container_with_relative_dest(mock_docker_client):
     session.copy_to_container(buf, dest="subdir")
     expected_path = f"{SANDBOX_ROOT}/subdir"
     session.container.exec_run.assert_any_call(["/bin/sh", "-c", ANY], user="root")
-    session.container.exec_run.assert_any_call(["mkdir", "-p", "--", expected_path], user="root")
-    session.container.exec_run.assert_any_call(["chmod", "-R", "a+rX,u+w", "--", expected_path], user="root")
     session.container.exec_run.assert_any_call(
-        ["chown", "-R", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", expected_path], user="root"
+        ["mkdir", "-p", "--", expected_path], user=f"{settings.RUN_UID}:{settings.RUN_GID}"
     )
+    verbs = [c.args[0][0] for c in session.container.exec_run.call_args_list if c.args and c.args[0]]
+    assert "chmod" not in verbs and "chown" not in verbs
 
 
 def test_execute_command_with_relative_workdir(mock_docker_client):
@@ -546,33 +541,87 @@ def test_sanitize_archive_stream_skips_hardlinks():
     assert "hardlink.txt" not in names
 
 
-def test_write_file_builds_singlefile_tar_for_repo_path(mock_docker_client, monkeypatch):
-    """write_file places content at /repo/<rel> via copy_to_container with the right mode."""
+def test_sanitize_archive_stream_synthesizes_missing_parent_dirs():
+    """A tar that omits explicit directory entries must still yield sandbox-owned dir members for
+    every ancestor (emitted before the file), so put_archive never auto-creates a root-owned,
+    sandbox-unwritable directory. This is what lets copy_to_container drop the recursive chown."""
+    in_buf = io.BytesIO()
+    with tarfile.open(fileobj=in_buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="pkg/sub/mod.py")  # no pkg/ or pkg/sub/ entries
+        info.size = 4
+        tf.addfile(info, io.BytesIO(b"x=1\n"))
+    in_buf.seek(0)
+
+    out_buf = io.BytesIO()
+    _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+    out_buf.seek(0)
+
+    with tarfile.open(fileobj=out_buf) as out_tf:
+        members = {m.name: m for m in out_tf.getmembers()}
+        order = out_tf.getnames()
+    for d in ("pkg", "pkg/sub"):
+        assert d in members and members[d].isdir(), order
+        assert members[d].uid == 1000 and members[d].gid == 1000
+        assert (members[d].mode & 0o777) == 0o755  # rwxr-xr-x: sandbox-traversable
+    assert order.index("pkg") < order.index("pkg/sub") < order.index("pkg/sub/mod.py")
+
+
+def test_sanitize_archive_stream_preserves_explicit_dir_entry_once():
+    """A well-formed tar that lists a directory before its contents keeps that single dir entry with
+    its own normalized mode — no duplicate synthetic entry."""
+    in_buf = io.BytesIO()
+    with tarfile.open(fileobj=in_buf, mode="w") as tf:
+        d = tarfile.TarInfo(name="pkg")
+        d.type = tarfile.DIRTYPE
+        d.mode = 0o775
+        tf.addfile(d)
+        f = tarfile.TarInfo(name="pkg/mod.py")
+        f.size = 0
+        f.mode = 0o644
+        tf.addfile(f, io.BytesIO(b""))
+    in_buf.seek(0)
+
+    out_buf = io.BytesIO()
+    _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+    out_buf.seek(0)
+
+    with tarfile.open(fileobj=out_buf) as out_tf:
+        members = list(out_tf.getmembers())
+    names = [m.name for m in members]
+    assert names.count("pkg") == 1
+    pkg = next(m for m in members if m.name == "pkg")
+    assert pkg.isdir() and pkg.uid == 1000 and (pkg.mode & 0o777) == 0o775
+
+
+def test_write_file_ships_sanitized_single_file_via_put_archive(mock_docker_client):
+    """write_file (default, create_only=False) ships one sanitized file straight to put_archive — no
+    copy_to_container, no chmod/chown round-trips. The member lands under the right parent stamped
+    with RUN_UID:RUN_GID (put_archive preserves the tar's uid/gid/mode, so no post-copy fix-up)."""
     captured: dict = {}
 
-    def fake_copy(self, tardata, dest=None, clear_before_copy=True):
-        captured["dest"] = dest
-        captured["clear"] = clear_before_copy
-        captured["tardata_type"] = type(tardata)
-        captured["tar_bytes"] = tardata.read()
+    def fake_put(path, stream):
+        captured["dest"] = path
+        captured["tar_bytes"] = stream.read()
+        return True
 
-    monkeypatch.setattr(SandboxDockerSession, "copy_to_container", fake_copy)
+    s = _session_with_container()
+    s.execute_command = Mock()
+    s.container.put_archive = Mock(side_effect=fake_put)
 
-    session = SandboxDockerSession()
-    session.container = MagicMock()
-    session.write_file(f"{SANDBOX_ROOT}/sub/dir/foo.py", b"print('hi')\n", mode=0o755)
+    s.write_file(f"{SANDBOX_ROOT}/sub/dir/foo.py", b"print('hi')\n", mode=0o755)
 
+    # create_only=False: parent assumed to exist (edit's read-modify-write) → no exec round-trip.
+    s.execute_command.assert_not_called()
     assert captured["dest"] == f"{SANDBOX_ROOT}/sub/dir"
-    assert captured["clear"] is False
-    assert not issubclass(captured["tardata_type"], (bytes, bytearray))
 
     with tarfile.open(fileobj=io.BytesIO(captured["tar_bytes"])) as tf:
         members = tf.getmembers()
         assert len(members) == 1
-        assert members[0].name == "foo.py"
-        assert members[0].isfile()
-        assert (members[0].mode & 0o7777) == 0o755
-        assert tf.extractfile(members[0]).read() == b"print('hi')\n"
+        m = members[0]
+        assert m.name == "foo.py" and m.isfile()
+        assert m.uid == settings.RUN_UID and m.gid == settings.RUN_GID
+        assert (m.mode & 0o7777) == 0o755
+        assert tf.extractfile(m).read() == b"print('hi')\n"
 
 
 def test_copy_to_container_streams_sanitized_output_to_put_archive(mock_docker_client):
@@ -656,46 +705,64 @@ def test_write_file_rejects_nul_in_path(mock_docker_client):
         session.write_file(f"{SANDBOX_ROOT}/foo\x00bar", b"x", mode=0o644)
 
 
+def test_write_file_create_only_folds_probe_and_mkdir_into_one_exec(mock_docker_client):
+    """create_only collapses the old probe + mkdir + chmod -R + chown -R into a SINGLE exec that both
+    rejects an existing path and ensures the parent dir, followed by one put_archive — and never
+    shells out to chmod/chown (put_archive carries the sanitized uid/gid/mode)."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="OK"))
+    s.container.put_archive = Mock(return_value=True)
+
+    s.write_file(f"{SANDBOX_ROOT}/sub/foo.py", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
+
+    s.execute_command.assert_called_once()
+    cmd = s.execute_command.call_args.args[0]
+    assert "[ -e " in cmd and "mkdir -p" in cmd  # existence probe + parent creation in one command
+    assert "chmod" not in cmd and "chown" not in cmd
+    s.container.put_archive.assert_called_once()
+    assert s.container.put_archive.call_args.args[0] == f"{SANDBOX_ROOT}/sub"
+
+
 def test_write_file_create_only_rejects_existing(mock_docker_client):
-    """create_only=True refuses to overwrite: an existence probe that finds the file raises
-    FileExistsError before any archive is copied."""
+    """create_only=True refuses to overwrite: the combined probe/mkdir exec reports EXISTS, so it
+    raises FileExistsError before any archive is shipped."""
     s = _session_with_container()
     s.execute_command = Mock(return_value=Mock(exit_code=0, output="EXISTS"))
-    s.copy_to_container = Mock()
+    s.container.put_archive = Mock()
     with pytest.raises(FileExistsError, match="already exists"):
         s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
-    s.copy_to_container.assert_not_called()
+    s.container.put_archive.assert_not_called()
 
 
 def test_write_file_create_only_allows_new(mock_docker_client):
-    """create_only=True writes when the probe reports the path is absent."""
+    """create_only=True writes when the combined exec reports OK (absent + parent ensured)."""
     s = _session_with_container()
-    s.execute_command = Mock(return_value=Mock(exit_code=0, output="ABSENT"))
-    s.copy_to_container = Mock()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output="OK"))
+    s.container.put_archive = Mock(return_value=True)
     s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
-    s.copy_to_container.assert_called_once()
+    s.container.put_archive.assert_called_once()
 
 
-def test_write_file_create_only_probe_failure_raises(mock_docker_client):
-    """A malfunctioning probe (unrecognised marker / non-zero exit) fails closed: it raises
+def test_write_file_create_only_staging_failure_raises(mock_docker_client):
+    """A malfunctioning staging exec (unrecognised marker / non-zero exit) fails closed: it raises
     RuntimeError instead of being mistaken for 'absent' and silently overwriting the file."""
     s = _session_with_container()
-    s.execute_command = Mock(return_value=Mock(exit_code=2, output="sh: printf: not found"))
-    s.copy_to_container = Mock()
-    with pytest.raises(RuntimeError, match="existence probe failed"):
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="sh: mkdir: not found"))
+    s.container.put_archive = Mock()
+    with pytest.raises(RuntimeError, match="stag"):
         s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,), create_only=True)
-    s.copy_to_container.assert_not_called()
+    s.container.put_archive.assert_not_called()
 
 
 def test_write_file_default_skips_existence_probe(mock_docker_client):
-    """The create_only=False default overwrites without probing — edit_file's write-back relies on
-    this, so the probe must be skipped entirely (no execute_command call)."""
+    """create_only=False (edit's write-back) overwrites in place: no exec round-trip at all, just one
+    put_archive into the existing parent."""
     s = _session_with_container()
     s.execute_command = Mock()
-    s.copy_to_container = Mock()
+    s.container.put_archive = Mock(return_value=True)
     s.write_file(f"{SANDBOX_ROOT}/a.txt", b"x", mode=0o644, allowed_roots=(SANDBOX_ROOT,))
     s.execute_command.assert_not_called()
-    s.copy_to_container.assert_called_once()
+    s.container.put_archive.assert_called_once()
 
 
 def test_edit_file_write_back_does_not_use_create_only():
@@ -760,17 +827,14 @@ def test_copy_to_container_allows_bare_workspace_root(mock_docker_client):
     session.copy_to_container(buf, dest=WORKSPACE_ROOT, clear_before_copy=False)
 
 
-def test_copy_to_container_chmod_failure_skips_chown(mock_docker_client):
-    """A failed chmod is raised before chown runs, so the error is attributed correctly and chown
-    is not run against a still-mis-permissioned tree."""
+def test_copy_to_container_skips_redundant_chmod_and_chown(mock_docker_client):
+    """copy_to_container no longer runs the recursive chmod/chown after put_archive: the sanitizer
+    stamps every member's uid/gid/mode and put_archive preserves them, so the post-copy passes (which
+    for a large seed tree walked thousands of files) are pure waste and have been removed."""
     session = SandboxDockerSession()
     session.container = MagicMock()
     session.container.put_archive.return_value = True
-    session.container.exec_run.side_effect = [
-        ExecResult(exit_code=0, output=b""),  # rm (clear_before_copy default)
-        ExecResult(exit_code=0, output=b""),  # mkdir
-        ExecResult(exit_code=1, output=b"chmod: boom"),  # chmod fails
-    ]
+    session.container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:
@@ -779,11 +843,10 @@ def test_copy_to_container_chmod_failure_skips_chown(mock_docker_client):
         tf.addfile(info, io.BytesIO(b""))
     buf.seek(0)
 
-    with pytest.raises(RuntimeError, match="normalize permissions"):
-        session.copy_to_container(buf)
+    session.copy_to_container(buf)
 
-    chown_calls = [c for c in session.container.exec_run.call_args_list if c.args and c.args[0][0] == "chown"]
-    assert chown_calls == []
+    verbs = [c.args[0][0] for c in session.container.exec_run.call_args_list if c.args and c.args[0]]
+    assert "chmod" not in verbs and "chown" not in verbs
 
 
 def test_copy_to_container_rejects_dest_traversal(mock_docker_client):
@@ -1170,6 +1233,27 @@ def test_find_paths_wrong_type_raises_not_a_directory():
     assert "[ -d " in cmd and f"exit {_PATH_WRONG_TYPE_EXIT}" in cmd
 
 
+def test_find_paths_includes_prune_fragment_in_command():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    s.find_paths("/scratch", excludes=(".git", "__pycache__"))
+    cmd = s.execute_command.call_args.args[0]
+    assert r"-type d \( -name '.git' -o -name '__pycache__' \) -prune -o" in cmd
+    assert "-print" in cmd
+
+
+def test_find_paths_without_excludes_omits_prune_fragment():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    s.find_paths("/scratch")
+    cmd = s.execute_command.call_args.args[0]
+    assert "-prune" not in cmd  # empty predicate => no prune fragment
+    assert "-type d -print" in cmd  # dir pass still present (find's default action made explicit)
+    assert "! -type d -print" in cmd  # file pass still present
+    # NOTE: assert on these fragments, NOT "-mindepth 1 -type d -print": an empty predicate leaves a
+    # double space ("-mindepth 1  -type d") in the command, so a single-space match would falsely fail.
+
+
 def test_grep_permission_denied_raises():
     """grep uses the default guard (require=None): existence + readability only. An unreadable path
     exits 9 -> PermissionError, and the prologue must NOT emit the dir-only wrong-type test."""
@@ -1180,6 +1264,40 @@ def test_grep_permission_denied_raises():
     cmd = s.execute_command.call_args.args[0]
     assert f"exit {_PATH_DENIED_EXIT}" in cmd
     assert f"exit {_PATH_WRONG_TYPE_EXIT}" not in cmd  # require=None -> no directory type test
+
+
+def test_grep_directory_branch_uses_find_xargs_with_prune_and_sentinel():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    s.grep("needle", "/scratch", glob=None, excludes=(".git",))
+    cmd = s.execute_command.call_args.args[0]
+    assert "if [ -d '/scratch' ]" in cmd  # directory branch
+    assert r"\( -name '.git' \) -prune -o" in cmd  # pruning applied
+    assert "-type f -print0" in cmd
+    assert "xargs -0 grep -HnF -e 'needle' /dev/null" in cmd  # /dev/null sentinel, literal pattern
+    assert "else grep -HnF -e 'needle' --" in cmd  # single-file fallback branch
+    # Lock the read-error contract (only integration tests exercise it for real, so pin its shape
+    # here so a refactor can't silently drop it): grep's stderr is captured via the fd-swap while
+    # matches flow through fd 3, and a non-empty capture surfaces the read error as exit 2.
+    # fd 3 MUST be opened with a standalone `exec 3>&1` (not a `3>&1` redirection on the assignment):
+    # bash does not expose an assignment-command redirection inside its command substitution, so the
+    # inline form left fd 3 closed under bash (`1>&3` -> "Bad file descriptor"), breaking every
+    # directory grep on images that ship /bin/bash. Pin the portable form here so it can't regress.
+    assert "exec 3>&1; errs=$(" in cmd  # fd 3 opened in the parent shell, visible to the substitution
+    assert "2>&1 1>&3 3>&-); ec=$?; exec 3>&-;" in cmd  # capture stderr, keep matches on stdout, then close fd 3
+    assert "3>&1;" not in cmd.replace("exec 3>&1;", "")  # the broken assignment-redirection form is gone
+    assert '[ -z "$errs" ] || exit 2;' in cmd  # unreadable file -> surface, not swallow
+    # And the xargs exit-code normalization (xargs collapses grep 1/2 -> 123) stays after it.
+    assert '[ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2;' in cmd
+
+
+def test_grep_without_excludes_still_builds_directory_branch():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
+    s.grep("x", "/scratch", glob=None)
+    cmd = s.execute_command.call_args.args[0]
+    assert "if [ -d '/scratch' ]" in cmd
+    assert "-prune" not in cmd  # empty predicate => no prune fragment
 
 
 def test_read_file_bytes_directory_raises_is_a_directory():
@@ -1207,3 +1325,41 @@ def test_delete_file_removed_returns_true():
     s = _session_with_container()
     s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
     assert s.delete_file("/scratch/x") is True
+
+
+def test_prune_predicate_empty_returns_empty_string():
+    from daiv_sandbox.sessions import _prune_predicate
+
+    assert _prune_predicate(()) == ""
+
+
+def test_prune_predicate_single_name_has_no_alternation():
+    from daiv_sandbox.sessions import _prune_predicate
+
+    # A single exclude must not emit a dangling `-o`.
+    frag = _prune_predicate(("node_modules",))
+    assert frag == r"-type d \( -name 'node_modules' \) -prune -o"
+
+
+def test_prune_predicate_builds_quoted_name_alternation():
+    from daiv_sandbox.sessions import _prune_predicate
+
+    frag = _prune_predicate((".git", "__pycache__", "*.egg-info"))
+    assert frag == r"-type d \( -name '.git' -o -name '__pycache__' -o -name '*.egg-info' \) -prune -o"
+
+
+def test_prune_predicate_shell_quotes_each_name():
+    from daiv_sandbox.sessions import _prune_predicate
+
+    # A name containing a single quote must be POSIX-escaped, never break out of quoting.
+    frag = _prune_predicate(("a'b",))
+    assert frag == r"""-type d \( -name 'a'"'"'b' \) -prune -o"""
+
+
+def test_fs_glob_grep_requests_default_exclude_to_empty_list():
+    from daiv_sandbox.schemas import FsGlobRequest, FsGrepRequest
+
+    assert FsGlobRequest(path="/workspace", pattern="**/*.py").exclude == []
+    assert FsGrepRequest(path="/workspace", pattern="x").exclude == []
+    assert FsGlobRequest(path="/workspace", pattern="*", exclude=["node_modules"]).exclude == ["node_modules"]
+    assert FsGrepRequest(path="/workspace", pattern="x", exclude=["node_modules"]).exclude == ["node_modules"]

@@ -36,3 +36,43 @@ def test_empty_extra_hosts_env_falls_back_to_default(monkeypatch):
     # env_ignore_empty=True: an empty value is treated as unset, keeping the default.
     monkeypatch.setenv("DAIV_SANDBOX_EXTRA_HOSTS", "")
     assert Settings().EXTRA_HOSTS == []
+
+
+def test_fs_prune_dirs_default():
+    # Pin the full default list so an accidental removal is caught; deliberate additions update this.
+    assert settings.FS_PRUNE_DIRS == [
+        ".git",
+        ".hg",
+        ".svn",
+        ".idea",
+        ".vs",
+        "__pycache__",
+        ".ruff_cache",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".pyre",
+        ".pytype",
+        ".hypothesis",
+        ".ipynb_checkpoints",
+        "*.egg-info",
+        ".eggs",
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+        ".turbo",
+        ".parcel-cache",
+        ".angular",
+        ".vite",
+        ".astro",
+        ".docusaurus",
+        ".cache",
+        ".phpunit.cache",
+        ".gradle",
+        "target",
+        "obj",
+    ]
+
+
+def test_fs_prune_dirs_parse_comma_separated_env(monkeypatch):
+    monkeypatch.setenv("DAIV_SANDBOX_FS_PRUNE_DIRS", ".git, node_modules ,__pycache__")
+    assert Settings().FS_PRUNE_DIRS == [".git", "node_modules", "__pycache__"]

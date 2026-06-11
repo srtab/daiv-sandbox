@@ -438,6 +438,15 @@ def _validate_workspace_dir(path: str) -> None:
     _validate_sandbox_path(path, allowed_roots=_WORKSPACE_ROOTS, allow_root=True)
 
 
+def _merge_excludes(request_exclude: list[str]) -> tuple[str, ...]:
+    """Combine the server default prune dirs with a request's per-call excludes (defaults first).
+
+    The defaults (``settings.FS_PRUNE_DIRS``) always apply; ``request_exclude`` extends them. Order is
+    irrelevant to ``find``'s ``-name`` alternation, but defaults-first keeps the resulting command stable.
+    """
+    return (*settings.FS_PRUNE_DIRS, *request_exclude)
+
+
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
     """Compile a path-aware glob (``**``, ``*``, ``?``, ``[..]``) to a regex for a base-relative path.
 
@@ -576,7 +585,8 @@ async def fs_grep(
         return FsGrepResponse(error=FsError(code=FsErrorCode.INVALID_PATH, message=str(exc)))
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
-            matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob)
+            excludes = _merge_excludes(request.exclude)
+            matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob, excludes)
         except FileNotFoundError:
             return FsGrepResponse(error=FsError(code=FsErrorCode.NOT_FOUND, message=f"No such path: {request.path}"))
         except PermissionError:
@@ -601,7 +611,8 @@ async def fs_glob(
     regex = _glob_to_regex(request.pattern)
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
-            all_entries = await asyncio.to_thread(cmd.find_paths, request.path)
+            excludes = _merge_excludes(request.exclude)
+            all_entries = await asyncio.to_thread(cmd.find_paths, request.path, excludes)
         except FileNotFoundError:
             return FsGlobResponse(
                 error=FsError(code=FsErrorCode.NOT_FOUND, message=f"No such directory: {request.path}")

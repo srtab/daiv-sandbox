@@ -114,6 +114,10 @@ class FsGrepRequest(BaseModel):
     pattern: str = Field(description="Literal substring to search for (not a regex).")
     path: str = Field(description="Absolute directory/file path under /workspace.")
     glob: str | None = Field(default=None, description="Optional filename glob to restrict the search.")
+    exclude: list[str] = Field(
+        default_factory=list,
+        description="Directory basenames/globs to prune from the search (extends the server defaults).",
+    )
 
 
 class FsGrepMatch(BaseModel):
@@ -130,6 +134,10 @@ class FsGrepResponse(BaseModel):
 class FsGlobRequest(BaseModel):
     pattern: str = Field(description="Glob pattern (supports *, **, ?, [abc]).")
     path: str = Field(description="Absolute base directory under /workspace.")
+    exclude: list[str] = Field(
+        default_factory=list,
+        description="Directory basenames/globs to prune from the search (extends the server defaults).",
+    )
 
 
 class FsGlobResponse(BaseModel):

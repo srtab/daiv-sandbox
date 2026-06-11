@@ -2,6 +2,8 @@ import base64
 
 import pytest
 
+from daiv_sandbox.config import settings
+
 from .utils import make_tar_gz
 
 
@@ -30,6 +32,66 @@ def test_agent_write_then_bash_read(client, workspace_session):
     run = client.post(f"/session/{sid}/", json={"commands": ["cat /workspace/tmp/note.txt"]})
     assert run.status_code == 200, run.text
     assert "from-agent" in run.json()["results"][0]["output"]
+
+
+def test_write_yields_sandbox_owned_file_and_parent_without_chown(client, workspace_session):
+    """fs/write ships the file straight through put_archive with no post-copy chmod/chown round-trip,
+    so the uid/gid/mode the sanitizer stamped must survive end-to-end on a real container — and a
+    parent dir created during the write (mkdir runs as the sandbox user) is sandbox-owned too, so no
+    root-owned path is left behind in /workspace."""
+    sid = workspace_session
+    w = client.post(
+        f"/session/{sid}/fs/write",
+        json={
+            "path": "/workspace/tmp/nested/dir/owned.txt",
+            "content": base64.b64encode(b"hi\n").decode(),
+            "mode": 0o644,
+        },
+    )
+    assert w.status_code == 200 and w.json()["ok"] is True, w.text
+
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "stat -c '%u %g %a' /workspace/tmp/nested/dir/owned.txt",
+                "stat -c '%u %g' /workspace/tmp/nested",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+    results = run.json()["results"]
+    assert results[0]["output"].strip() == f"{settings.RUN_UID} {settings.RUN_GID} 644", results[0]
+    assert results[1]["output"].strip() == f"{settings.RUN_UID} {settings.RUN_GID}", results[1]
+
+
+def test_seed_nested_tree_is_sandbox_owned_and_writable(client, sandbox_session):
+    """Seeding a tarball that omits explicit directory entries must still leave every extracted
+    directory sandbox-owned and writable. copy_to_container no longer runs chown -R, so the
+    sanitizer's synthesized dir entries (preserved by put_archive) are what guarantee this — without
+    them put_archive would auto-create pkg/sub root-owned and the sandbox user couldn't write into it."""
+    sid = sandbox_session(base_image="alpine:latest")
+    seed = client.post(
+        f"/session/{sid}/seed/",
+        files={"repo_archive": ("repo.tar.gz", make_tar_gz({"pkg/sub/mod.py": b"x = 1\n"}), "application/gzip")},
+    )
+    assert seed.status_code == 204, seed.text
+
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "stat -c '%u %g %a' /workspace/repo/pkg",
+                "stat -c '%u %g' /workspace/repo/pkg/sub/mod.py",
+                "echo extra > /workspace/repo/pkg/sub/added.py && echo WROTE",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+    results = run.json()["results"]
+    assert results[0]["output"].strip() == f"{settings.RUN_UID} {settings.RUN_GID} 755", results[0]
+    assert results[1]["output"].strip() == f"{settings.RUN_UID} {settings.RUN_GID}", results[1]
+    assert "WROTE" in results[2]["output"], results[2]  # sandbox user can write into the seeded dir
 
 
 def test_bash_write_then_agent_read_and_grep(client, workspace_session):
@@ -248,3 +310,212 @@ def test_delete_directory_reports_is_a_directory(client, workspace_session):
     body = d.json()
     assert body["ok"] is False
     assert body["error"]["code"] == "is_a_directory"
+
+
+def test_glob_prunes_caches_but_keeps_dependency_source(client, workspace_session):
+    """Default pruning skips cache/VCS junk (incl. __pycache__ inside deps) but still returns
+    dependency source under node_modules (not a default-pruned dir)."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "mkdir -p /workspace/tmp/pkg/__pycache__ /workspace/tmp/.ruff_cache "
+                "/workspace/tmp/node_modules/dep/__pycache__",
+                "printf 'real\\n' > /workspace/tmp/pkg/real.py",
+                # `.py` (not `.pyc`) so it WOULD match **/*.py if __pycache__ were not pruned — proves
+                # the pruning, not just that the glob skips .pyc. One sits inside a kept dependency tree.
+                "printf 'cached\\n' > /workspace/tmp/pkg/__pycache__/cached.py",
+                "printf 'depcache\\n' > /workspace/tmp/node_modules/dep/__pycache__/dep_cached.py",
+                "printf 'junk\\n' > /workspace/tmp/.ruff_cache/x.py",
+                "printf 'depsrc\\n' > /workspace/tmp/node_modules/dep/index.py",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    gl = client.post(f"/session/{sid}/fs/glob", json={"path": "/workspace/tmp", "pattern": "**/*.py"})
+    assert gl.status_code == 200, gl.text
+    paths = {m["path"] for m in gl.json()["matches"]}
+    assert "/workspace/tmp/pkg/real.py" in paths  # real source kept
+    assert "/workspace/tmp/node_modules/dep/index.py" in paths  # dependency source kept
+    assert not any("/__pycache__/" in p for p in paths)  # bytecode dir pruned (incl. inside node_modules)
+    assert not any("/.ruff_cache/" in p for p in paths)  # cache dir pruned
+
+
+def test_glob_request_exclude_prunes_dependency_dir(client, workspace_session):
+    """A per-request exclude adds to the defaults (here: prune node_modules too)."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "mkdir -p /workspace/tmp/node_modules/dep",
+                "printf 'a\\n' > /workspace/tmp/keep.py",
+                "printf 'b\\n' > /workspace/tmp/node_modules/dep/index.py",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    gl = client.post(
+        f"/session/{sid}/fs/glob", json={"path": "/workspace/tmp", "pattern": "**/*.py", "exclude": ["node_modules"]}
+    )
+    assert gl.status_code == 200, gl.text
+    paths = {m["path"] for m in gl.json()["matches"]}
+    assert "/workspace/tmp/keep.py" in paths
+    assert not any("/node_modules/" in p for p in paths)
+
+
+def test_grep_prunes_caches_but_keeps_dependency_source(client, workspace_session):
+    """grep skips reading default-pruned dirs (no NEEDLE from .ruff_cache) but still searches
+    node_modules dependency source; a request exclude can prune node_modules too."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "mkdir -p /workspace/tmp/.ruff_cache /workspace/tmp/node_modules/dep",
+                "printf 'NEEDLE\\n' > /workspace/tmp/real.txt",
+                "printf 'NEEDLE\\n' > /workspace/tmp/.ruff_cache/c.txt",
+                "printf 'NEEDLE\\n' > /workspace/tmp/node_modules/dep/d.txt",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None})
+    assert g.status_code == 200, g.text
+    paths = {m["path"] for m in g.json()["matches"]}
+    assert "/workspace/tmp/real.txt" in paths
+    assert "/workspace/tmp/node_modules/dep/d.txt" in paths  # dependency source searched
+    assert not any("/.ruff_cache/" in p for p in paths)  # cache dir not read
+
+    g2 = client.post(
+        f"/session/{sid}/fs/grep",
+        json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None, "exclude": ["node_modules"]},
+    )
+    assert g2.status_code == 200, g2.text
+    paths2 = {m["path"] for m in g2.json()["matches"]}
+    assert "/workspace/tmp/real.txt" in paths2
+    assert not any("/node_modules/" in p for p in paths2)
+
+
+def test_grep_no_match_in_pruned_tree_returns_empty_not_error(client, workspace_session):
+    """A search whose only candidate files are under pruned dirs returns [] cleanly (the xargs
+    exit-code normalization must not surface a no-match as exec_failed)."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "mkdir -p /workspace/tmp/.ruff_cache",
+                "printf 'NEEDLE\\n' > /workspace/tmp/.ruff_cache/only.txt",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None})
+    assert g.status_code == 200, g.text
+    body = g.json()
+    assert body["error"] is None, body
+    assert body["matches"] == [], body
+
+
+def test_grep_surfaces_unreadable_file_as_error(client, workspace_session):
+    """A file grep cannot read must surface as an error, not be silently dropped or returned as a
+    partial result. The old `grep -r` exited 2 on a per-file read error; the find|xargs pipeline
+    must preserve that contract (xargs collapses grep 1/2 into 123, so the read error has to be
+    recovered from grep's stderr). Here a readable match coexists with an unreadable file: the whole
+    grep must surface exec_failed rather than returning only the readable match as if complete."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "printf 'NEEDLE readable\\n' > /workspace/tmp/ok.txt",
+                "printf 'NEEDLE locked\\n' > /workspace/tmp/locked.txt",
+                "chmod 000 /workspace/tmp/locked.txt",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None})
+    assert g.status_code == 200, g.text
+    body = g.json()
+    assert body["error"] is not None, body
+    assert body["error"]["code"] == "exec_failed", body
+
+
+def test_glob_and_grep_prune_egg_info_glob_default_at_depth(client, workspace_session):
+    """The default prune list includes the *glob* entry `*.egg-info` (not a literal name). busybox
+    `find -name '*.egg-info' -prune` must match it at any depth — for both glob and grep — which a
+    mis-quoted `*` (escaped so the shell never expands it) would silently break."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "mkdir -p /workspace/tmp/src/mypkg.egg-info",
+                "printf 'NEEDLE\\n' > /workspace/tmp/src/keep.txt",
+                "printf 'NEEDLE\\n' > /workspace/tmp/src/mypkg.egg-info/PKG-INFO.txt",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+
+    gl = client.post(f"/session/{sid}/fs/glob", json={"path": "/workspace/tmp", "pattern": "**/*.txt"})
+    assert gl.status_code == 200, gl.text
+    gl_paths = {m["path"] for m in gl.json()["matches"]}
+    assert "/workspace/tmp/src/keep.txt" in gl_paths
+    assert not any(".egg-info/" in p for p in gl_paths)  # glob-form default pruned at depth
+
+    g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None})
+    assert g.status_code == 200, g.text
+    g_paths = {m["path"] for m in g.json()["matches"]}
+    assert "/workspace/tmp/src/keep.txt" in g_paths
+    assert not any(".egg-info/" in p for p in g_paths)  # grep never opens files inside it either
+
+
+def test_grep_single_file_target(client, workspace_session):
+    """grep against a file path (not a directory) takes the single-file branch and returns matches
+    with the same path:line:text shape as the directory branch."""
+    sid = workspace_session
+    run = client.post(
+        f"/session/{sid}/", json={"commands": ["printf 'alpha\\nNEEDLE here\\nomega\\n' > /workspace/tmp/single.txt"]}
+    )
+    assert run.status_code == 200, run.text
+
+    g = client.post(
+        f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp/single.txt", "glob": None}
+    )
+    assert g.status_code == 200, g.text
+    body = g.json()
+    assert body["error"] is None, body
+    assert body["matches"] == [{"path": "/workspace/tmp/single.txt", "line": 2, "text": "NEEDLE here"}], body
+
+
+def test_grep_directory_works_when_pipefail_wrapper_selects_bash(client, sandbox_session):
+    """Regression: the directory-branch stderr capture must work under bash, not just busybox/dash.
+
+    The capture idiom feeds grep's stderr into `errs` while matches flow to the real stdout via fd 3.
+    The original form put the `3>&1` on an assignment-only command (`errs=$(... 1>&3 ...) 3>&1`), which
+    busybox ash and dash honour but bash does NOT: bash never opens fd 3 for the command substitution,
+    so `1>&3` fails with "3: Bad file descriptor". That bogus stderr made `errs` non-empty (-> exit 2 ->
+    exec_failed) AND swallowed every match. `PIPEFAIL_WRAPPER` prefers /bin/bash, so any sandbox image
+    that ships it (python/node/debian/ubuntu) had a wholly broken directory grep — yet the suite only
+    exercised alpine (no /bin/bash), so it slipped through. debian:bookworm-slim ships /bin/bash and
+    reproduces the failure; the fix must return the match here with no error."""
+    sid = sandbox_session(base_image="debian:bookworm-slim")
+    run = client.post(
+        f"/session/{sid}/", json={"commands": ["printf 'import os\\nNEEDLE here\\n' > /workspace/tmp/a.py"]}
+    )
+    assert run.status_code == 200, run.text
+
+    g = client.post(f"/session/{sid}/fs/grep", json={"pattern": "NEEDLE", "path": "/workspace/tmp", "glob": None})
+    assert g.status_code == 200, g.text
+    body = g.json()
+    assert body["error"] is None, body
+    assert body["matches"] == [{"path": "/workspace/tmp/a.py", "line": 2, "text": "NEEDLE here"}], body

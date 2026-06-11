@@ -93,6 +93,23 @@ def _sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def _prune_predicate(excludes: tuple[str, ...]) -> str:
+    """
+    Build a busybox-safe ``find`` fragment that prunes directories matching *excludes* by basename.
+
+    Returns ``-type d \\( -name '<a>' -o -name '<b>' … \\) -prune -o`` (each name ``_sh_quote``'d, so
+    arbitrary input is shell-safe), or ``""`` when *excludes* is empty so callers fall back to their
+    original ``find`` expression. Names are passed to ``find -name``, so each entry is a *basename
+    glob* (e.g. ``*.egg-info`` prunes any such directory at any depth). ``-type d`` is placed before
+    the name group so non-directory nodes short-circuit the whole conjunction and never run the
+    ``-name`` tests (nor the no-op ``-prune``).
+    """
+    if not excludes:
+        return ""
+    names = " -o ".join(f"-name {_sh_quote(name)}" for name in excludes)
+    return rf"-type d \( {names} \) -prune -o"
+
+
 def _validate_sandbox_path(path: str, allowed_roots: tuple[str, ...], *, allow_root: bool = False) -> str:
     """
     Lexically validate that *path* is a safe absolute path under one of *allowed_roots*.
@@ -181,11 +198,42 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
     - Rejects absolute paths and '..' traversal.
     - Normalizes ownership to the sandbox uid/gid.
     - Normalizes permissions similar to: chmod -R a+rX,u+w
+    - Synthesizes a sandbox-owned entry for every missing ancestor directory, so extraction never
+      auto-creates a root-owned (sandbox-unwritable) intermediate directory.
 
     Both streams are consumed/written from their current positions. The caller must
     seek ``in_stream`` to the desired start offset before calling this function.
     ``out_stream`` is not seeked back afterward.
+
+    Callers extract the result with ``put_archive``, which preserves each member's uid/gid/mode — so
+    this is the single point where ownership/permissions are established (no post-extraction
+    ``chmod``/``chown`` pass is needed).
     """
+    seen_dirs: set[str] = set()
+
+    def _emit_dir(out_tf: tarfile.TarFile, dirpath: str, mode: int) -> None:
+        info = tarfile.TarInfo(name=dirpath)
+        info.type = tarfile.DIRTYPE
+        info.size = 0
+        info.mode = mode
+        info.uid = uid
+        info.gid = gid
+        info.uname = ""
+        info.gname = ""
+        info.mtime = 0
+        out_tf.addfile(info)
+        seen_dirs.add(dirpath)
+
+    def _ensure_parents(out_tf: tarfile.TarFile, name: str) -> None:
+        # Emit a sandbox-owned, traversable entry for each not-yet-seen ancestor of *name*, top-down,
+        # so a tar that omits explicit directory entries can't leave put_archive to auto-create them
+        # root-owned. 0o755 = rwxr-xr-x (the a+rX,u+w dir baseline).
+        parts = name.split("/")[:-1]  # drop the leaf component
+        for i in range(1, len(parts) + 1):
+            ancestor = "/".join(parts[:i])
+            if ancestor and ancestor not in seen_dirs:
+                _emit_dir(out_tf, ancestor, 0o755)
+
     try:
         with tarfile.open(fileobj=in_stream, mode="r:*") as in_tf, tarfile.open(fileobj=out_stream, mode="w") as out_tf:
             for member in in_tf:
@@ -201,6 +249,8 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
                     )
                     continue
 
+                _ensure_parents(out_tf, normalized_name)
+
                 # Mirror `chmod -R a+rX,u+w` semantics while clearing special bits.
                 base_mode = member.mode & 0o777
                 base_mode &= ~0o7000  # clear suid/sgid/sticky
@@ -211,18 +261,9 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
                 else:
                     mode &= ~0o111
 
-                out_info = tarfile.TarInfo(name=normalized_name)
-                out_info.uid = uid
-                out_info.gid = gid
-                out_info.uname = ""
-                out_info.gname = ""
-                out_info.mtime = 0
-                out_info.mode = mode
-
                 if member.isdir():
-                    out_info.type = tarfile.DIRTYPE
-                    out_info.size = 0
-                    out_tf.addfile(out_info)
+                    if normalized_name not in seen_dirs:  # not already emitted as a synthesized ancestor
+                        _emit_dir(out_tf, normalized_name, mode)
                     continue
 
                 # Regular file
@@ -230,9 +271,16 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
                 if extracted is None:
                     raise ValueError(f"Failed to read file entry from archive: {member.name!r}")
 
+                out_info = tarfile.TarInfo(name=normalized_name)
+                out_info.uid = uid
+                out_info.gid = gid
+                out_info.uname = ""
+                out_info.gname = ""
+                out_info.mtime = 0
+                out_info.mode = mode
+                out_info.type = tarfile.REGTYPE
+                out_info.size = member.size
                 try:
-                    out_info.type = tarfile.REGTYPE
-                    out_info.size = member.size
                     out_tf.addfile(out_info, fileobj=extracted)
                 finally:
                     extracted.close()
@@ -498,7 +546,10 @@ class SandboxDockerSession:
                     f"(exit_code: {rm_result.exit_code}) -> {rm_result.output}"
                 )
 
-        mkdir_result = self.container.exec_run(["mkdir", "-p", "--", to_dir_norm], user="root")
+        # Create the dest as the sandbox user, so a freshly-created directory is already owned
+        # correctly and needs no follow-up chown. Within /workspace the sandbox user owns the tree
+        # (set at container bootstrap), so this always succeeds for the real seed destinations.
+        mkdir_result = self.container.exec_run(["mkdir", "-p", "--", to_dir_norm], user=self._get_user())
         if mkdir_result.exit_code != 0:
             raise RuntimeError(
                 f"Failed to create directory {self.container.short_id}:{to_dir_norm}: "
@@ -513,26 +564,12 @@ class SandboxDockerSession:
         if not put_ok:
             raise RuntimeError(f"Failed to copy archive to {self.container.short_id}:{to_dir_norm}")
 
-        # Normalize permissions/ownership on the extracted tree. Check chmod *before* running chown,
-        # so a failure is attributed to the step that actually failed — previously both ran
-        # unconditionally and a chmod failure was reported even though chown had already run against
-        # the same (still mis-permissioned) tree.
-        #
-        # NOTE: The archive is sanitized to disallow symlinks/hardlinks, which avoids dangerous recursive
-        # chmod/chown dereferencing behavior on attacker-controlled link targets.
-        chmod_result = self.container.exec_run(["chmod", "-R", "a+rX,u+w", "--", to_dir_norm], user="root")
-        if chmod_result.exit_code != 0:
-            raise RuntimeError(
-                f"Failed to normalize permissions of {self.container.short_id}:{to_dir_norm}: "
-                f"(exit_code: {chmod_result.exit_code}) -> {chmod_result.output}"
-            )
-
-        chown_result = self.container.exec_run(["chown", "-R", self._get_user(), "--", to_dir_norm], user="root")
-        if chown_result.exit_code != 0:
-            raise RuntimeError(
-                f"Failed to normalize ownership for {self.container.short_id}:{to_dir_norm}: "
-                f"(exit_code: {chown_result.exit_code}) -> {chown_result.output}"
-            )
+        # No post-copy `chmod -R`/`chown -R`: `_sanitize_archive_stream` already stamps every member
+        # with the sandbox uid/gid and normalized `a+rX,u+w` permissions (special bits cleared), and
+        # `put_archive` preserves the tar's ownership/mode on extraction. The recursive passes that
+        # used to walk the whole extracted tree — thousands of files for a large seed — were therefore
+        # redundant and have been removed. (The archive also rejects symlinks/hardlinks, so nothing
+        # in it can point outside the tree.)
 
     def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
         """
@@ -617,13 +654,17 @@ class SandboxDockerSession:
         """
         Write *content* to *path* (absolute, under one of *allowed_roots*) inside the container.
 
-        The path is validated lexically. The content is shipped via a single-file tar
-        through the existing copy_to_container pipeline (sanitised, mode preserved).
+        The path is validated lexically. The file is shipped as a single sanitized tar member
+        through the Docker archive API (``put_archive``), which preserves the member's uid/gid/mode —
+        so sandbox-user ownership and the normalized ``a+rX,u+w`` permissions are baked into the tar
+        by ``_sanitize_archive_stream`` and need no post-copy ``chmod``/``chown`` round-trips.
 
-        When *create_only* is True, refuse to overwrite an existing path (matching deepagents'
-        create-only ``write`` contract). The check probes existence with ``[ -e ]``; there is an
-        inherent TOCTOU window between the probe and the write. The default (False) overwrites,
-        which is what ``edit_file``'s write-back relies on.
+        When *create_only* is True (the ``fs/write`` contract, matching deepagents'), a single exec —
+        run as the sandbox user — both refuses an existing path and ensures the parent directory,
+        folding what used to be a separate existence probe plus ``mkdir`` (plus the now-redundant
+        recursive ``chmod``/``chown``). There is an inherent TOCTOU window between that check and the
+        write. When *create_only* is False (``edit_file``'s read-modify-write back), the parent is
+        assumed to already exist, so no exec runs at all — just the archive copy.
         """
         canonical = _validate_sandbox_path(path, allowed_roots=allowed_roots)
         parent_dir, _, filename = canonical.rpartition("/")
@@ -631,26 +672,34 @@ class SandboxDockerSession:
             raise ValueError(f"path resolves to an unusable location: {path!r}")
 
         if create_only:
-            # Probe existence and fail *closed*: the guard exists to prevent overwrites, so a
-            # malfunctioning probe must raise (caught and logged by fs_write) rather than be mistaken
-            # for "absent" and silently clobber the file. Both branches print a definite marker and
-            # exit 0, so an unrecognised marker or non-zero exit signals a broken probe, not absence.
-            probe = self.execute_command(
-                f"if [ -e {_sh_quote(canonical)} ]; then printf EXISTS; else printf ABSENT; fi"
+            # One round-trip (as the sandbox user): reject an existing path, otherwise create the
+            # parent. Fail *closed* — an unrecognised marker or non-zero exit must raise (caught and
+            # logged by fs_write) rather than be mistaken for "absent" and clobber the file. Creating
+            # the parent as the sandbox user means it needs no follow-up chown.
+            q_file, q_parent = _sh_quote(canonical), _sh_quote(parent_dir)
+            staged = self.execute_command(
+                f"if [ -e {q_file} ]; then printf EXISTS; exit 0; fi; "
+                f"mkdir -p -- {q_parent} || {{ printf MKDIR_FAILED; exit 1; }}; printf OK"
             )
-            marker = probe.output.strip()
-            if probe.exit_code != 0 or marker not in ("EXISTS", "ABSENT"):
-                raise RuntimeError(
-                    f"create-only existence probe failed for {path!r} (exit {probe.exit_code}, output {probe.output!r})"
-                )
-            if marker == "EXISTS":
+            marker = staged.output.strip()
+            if staged.exit_code == 0 and marker == "EXISTS":
                 raise FileExistsError(
                     f"Cannot write to {path} because it already exists. "
                     "Read and then make an edit, or write to a new path."
                 )
+            if staged.exit_code != 0 or marker != "OK":
+                raise RuntimeError(
+                    f"write staging failed for {path!r} (exit {staged.exit_code}, output {staged.output!r})"
+                )
 
-        with _build_single_file_tar_stream(filename, content, mode=mode) as tar_stream:
-            self.copy_to_container(tar_stream, dest=parent_dir, clear_before_copy=False)
+        with (
+            _build_single_file_tar_stream(filename, content, mode=mode) as raw_tar,
+            tempfile.SpooledTemporaryFile(max_size=_SINGLE_FILE_TAR_SPOOL_LIMIT) as sanitized,
+        ):
+            _sanitize_archive_stream(raw_tar, sanitized, uid=settings.RUN_UID, gid=settings.RUN_GID)
+            sanitized.seek(0)
+            if not self.container.put_archive(parent_dir, sanitized):
+                raise RuntimeError(f"Failed to write {self.container.short_id}:{canonical}")
 
     def read_file_bytes(self, path: str) -> bytes:
         """Return the raw bytes of a single file via the Docker archive API.
@@ -703,20 +752,56 @@ class SandboxDockerSession:
             entries.append(DirEntry(f"{base}/{clean}", is_dir))
         return entries
 
-    def grep(self, pattern: str, path: str, glob: str | None) -> list[GrepHit]:
-        """Literal recursive search via `grep -rHnF`. Returns GrepHit(path, line, text).
+    def grep(self, pattern: str, path: str, glob: str | None, excludes: tuple[str, ...] = ()) -> list[GrepHit]:
+        """Literal recursive search. Returns GrepHit(path, line, text).
 
-        `glob`, when given, restricts results to files whose basename matches it. The
-        filtering is applied host-side (busybox `grep` on minimal images like alpine has
-        no `--include`). grep exit code 1 means "no matches" (returns []); exit >= 2 is a
-        real error and raises RuntimeError. The path guard runs first (existence + readability
-        only, since grep accepts a file or a directory): a genuinely absent path raises
-        FileNotFoundError and an unreadable target raises PermissionError, both distinct from
-        grep's own exit 2. Note grep is recursive with stderr discarded, so an unreadable
-        *subdirectory* under a readable root is silently skipped rather than reported as an error.
+        For a directory target, files are enumerated with a prune-aware ``find`` and piped to
+        ``grep`` (``--exclude-dir`` is GNU-only, so busybox can't prune in grep itself); this makes
+        grep skip *opening* files under excluded directories rather than reading and discarding them.
+        For a single-file target, grep runs directly.
+
+        `glob`, when given, restricts results to files whose basename matches it (applied host-side;
+        busybox grep has no `--include`). `excludes` (directory basenames/globs) are pruned via
+        ``_prune_predicate``.
+
+        Read-error contract: a file ``grep`` is asked to search but cannot read (EACCES, or a file
+        that vanished in the find->grep window) is surfaced, not swallowed. ``xargs`` collapses
+        grep's exit 1 (no match) and 2 (read error) into a single 123, so the read error can't be
+        told apart from the exit code alone; instead grep's stderr is captured into a shell variable
+        (matches still flow to stdout via fd 3) and a non-empty capture forces exit 2 -> RuntimeError.
+        This matches the previous ``grep -rHnF`` (which exited 2 on a per-file read error) and the
+        single-file branch below (which raises on grep's own exit >= 2). An unreadable *subdirectory*
+        met while traversing is still silently skipped: ``find``'s stderr is discarded, so it is
+        never enumerated and never reaches grep. With no read error, exit 0 (match) and 123 (no
+        match) both parse the output (empty -> []); any other code (e.g. 127 grep-missing) raises.
+        The path guard (require=None) still raises FileNotFoundError on a true absence and
+        PermissionError on an unreadable *target*, distinct from grep's own exits.
         """
         quoted = _sh_quote(path)
-        result = self._run_path_guarded(path, f"grep -rHnF -e {_sh_quote(pattern)} -- {quoted} 2>/dev/null")
+        quoted_pattern = _sh_quote(pattern)
+        prune = _prune_predicate(excludes)
+        body = (
+            f"if [ -d {quoted} ]; then "
+            # Capture grep's stderr (per-file read errors) into `errs` while matches flow to the real
+            # stdout via fd 3; `find`'s own stderr stays discarded, so an unreadable *subdirectory* is
+            # silently skipped, but a file grep cannot read leaves a message in `errs`. fd 3 is opened
+            # in *this* shell with `exec 3>&1` (then closed afterwards) rather than via a `3>&1`
+            # redirection on the assignment: bash does not make a redirection attached to an
+            # assignment-only command visible inside its command substitution, so the inline form
+            # left fd 3 closed under bash (`1>&3` -> "Bad file descriptor"), swallowing every match
+            # and forcing a spurious exit 2. `exec 3>&1` works identically across bash, dash and
+            # busybox ash. fd 3 must be closed *after* `ec=$?` so the close can't clobber the status.
+            f"exec 3>&1; "
+            f"errs=$({{ {{ find {quoted} -mindepth 1 {prune} -type f -print0 2>/dev/null || true; }} "
+            f"| xargs -0 grep -HnF -e {quoted_pattern} /dev/null; }} 2>&1 1>&3 3>&-); ec=$?; exec 3>&-; "
+            # A non-empty `errs` means a searched file couldn't be read -> surface it as exit 2.
+            f'[ -z "$errs" ] || exit 2; '
+            # No read error: xargs collapsed grep's 1 (no match) and 2 into 123, so 0/123 are both
+            # success here; anything else (e.g. 127 grep-missing) becomes exit 2 -> RuntimeError.
+            f'[ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2; '
+            f"else grep -HnF -e {quoted_pattern} -- {quoted} 2>/dev/null; fi"
+        )
+        result = self._run_path_guarded(path, body)
         if result.exit_code >= 2:
             raise RuntimeError(f"grep failed (exit {result.exit_code}) for {path!r}")
         matches: list[GrepHit] = []
@@ -728,20 +813,23 @@ class SandboxDockerSession:
                     matches.append(GrepHit(file_path, line_no, text))
         return matches
 
-    def find_paths(self, path: str) -> list[DirEntry]:
+    def find_paths(self, path: str, excludes: tuple[str, ...] = ()) -> list[DirEntry]:
         """Recursively enumerate entries under `path` via POSIX `find` (for glob matching).
 
         Uses a busybox-safe type-marker scheme (GNU `find -printf` is unavailable on
         images like alpine): directories are suffixed with ``/D`` and files with ``/F``.
-        Goes through the path guard (require="dir"), so it raises FileNotFoundError when the path
-        does not exist, NotADirectoryError when it exists but is not a directory, and PermissionError
-        when it is not readable/traversable. RuntimeError is raised only when the traversal itself
-        genuinely fails after the guard passes.
+        *excludes* (directory basenames/globs) are pruned via ``_prune_predicate`` so their
+        subtrees are never descended, enumerated, or transported. Goes through the path guard
+        (require="dir"), so it raises FileNotFoundError when the path does not exist,
+        NotADirectoryError when it exists but is not a directory, and PermissionError when it is
+        not readable/traversable. RuntimeError is raised only when the traversal itself genuinely
+        fails after the guard passes.
         """
         quoted = _sh_quote(path)
+        prune = _prune_predicate(excludes)
         body = (
-            f"{{ find {quoted} -mindepth 1 -type d 2>/dev/null | sed 's/$/\\/D/'; "
-            f"find {quoted} -mindepth 1 ! -type d 2>/dev/null | sed 's/$/\\/F/'; }}"
+            f"{{ find {quoted} -mindepth 1 {prune} -type d -print 2>/dev/null | sed 's/$/\\/D/'; "
+            f"find {quoted} -mindepth 1 {prune} ! -type d -print 2>/dev/null | sed 's/$/\\/F/'; }}"
         )
         result = self._run_path_guarded(path, body, require="dir")
         if result.exit_code != 0:
