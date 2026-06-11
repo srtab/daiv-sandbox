@@ -2,6 +2,8 @@ import base64
 
 import pytest
 
+from daiv_sandbox.config import settings
+
 from .utils import make_tar_gz
 
 
@@ -30,6 +32,66 @@ def test_agent_write_then_bash_read(client, workspace_session):
     run = client.post(f"/session/{sid}/", json={"commands": ["cat /workspace/tmp/note.txt"]})
     assert run.status_code == 200, run.text
     assert "from-agent" in run.json()["results"][0]["output"]
+
+
+def test_write_yields_sandbox_owned_file_and_parent_without_chown(client, workspace_session):
+    """fs/write ships the file straight through put_archive with no post-copy chmod/chown round-trip,
+    so the uid/gid/mode the sanitizer stamped must survive end-to-end on a real container — and a
+    parent dir created during the write (mkdir runs as the sandbox user) is sandbox-owned too, so no
+    root-owned path is left behind in /workspace."""
+    sid = workspace_session
+    w = client.post(
+        f"/session/{sid}/fs/write",
+        json={
+            "path": "/workspace/tmp/nested/dir/owned.txt",
+            "content": base64.b64encode(b"hi\n").decode(),
+            "mode": 0o644,
+        },
+    )
+    assert w.status_code == 200 and w.json()["ok"] is True, w.text
+
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "stat -c '%u %g %a' /workspace/tmp/nested/dir/owned.txt",
+                "stat -c '%u %g' /workspace/tmp/nested",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+    results = run.json()["results"]
+    assert results[0]["output"].strip() == f"{settings.RUN_UID} {settings.RUN_GID} 644", results[0]
+    assert results[1]["output"].strip() == f"{settings.RUN_UID} {settings.RUN_GID}", results[1]
+
+
+def test_seed_nested_tree_is_sandbox_owned_and_writable(client, sandbox_session):
+    """Seeding a tarball that omits explicit directory entries must still leave every extracted
+    directory sandbox-owned and writable. copy_to_container no longer runs chown -R, so the
+    sanitizer's synthesized dir entries (preserved by put_archive) are what guarantee this — without
+    them put_archive would auto-create pkg/sub root-owned and the sandbox user couldn't write into it."""
+    sid = sandbox_session(base_image="alpine:latest")
+    seed = client.post(
+        f"/session/{sid}/seed/",
+        files={"repo_archive": ("repo.tar.gz", make_tar_gz({"pkg/sub/mod.py": b"x = 1\n"}), "application/gzip")},
+    )
+    assert seed.status_code == 204, seed.text
+
+    run = client.post(
+        f"/session/{sid}/",
+        json={
+            "commands": [
+                "stat -c '%u %g %a' /workspace/repo/pkg",
+                "stat -c '%u %g' /workspace/repo/pkg/sub/mod.py",
+                "echo extra > /workspace/repo/pkg/sub/added.py && echo WROTE",
+            ]
+        },
+    )
+    assert run.status_code == 200, run.text
+    results = run.json()["results"]
+    assert results[0]["output"].strip() == f"{settings.RUN_UID} {settings.RUN_GID} 755", results[0]
+    assert results[1]["output"].strip() == f"{settings.RUN_UID} {settings.RUN_GID}", results[1]
+    assert "WROTE" in results[2]["output"], results[2]  # sandbox user can write into the seeded dir
 
 
 def test_bash_write_then_agent_read_and_grep(client, workspace_session):
