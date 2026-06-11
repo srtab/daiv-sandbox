@@ -27,7 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unified the container filesystem under `/workspace` (`repo/`, `skills/`, `tmp/`). Repo archives now extract into `/workspace/repo`, skills into `/workspace/skills`, and commands run in `/workspace/repo`. **Breaking change** — paths moved from `/repo` and `/skills`.
 - Blocking Docker operations now run off the async event loop, so multiple sessions can be served in parallel.
 - Archive sanitization and the container copy now stream end-to-end through a `SpooledTemporaryFile`; archives larger than 8 MiB no longer require a full in-memory copy on the server.
-- `fs/write`, `fs/edit`, and `seed` are substantially faster. Ownership and permissions are now established once — in the archive sanitizer, preserved by `put_archive` — instead of by a recursive `chmod -R`/`chown -R` after every copy. A single-file `fs/write` ships content straight through the Docker archive API and ensures its parent directory in one container exec (and `fs/edit`, whose parent already exists, needs none), and `seed` no longer walks the extracted tree to re-apply permissions. In a paired benchmark this cut `fs/write` ~72% (≈205 → 57 ms), `fs/edit` ~93% (≈155 → 11 ms), and `seed` ~17–32% (large repo ≈2.36 → 1.96 s).
 - Archive sanitization now synthesizes a sandbox-owned entry for every missing ancestor directory, so an uploaded tarball that omits directory entries no longer leaves intermediate directories owned by `root` (and unwritable by the sandbox user) after extraction.
 
 ### Removed

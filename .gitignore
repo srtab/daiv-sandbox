@@ -172,3 +172,4 @@ docs/*
 
 # daiv-sandbox benchmark harness: cache the downloaded repo tarballs, keep results tracked
 benchmarks/.cache/
+benchmarks/results/
