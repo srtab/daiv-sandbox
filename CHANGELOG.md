@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Blocking Docker operations now run off the async event loop, so multiple sessions can be served in parallel.
 - Archive sanitization and the container copy now stream end-to-end through a `SpooledTemporaryFile`; archives larger than 8 MiB no longer require a full in-memory copy on the server.
 - Archive sanitization now synthesizes a sandbox-owned entry for every missing ancestor directory, so an uploaded tarball that omits directory entries no longer leaves intermediate directories owned by `root` (and unwritable by the sandbox user) after extraction.
+- Archive sanitization now preserves in-tree relative symlinks instead of dropping every symlink, so repos that track symlinks no longer seed with a dirty git tree. Symlinks with absolute targets, targets resolving above the archive root (including chained-symlink escapes), members written through a symlinked directory, and same-name symlink/file collisions are still skipped. Skipped members are reported with a single high-severity summary log per archive.
 
 ### Removed
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import io
 import logging
+import posixpath
 import socket
 import tarfile
 import tempfile
@@ -189,17 +190,69 @@ def _normalize_tar_member_name(name: str) -> str | None:
     return None if normalized in {"", "."} else normalized
 
 
-def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid: int, gid: int) -> None:
+def _symlink_target_is_safe(name: str, linkname: str, seen_symlinks: set[str]) -> bool:
+    """
+    Whether a symlink member may be preserved: its target must be relative and *lexically*
+    resolve inside the archive root.
+
+    ``name`` is the already-normalized member path; ``linkname`` is the raw tar link
+    target, resolved against the member's parent directory (POSIX symlink semantics).
+
+    Resolution is lexical (``..`` collapses path components textually), which is only
+    sound when no intermediate component is itself a symlink — ``link/..`` resolves
+    relative to the link's *target*, not its parent, so a chain like ``a/b -> ..`` +
+    ``c -> a/b/../z`` would lexically pass while really escaping the root. Any target
+    whose non-final components traverse a previously emitted symlink is therefore
+    rejected outright rather than mis-resolved. A target whose *final* component is a
+    symlink is fine (an in-tree link to a link resolves through independently-vetted
+    links).
+    """
+    if not linkname or PurePosixPath(linkname).is_absolute():
+        return False
+    parent = str(PurePosixPath(name).parent)
+    joined = posixpath.join("" if parent == "." else parent, linkname)
+    components = [c for c in joined.split("/") if c not in ("", ".")]
+    prefix: list[str] = []
+    for i, component in enumerate(components):
+        if component == "..":
+            if not prefix:
+                return False  # climbs above the archive root
+            prefix.pop()
+        else:
+            prefix.append(component)
+        if i < len(components) - 1 and "/".join(prefix) in seen_symlinks:
+            return False  # lexical math is meaningless through a symlink
+    return True
+
+
+def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid: int, gid: int) -> int:
     """
     Sanitize an incoming (possibly compressed) tar archive for safer extraction,
-    writing an *uncompressed* tar to ``out_stream``.
+    writing an *uncompressed* tar to ``out_stream``. Returns the number of members
+    that were skipped (0 when the archive passed through intact) so callers can
+    surface a partially seeded workspace instead of discovering it via a dirty tree.
 
-    - Rejects symlinks, hardlinks, device nodes, and FIFOs.
-    - Rejects absolute paths and '..' traversal.
-    - Normalizes ownership to the sandbox uid/gid.
-    - Normalizes permissions similar to: chmod -R a+rX,u+w
-    - Synthesizes a sandbox-owned entry for every missing ancestor directory, so extraction never
-      auto-creates a root-owned (sandbox-unwritable) intermediate directory.
+    Escape safety rests on the *combination* of three guards — weakening any one of
+    them in isolation re-opens the others:
+
+    - ``_normalize_tar_member_name`` rejects absolute member names and ``..`` segments.
+    - ``_symlink_target_is_safe`` admits only relative symlink targets that lexically
+      resolve inside the root and don't traverse another symlink mid-path.
+    - Members whose path traverses, or whose name collides with, a previously emitted
+      symlink are skipped (no writes *through* links and no symlink/file type confusion);
+      symmetrically, a symlink whose name was already emitted as a dir or link is skipped
+      (first entry wins — duplicate same-name members would make extraction
+      extractor-dependent).
+
+    Preserved symlinks keep their linkname (repos legitimately track them; dropping them
+    dirties the seeded git tree). Hardlinks, device nodes, and FIFOs are always rejected.
+
+    Other normalizations:
+
+    - Ownership is stamped to the sandbox uid/gid.
+    - Permissions are normalized similar to: chmod -R a+rX,u+w
+    - A sandbox-owned entry is synthesized for every missing ancestor directory, so extraction
+      never auto-creates a root-owned (sandbox-unwritable) intermediate directory.
 
     Both streams are consumed/written from their current positions. The caller must
     seek ``in_stream`` to the desired start offset before calling this function.
@@ -210,6 +263,17 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
     ``chmod``/``chown`` pass is needed).
     """
     seen_dirs: set[str] = set()
+    seen_symlinks: set[str] = set()
+    total_members = 0
+    skipped: list[str] = []
+
+    def _skip(member_name: str, detail: str) -> None:
+        skipped.append(member_name)
+        logger.warning("Skipping archive entry %r: %s", member_name, detail)
+
+    def _traverses_symlink(name: str) -> bool:
+        parts = name.split("/")[:-1]
+        return any("/".join(parts[:i]) in seen_symlinks for i in range(1, len(parts) + 1))
 
     def _emit_dir(out_tf: tarfile.TarFile, dirpath: str, mode: int) -> None:
         info = tarfile.TarInfo(name=dirpath)
@@ -240,13 +304,47 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
                 normalized_name = _normalize_tar_member_name(member.name)
                 if normalized_name is None:
                     continue
+                total_members += 1
 
-                if not (member.isfile() or member.isdir()):
-                    logger.warning(
-                        "Skipping unsupported archive entry %r (type=%r); only files/dirs are allowed",
-                        member.name,
-                        member.type,
-                    )
+                if not (member.isfile() or member.isdir() or member.issym()):
+                    _skip(member.name, f"unsupported type {member.type!r}; only files/dirs/symlinks are allowed")
+                    continue
+
+                if _traverses_symlink(normalized_name):
+                    _skip(member.name, "path traverses a symlinked directory")
+                    continue
+
+                if not member.issym() and normalized_name in seen_symlinks:
+                    # A same-named file/dir after a symlink would put two members with conflicting
+                    # types in the output tar; extraction is then extractor-dependent (Docker's
+                    # untar deletes the existing path). First entry wins, consistently.
+                    _skip(member.name, "name collides with a previously emitted symlink")
+                    continue
+
+                if member.issym():
+                    if normalized_name in seen_dirs or normalized_name in seen_symlinks:
+                        # The dir case includes parents synthesized for an earlier out-of-order
+                        # child (`alias/file.txt` listed before `alias -> real`): emitting the
+                        # symlink anyway would make Docker's untar delete the dir and its contents.
+                        _skip(member.name, "symlink name collides with a previously emitted directory or symlink")
+                        continue
+                    if not _symlink_target_is_safe(normalized_name, member.linkname, seen_symlinks):
+                        _skip(member.name, f"symlink target {member.linkname!r} escapes the archive root")
+                        continue
+                    _ensure_parents(out_tf, normalized_name)
+                    out_info = tarfile.TarInfo(name=normalized_name)
+                    out_info.type = tarfile.SYMTYPE
+                    out_info.linkname = member.linkname
+                    out_info.size = 0
+                    # Ignored on Linux; access through a symlink is governed by the target's perms.
+                    out_info.mode = 0o777
+                    out_info.uid = uid
+                    out_info.gid = gid
+                    out_info.uname = ""
+                    out_info.gname = ""
+                    out_info.mtime = 0
+                    out_tf.addfile(out_info)
+                    seen_symlinks.add(normalized_name)
                     continue
 
                 _ensure_parents(out_tf, normalized_name)
@@ -286,6 +384,18 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
                     extracted.close()
     except (tarfile.TarError, EOFError, OSError) as e:
         raise ValueError(f"Invalid or truncated archive: {e}") from e
+
+    if skipped:
+        # The per-member WARNINGs above are easy to lose in log noise, and the symptom of a
+        # partially seeded repo (a dirty git tree polluting every captured patch) surfaces far
+        # away, on the client side. One high-severity, greppable summary per archive.
+        logger.error(
+            "Archive sanitization dropped %d of %d members: %s",
+            len(skipped),
+            total_members,
+            ", ".join(skipped[:20]) + (", …" if len(skipped) > 20 else ""),
+        )
+    return len(skipped)
 
 
 class SandboxDockerSession:

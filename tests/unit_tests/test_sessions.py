@@ -493,28 +493,205 @@ def test_get_exec_environment(mock_docker_client):
     assert session._get_exec_environment() == EXPECTED_EXEC_ENV
 
 
-def test_sanitize_archive_stream_skips_symlinks():
-    """Symlink entries are silently skipped in the streamed output."""
+def _sanitize_tar(build) -> tuple[tarfile.TarFile, int]:
+    """Build an input tar via *build(tf)*, run the sanitizer, return (output TarFile, skip count)."""
     in_buf = io.BytesIO()
     with tarfile.open(fileobj=in_buf, mode="w") as tf:
-        content = b"hello"
-        info = tarfile.TarInfo(name="file.txt")
-        info.size = len(content)
-        tf.addfile(info, io.BytesIO(content))
-        sym = tarfile.TarInfo(name="symlink.txt")
-        sym.type = tarfile.SYMTYPE
-        sym.linkname = "file.txt"
-        tf.addfile(sym)
+        build(tf)
     in_buf.seek(0)
-
     out_buf = io.BytesIO()
-    _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
+    skipped = _sanitize_archive_stream(in_buf, out_buf, uid=1000, gid=1000)
     out_buf.seek(0)
+    return tarfile.open(fileobj=out_buf), skipped
 
-    with tarfile.open(fileobj=out_buf) as out_tf:
+
+def _add_symlink(tf: tarfile.TarFile, name: str, target: str) -> None:
+    sym = tarfile.TarInfo(name=name)
+    sym.type = tarfile.SYMTYPE
+    sym.linkname = target
+    tf.addfile(sym)
+
+
+def _add_file(tf: tarfile.TarFile, name: str, content: bytes = b"hello") -> None:
+    info = tarfile.TarInfo(name=name)
+    info.size = len(content)
+    tf.addfile(info, io.BytesIO(content))
+
+
+def _add_dir(tf: tarfile.TarFile, name: str) -> None:
+    info = tarfile.TarInfo(name=name)
+    info.type = tarfile.DIRTYPE
+    tf.addfile(info)
+
+
+def test_sanitize_archive_stream_preserves_in_tree_symlinks():
+    """Relative symlinks resolving inside the archive root survive sanitization intact.
+
+    Repos legitimately track symlinks; dropping them leaves the seeded git tree dirty
+    (spurious symlink deletions polluting every captured diff). The ``a/b/link`` vector
+    is the common real-repo shape (``bin/foo -> ../pkg/foo``): in-tree only because the
+    ``..`` resolves against the member's parent dir — it pins the parent-join math."""
+
+    def build(tf):
+        _add_file(tf, "docs/file.txt")
+        _add_symlink(tf, "docs/link.txt", "file.txt")
+        _add_symlink(tf, "top-link.txt", "docs/../docs/file.txt")
+        _add_symlink(tf, "a/b/link.txt", "../../docs/file.txt")
+
+    out_tf, skipped = _sanitize_tar(build)
+    with out_tf:
+        link = out_tf.getmember("docs/link.txt")
+        assert link.issym()
+        assert link.linkname == "file.txt"
+        assert link.uid == 1000 and link.gid == 1000
+        top = out_tf.getmember("top-link.txt")
+        assert top.issym()
+        assert top.linkname == "docs/../docs/file.txt"
+        nested = out_tf.getmember("a/b/link.txt")
+        assert nested.issym()
+        assert nested.linkname == "../../docs/file.txt"
+    assert skipped == 0
+
+
+def test_sanitize_archive_stream_skips_escaping_symlinks():
+    """Absolute targets and targets resolving above the archive root are dropped.
+
+    ``nested-up`` escapes only after resolving against its parent dir (``a/`` + ``../../``),
+    pinning the parent-join math from the rejecting side; ``dotdot-link`` is the bare-``..``
+    boundary case (the parent of the root itself)."""
+
+    def build(tf):
+        _add_file(tf, "file.txt")
+        _add_symlink(tf, "abs-link", "/etc/passwd")
+        _add_symlink(tf, "up-link", "../outside")
+        _add_symlink(tf, "sneaky-link", "a/../../outside")
+        _add_symlink(tf, "dotdot-link", "..")
+        _add_symlink(tf, "a/nested-up", "../../outside")
+        _add_symlink(tf, "empty-link", "")
+
+    out_tf, skipped = _sanitize_tar(build)
+    with out_tf:
         names = out_tf.getnames()
     assert "file.txt" in names
-    assert "symlink.txt" not in names
+    assert "abs-link" not in names
+    assert "up-link" not in names
+    assert "sneaky-link" not in names
+    assert "dotdot-link" not in names
+    assert "a/nested-up" not in names
+    assert "empty-link" not in names
+    assert skipped == 6
+
+
+def test_sanitize_archive_stream_skips_chained_symlink_escape():
+    """Lexical target resolution is unsound through another symlink: ``a/b -> ..`` resolves to
+    the root (safe on its own), but ``c -> a/b/../z`` then really points at the root's *parent*
+    even though it lexically normalizes to the in-tree ``a/z``. Targets traversing an emitted
+    symlink mid-path must be rejected, not mis-resolved."""
+
+    def build(tf):
+        _add_dir(tf, "a")
+        _add_symlink(tf, "a/b", "..")
+        _add_symlink(tf, "c", "a/b/../z")
+
+    out_tf, skipped = _sanitize_tar(build)
+    with out_tf:
+        names = out_tf.getnames()
+        assert "a/b" in names  # safe on its own: resolves to the archive root
+    assert "c" not in names
+    assert skipped == 1
+
+
+def test_sanitize_archive_stream_skips_members_under_symlinked_dirs():
+    """No writes *through* links: a member whose path traverses an emitted symlink is dropped —
+    including deep descendants, pinning the ancestor-prefix arithmetic."""
+
+    def build(tf):
+        _add_dir(tf, "real")
+        _add_symlink(tf, "alias", "real")
+        _add_file(tf, "alias/file.txt", b"pwned")
+        _add_dir(tf, "a")
+        _add_symlink(tf, "a/alias", "real")
+        _add_file(tf, "a/alias/b/deep.txt", b"pwned")
+
+    out_tf, skipped = _sanitize_tar(build)
+    with out_tf:
+        names = out_tf.getnames()
+    assert "alias" in names
+    assert "alias/file.txt" not in names
+    assert "a/alias" in names
+    assert "a/alias/b/deep.txt" not in names
+    assert skipped == 2
+
+
+def test_sanitize_archive_stream_skips_symlink_colliding_with_earlier_dir():
+    """Out-of-order producer: children listed *before* their dir turns out to be a symlink.
+    Emitting both a real dir and a same-named symlink would let Docker's untar delete the
+    dir (and its contents) when the symlink is extracted — silent data loss. First wins:
+    the dir and its file are preserved, the late symlink is dropped."""
+
+    def build(tf):
+        _add_file(tf, "alias/file.txt")
+        _add_symlink(tf, "alias", "real")
+
+    out_tf, skipped = _sanitize_tar(build)
+    with out_tf:
+        assert out_tf.getmember("alias").isdir()
+        assert out_tf.getmember("alias/file.txt").isfile()
+    assert skipped == 1
+
+
+def test_sanitize_archive_stream_skips_file_colliding_with_earlier_symlink():
+    """The mirror collision: a file/dir named exactly like an already-emitted symlink (not
+    merely *under* it) would type-confuse extraction the same way. First wins."""
+
+    def build(tf):
+        _add_dir(tf, "real")
+        _add_symlink(tf, "alias", "real")
+        _add_file(tf, "alias")
+        _add_symlink(tf, "alias", "elsewhere")
+
+    out_tf, skipped = _sanitize_tar(build)
+    with out_tf:
+        alias = out_tf.getmember("alias")
+        assert alias.issym()
+        assert alias.linkname == "real"
+        assert len([n for n in out_tf.getnames() if n == "alias"]) == 1
+    assert skipped == 2
+
+
+def test_sanitize_archive_stream_synthesizes_parents_for_symlinks():
+    """A nested symlink arriving with no prior entry under its parent must still get a
+    sandbox-owned ancestor dir — otherwise put_archive auto-creates it root-owned."""
+
+    def build(tf):
+        _add_symlink(tf, "pkg/link", "target")
+
+    out_tf, skipped = _sanitize_tar(build)
+    with out_tf:
+        parent = out_tf.getmember("pkg")
+        assert parent.isdir()
+        assert parent.uid == 1000 and parent.gid == 1000
+        assert out_tf.getmember("pkg/link").issym()
+    assert skipped == 0
+
+
+def test_sanitize_archive_stream_logs_one_skip_summary(caplog):
+    """Per-member skip WARNINGs are easy to lose; a single ERROR summary with the count and
+    names is the greppable signal that the seeded workspace is incomplete."""
+
+    def build(tf):
+        _add_file(tf, "file.txt")
+        _add_symlink(tf, "abs-link", "/etc/passwd")
+        _add_symlink(tf, "up-link", "../outside")
+
+    with caplog.at_level("ERROR"):
+        out_tf, skipped = _sanitize_tar(build)
+    out_tf.close()
+    assert skipped == 2
+    summary = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(summary) == 1
+    assert "dropped 2 of 3 members" in summary[0].getMessage()
+    assert "abs-link" in summary[0].getMessage() and "up-link" in summary[0].getMessage()
 
 
 def test_sanitize_archive_stream_skips_hardlinks():
