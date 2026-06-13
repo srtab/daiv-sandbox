@@ -1248,3 +1248,30 @@ def test_fs_grep_forwards_default_plus_request_excludes(mock_session, client, mo
     call = mock_session.grep.call_args
     passed = call.args[3] if len(call.args) > 3 else call.kwargs["excludes"]
     assert tuple(passed) == (".git", "vendor")
+
+
+def test_fs_grep_threads_regex_params(mock_session, client):
+    """case_insensitive/multiline/head_limit from the request reach Session.grep as kwargs."""
+    mock_session.grep.return_value = []
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/grep",
+        json={"path": "/workspace/tmp", "pattern": "x", "case_insensitive": True, "multiline": True, "head_limit": 5},
+    )
+    assert resp.status_code == 200, resp.text
+    kwargs = mock_session.grep.call_args.kwargs
+    assert kwargs["case_insensitive"] is True
+    assert kwargs["multiline"] is True
+    assert kwargs["head_limit"] == 5
+
+
+def test_fs_grep_invalid_pattern_maps_to_invalid_pattern_error(mock_session, client):
+    """A regex that fails to compile is surfaced as error.code=invalid_pattern with the engine message."""
+    from daiv_sandbox.sessions import InvalidGrepPatternError
+
+    mock_session.grep.side_effect = InvalidGrepPatternError("regex parse error: unclosed group")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/tmp", "pattern": "("})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["matches"] == []
+    assert body["error"]["code"] == "invalid_pattern"
+    assert "regex parse error" in body["error"]["message"]

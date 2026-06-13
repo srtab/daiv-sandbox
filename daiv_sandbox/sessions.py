@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import io
+import json
 import logging
 import posixpath
 import socket
@@ -33,6 +34,25 @@ SCRATCH_ROOT = "/workspace/tmp"
 DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
 TYPE_CMD_EXECUTOR = "cmd_executor"
 
+# Static (musl) ripgrep binaries baked into the *service* image, one per supported task-image arch
+# (see the `ripgrep-fetch` stage in the Dockerfile). At session start the binary matching the task
+# container's architecture is injected into it (see `_inject_ripgrep`) so `grep` can run a real regex
+# engine there; absent that, `grep` falls back to the POSIX `grep -E` pipeline. The keys are the
+# `uname -m` machine names reported by the task container.
+RIPGREP_HOST_BINARIES = {
+    "x86_64": "/opt/rg/x86_64/rg",
+    "aarch64": "/opt/rg/aarch64/rg",
+    # `uname -m` aliases for the same ISAs on some images.
+    "amd64": "/opt/rg/x86_64/rg",
+    "arm64": "/opt/rg/aarch64/rg",
+}
+
+# Where the injected `rg` binary lands inside the task container: a `bin` dir under SANDBOX_HOME,
+# which lives *outside* /workspace, so it never dirties the seeded git tree or the captured patch
+# and is unreachable through the fs/* endpoints.
+RIPGREP_CONTAINER_DIR = f"{SANDBOX_HOME}/bin"
+RIPGREP_CONTAINER_PATH = f"{RIPGREP_CONTAINER_DIR}/rg"
+
 
 class SessionUnavailableError(RuntimeError):
     """A session's container exists but could not be brought to (or left in) the desired state.
@@ -46,6 +66,15 @@ class SessionUnavailableError(RuntimeError):
         super().__init__(f"Session '{session_id}' could not be {action}")
         self.session_id = session_id
         self.action = action
+
+
+class InvalidGrepPatternError(ValueError):
+    """The grep *pattern* failed to compile as a regex.
+
+    Carries the engine's own (agent-readable) error message. Raised by ``Session.grep`` on a ripgrep
+    or POSIX-``grep`` regex parse error so ``fs_grep`` can map it to ``FsErrorCode.INVALID_PATTERN``
+    instead of the blanket ``exec_failed``.
+    """
 
 
 class DirEntry(NamedTuple):
@@ -82,6 +111,12 @@ _PATH_ABSENT_EXIT = 7
 # 8 and 9 are unused by test/ls/grep/find, so they can't collide.
 _PATH_WRONG_TYPE_EXIT = 8
 _PATH_DENIED_EXIT = 9
+
+# Sentinel exit the POSIX grep fallback emits when the *pattern* itself fails to compile as an ERE
+# (detected by an empty-input probe before any file is searched), so a bad regex is mapped to
+# InvalidGrepPatternError rather than the read-error RuntimeError. 10 is unused by
+# grep/find/xargs/test (0/1/2/123/124/127), so it can't collide with a real tool exit.
+_GREP_BAD_PATTERN_EXIT = 10
 
 
 def _sh_quote(value: str) -> str:
@@ -158,6 +193,34 @@ def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int) -
             info.size = len(content)
             info.mode = mode & 0o7777
             info.type = tarfile.REGTYPE
+            tf.addfile(info, io.BytesIO(content))
+        stream.seek(0)
+    except BaseException:
+        stream.close()
+        raise
+    return stream
+
+
+def _build_owned_executable_tar_stream(filename: str, content: bytes, *, uid: int, gid: int) -> IO[bytes]:
+    """Build an uncompressed tar with one mode-0755 regular-file member owned by *uid*/*gid*.
+
+    Like ``_build_single_file_tar_stream`` but stamps ownership and a fixed executable mode — used to
+    inject the ripgrep binary so it lands sandbox-owned and executable without going through
+    ``_sanitize_archive_stream`` (whose ``a+rX`` normalization would widen 0o755 to 0o777). Returns a
+    seekable stream positioned at offset 0; the caller owns it and must close it.
+    """
+    stream = tempfile.SpooledTemporaryFile(max_size=_SINGLE_FILE_TAR_SPOOL_LIMIT)  # noqa: SIM115
+    try:
+        with tarfile.open(fileobj=stream, mode="w") as tf:
+            info = tarfile.TarInfo(name=filename)
+            info.size = len(content)
+            info.mode = 0o755
+            info.type = tarfile.REGTYPE
+            info.uid = uid
+            info.gid = gid
+            info.uname = ""
+            info.gname = ""
+            info.mtime = 0
             tf.addfile(info, io.BytesIO(content))
         stream.seek(0)
     except BaseException:
@@ -425,6 +488,11 @@ class SandboxDockerSession:
         self.session_id: str | None = session_id
         self.client: DockerClient = client or self._get_shared_client()
         self.container: Container | None = self._get_container(session_id) if session_id else None
+        # In-container path of the injected ripgrep binary, or None when rg is unavailable for this
+        # session (set during `_start_container`; `grep` falls back to POSIX when None). It is only
+        # populated on a freshly-started session — a warm-reused session looked up by id re-derives
+        # nothing here, so `grep` simply takes the POSIX path, which is always correct.
+        self._rg_path: str | None = None
 
     @classmethod
     def ping(cls, *, client: DockerClient | None = None) -> bool:
@@ -540,6 +608,75 @@ class SandboxDockerSession:
             except Exception:
                 logger.warning("Failed to remove container %s after bootstrap failure", container.short_id)
             raise
+
+        # Best-effort: inject a matching static ripgrep so fs/grep can use a real regex engine. This
+        # MUST never fail session start — any problem leaves `self._rg_path` None and grep falls back
+        # to the POSIX pipeline. Run *after* the critical bootstrap (so a broken inject can't strand a
+        # half-set-up container) and outside the failure-cleanup block above for the same reason.
+        self._inject_ripgrep(container)
+
+    def _inject_ripgrep(self, container: Container) -> None:
+        """Inject the arch-matching static ripgrep binary into *container*, recording its path.
+
+        Detects the container architecture via ``uname -m``, builds an in-memory tar holding the
+        matching host-side ``rg`` (mode 0755, owned by the sandbox uid/gid) and ``put_archive``\\s it
+        into ``RIPGREP_CONTAINER_DIR`` (a ``bin`` dir under SANDBOX_HOME, outside /workspace). On
+        success ``self._rg_path`` is set to the in-container path; ``grep`` then prefers rg.
+
+        Degrades gracefully: an unknown/undetectable arch, a missing host binary, or any
+        ``put_archive``/exec fault logs a WARNING and leaves ``self._rg_path`` None — it never raises,
+        so a task image without a usable rg simply falls back to the POSIX ``grep -E`` pipeline.
+        """
+        try:
+            uname = container.exec_run(["uname", "-m"])
+            if uname.exit_code != 0:
+                logger.warning(
+                    "Could not detect arch of %s for ripgrep injection (uname exit %s); using POSIX grep",
+                    container.short_id,
+                    uname.exit_code,
+                )
+                return
+            arch = uname.output.decode("utf-8", errors="replace").strip()
+            host_binary = RIPGREP_HOST_BINARIES.get(arch)
+            if host_binary is None:
+                logger.warning(
+                    "No ripgrep binary bundled for arch %r in %s; using POSIX grep", arch, container.short_id
+                )
+                return
+            try:
+                rg_bytes = Path(host_binary).read_bytes()
+            except OSError as exc:
+                logger.warning("Bundled ripgrep %s is unreadable (%s); using POSIX grep", host_binary, exc)
+                return
+
+            # The dir is created as the sandbox user so the binary is owned and executable by it; the
+            # tar member carries the same uid/gid + 0755, which put_archive preserves on extraction.
+            mkdir = container.exec_run(["mkdir", "-p", "--", RIPGREP_CONTAINER_DIR], user=self._get_user())
+            if mkdir.exit_code != 0:
+                logger.warning(
+                    "Failed to create %s in %s (exit %s); using POSIX grep",
+                    RIPGREP_CONTAINER_DIR,
+                    container.short_id,
+                    mkdir.exit_code,
+                )
+                return
+
+            # Pack the binary directly (not through `_sanitize_archive_stream`, whose `a+rX` mode
+            # normalization would widen 0o755 to 0o777): a single executable member, owned by the
+            # sandbox uid/gid at exactly mode 0o755, which put_archive preserves on extraction.
+            with _build_owned_executable_tar_stream("rg", rg_bytes, uid=settings.RUN_UID, gid=settings.RUN_GID) as tar:
+                if not container.put_archive(RIPGREP_CONTAINER_DIR, tar):
+                    logger.warning("Failed to copy ripgrep into %s; using POSIX grep", container.short_id)
+                    return
+        except Exception:
+            # Catch-all by design: ripgrep is an optimization, never a session-start prerequisite.
+            # Log the traceback (not a bare message) so a systemic injection failure across a fleet
+            # is diagnosable instead of silently degrading every session to POSIX grep.
+            logger.exception("Unexpected error injecting ripgrep into %s; using POSIX grep", container.short_id)
+            return
+
+        self._rg_path = RIPGREP_CONTAINER_PATH
+        logger.info("Injected ripgrep into %s at %s", container.short_id, RIPGREP_CONTAINER_PATH)
 
     def _resolve_extra_hosts(self, hostnames: list[str]) -> dict[str, str]:
         """Resolve sibling-service names to IPs for injection as static cmd-executor /etc/hosts entries.
@@ -862,35 +999,176 @@ class SandboxDockerSession:
             entries.append(DirEntry(f"{base}/{clean}", is_dir))
         return entries
 
-    def grep(self, pattern: str, path: str, glob: str | None, excludes: tuple[str, ...] = ()) -> list[GrepHit]:
-        """Literal recursive search. Returns GrepHit(path, line, text).
+    def grep(
+        self,
+        pattern: str,
+        path: str,
+        glob: str | None,
+        excludes: tuple[str, ...] = (),
+        *,
+        case_insensitive: bool = False,
+        multiline: bool = False,
+        head_limit: int | None = None,
+    ) -> list[GrepHit]:
+        """Recursive *regex* search. Returns GrepHit(path, line, text).
 
-        For a directory target, files are enumerated with a prune-aware ``find`` and piped to
-        ``grep`` (``--exclude-dir`` is GNU-only, so busybox can't prune in grep itself); this makes
-        grep skip *opening* files under excluded directories rather than reading and discarding them.
-        For a single-file target, grep runs directly.
+        ``pattern`` is always a regular expression (mirroring Claude Code's Grep): metacharacters must
+        be escaped to match literally — there is no literal mode. Two engines back this:
 
-        `glob`, when given, restricts results to files whose basename matches it (applied host-side;
-        busybox grep has no `--include`). `excludes` (directory basenames/globs) are pruned via
-        ``_prune_predicate``.
+        - **ripgrep** (``self._rg_path`` set): the primary path, injected at session start. ``rg --json``
+          is parsed host-side, which sidesteps the fragile ``path:line:text`` split (paths may contain
+          ``:``) and gives a Rust-regex flavor (``\\d``/``\\w``/``\\b`` etc.).
+        - **POSIX ``grep -E``** (ripgrep unavailable): the fallback, on the same prune-aware
+          ``find | xargs grep`` pipeline as before but with ``-E`` (POSIX ERE) instead of ``-F``. The
+          ERE flavor is libc's, NOT Rust regex — ``\\d``/``\\w``/``\\b`` are not portable, POSIX classes
+          (``[[:digit:]]`` …) are. ``--multiline`` has no portable equivalent here, so it is ignored.
 
-        Read-error contract: a file ``grep`` is asked to search but cannot read (EACCES, or a file
-        that vanished in the find->grep window) is surfaced, not swallowed. ``xargs`` collapses
-        grep's exit 1 (no match) and 2 (read error) into a single 123, so the read error can't be
-        told apart from the exit code alone; instead grep's stderr is captured into a shell variable
-        (matches still flow to stdout via fd 3) and a non-empty capture forces exit 2 -> RuntimeError.
-        This matches the previous ``grep -rHnF`` (which exited 2 on a per-file read error) and the
-        single-file branch below (which raises on grep's own exit >= 2). An unreadable *subdirectory*
-        met while traversing is still silently skipped: ``find``'s stderr is discarded, so it is
-        never enumerated and never reaches grep. With no read error, exit 0 (match) and 123 (no
-        match) both parse the output (empty -> []); any other code (e.g. 127 grep-missing) raises.
-        The path guard (require=None) still raises FileNotFoundError on a true absence and
-        PermissionError on an unreadable *target*, distinct from grep's own exits.
+        Common to both: ``glob`` (when given) restricts results to files whose basename matches it
+        (applied host-side; busybox grep has no ``--include``); ``excludes`` (directory basenames/globs)
+        are pruned via ``_prune_predicate``; ``case_insensitive`` adds ``-i``; ``head_limit`` caps the
+        number of returned matches (None = uncapped). The path guard still raises FileNotFoundError on
+        a true absence and PermissionError on an unreadable *target*. A regex that fails to compile is
+        surfaced as ``InvalidGrepPatternError`` carrying the engine's own message.
+        """
+        if self._rg_path:
+            return self._grep_ripgrep(
+                pattern,
+                path,
+                glob,
+                excludes,
+                case_insensitive=case_insensitive,
+                multiline=multiline,
+                head_limit=head_limit,
+            )
+        return self._grep_posix(pattern, path, glob, excludes, case_insensitive=case_insensitive, head_limit=head_limit)
+
+    def _grep_ripgrep(
+        self,
+        pattern: str,
+        path: str,
+        glob: str | None,
+        excludes: tuple[str, ...],
+        *,
+        case_insensitive: bool,
+        multiline: bool,
+        head_limit: int | None,
+    ) -> list[GrepHit]:
+        """Primary search path: run the injected ``rg --json`` and parse its event stream host-side.
+
+        rg handles recursion, the regex engine, and pruning itself: ``--glob`` applies the (basename)
+        ``glob`` filter and ``--glob '!<dir>'`` prunes each exclude. ``--no-config``/``--no-ignore``
+        keep results deterministic and independent of any ``.gitignore``/user config in the workspace.
+
+        rg exits 0 on matches, 1 on no matches, and 2 on error; a regex parse error (exit 2 with a
+        ``regex parse error`` message on stderr) becomes ``InvalidGrepPatternError`` carrying rg's own
+        message; any other exit-2 becomes RuntimeError. The path guard runs first (absence/unreadable
+        target), so those stay distinct from rg's exits.
+        """
+        assert self._rg_path is not None  # only reached via grep() when rg is available  # noqa: S101
+        rg = _sh_quote(self._rg_path)
+        quoted = _sh_quote(path)
+        # `--` terminates options so a pattern starting with `-` is not parsed as a flag.
+        args = [rg, "--json", "--no-config", "--no-ignore", "--hidden"]
+        if case_insensitive:
+            args.append("-i")
+        if multiline:
+            # `--multiline-dotall` makes `.` span newlines, matching the documented multiline contract.
+            args.extend(["--multiline", "--multiline-dotall"])
+        if glob is not None:
+            args.extend(["--glob", _sh_quote(glob)])
+        for name in excludes:
+            # Mirror the POSIX prune semantics: exclude any directory of this basename, at any depth.
+            args.extend(["--glob", _sh_quote(f"!**/{name}/**")])
+        args.extend(["-e", _sh_quote(pattern), "--", quoted])
+        body = " ".join(args)
+
+        result = self._run_path_guarded(path, body)
+        if result.exit_code >= 2:
+            # rg writes its diagnostics to stderr, which execute_command folds into `output`.
+            message = result.output.strip()
+            if "regex parse error" in message.lower() or "error parsing" in message.lower():
+                raise InvalidGrepPatternError(message or f"invalid pattern: {pattern!r}")
+            raise RuntimeError(f"ripgrep failed (exit {result.exit_code}) for {path!r}: {message}")
+
+        return self._parse_ripgrep_json(result.output, head_limit=head_limit)
+
+    @staticmethod
+    def _parse_ripgrep_json(output: str, *, head_limit: int | None) -> list[GrepHit]:
+        """Parse rg's ``--json`` event stream into GrepHit(path, line, text), capping at *head_limit*.
+
+        rg emits one JSON object per line; we only care about ``{"type": "match"}`` events, whose
+        ``data`` carries the absolute ``path``, 1-indexed ``line_number``, and the matched ``lines``
+        text (each as ``{"text": ...}`` for valid UTF-8, or ``{"bytes": <base64>}`` for lossy bytes —
+        the latter is skipped, as the POSIX path also can't represent it). Non-match events
+        (``begin``/``end``/``summary``) and any unparseable line are ignored. Stops collecting once
+        ``head_limit`` matches are gathered so a huge result set isn't fully buffered.
+        """
+        matches: list[GrepHit] = []
+        for line in output.splitlines():
+            if not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") != "match":
+                continue
+            data = event.get("data", {})
+            path_text = (data.get("path") or {}).get("text")
+            line_no = data.get("line_number")
+            line_text = (data.get("lines") or {}).get("text")
+            if path_text is None or line_no is None or line_text is None:
+                # A `bytes`-encoded path/line (non-UTF-8) has no `text`; skip rather than guess.
+                continue
+            matches.append(GrepHit(path_text, int(line_no), line_text.rstrip("\n")))
+            if head_limit is not None and len(matches) >= head_limit:
+                break
+        return matches
+
+    def _grep_posix(
+        self,
+        pattern: str,
+        path: str,
+        glob: str | None,
+        excludes: tuple[str, ...],
+        *,
+        case_insensitive: bool,
+        head_limit: int | None,
+    ) -> list[GrepHit]:
+        """Fallback search path (ripgrep unavailable): the prune-aware ``find | xargs grep -E`` pipeline.
+
+        Switches the old literal ``-F`` to ``-E`` (POSIX ERE) so ``pattern`` is a regex; the flavor is
+        libc ERE, NOT Rust regex (``\\d``/``\\w``/``\\b`` are not portable; POSIX classes are). ``-i`` is
+        added when ``case_insensitive``; ``multiline`` has no portable equivalent and is not handled
+        here. ``head_limit`` is applied host-side after parsing.
+
+        For a directory target, files are enumerated with a prune-aware ``find`` and piped to grep
+        (``--exclude-dir`` is GNU-only, so busybox can't prune in grep itself). For a single-file
+        target, grep runs directly.
+
+        Error handling extends the old read-error contract with bad-pattern detection. A bad ERE makes
+        grep exit 2 *immediately* with a parse error on stderr, independent of any file, so a cheap
+        probe (``grep -E -e <pattern> </dev/null``) runs first: its exit 2 forces the sentinel
+        ``_GREP_BAD_PATTERN_EXIT`` (-> InvalidGrepPatternError, carrying the captured message). Only
+        once the pattern is known-good does the real search run, where a non-empty stderr capture
+        still means a per-file *read* error (-> exit 2 -> RuntimeError). ``xargs`` collapses grep's 1
+        (no match) and 2 into 123, so 0/123 are both success; anything else raises.
         """
         quoted = _sh_quote(path)
         quoted_pattern = _sh_quote(pattern)
         prune = _prune_predicate(excludes)
+        ci = "-i " if case_insensitive else ""
         body = (
+            # Probe the pattern against empty input first: a bad ERE exits 2 here with the parse error
+            # on stderr (captured into `perr`), before any file is touched. Surface it via a distinct
+            # sentinel so fs_grep can map it to invalid_pattern rather than a blanket exec failure.
+            f"perr=$(grep -E {ci}-e {quoted_pattern} </dev/null 2>&1); pc=$?; "
+            # EXACTLY exit 2 means a bad ERE -> bad-pattern sentinel. A HIGHER code (126 not-executable,
+            # 127 grep-missing) is an environment fault, NOT a bad pattern: let it fall through to
+            # `exit 2` -> RuntimeError -> exec_failed, so a missing grep is never reported to the agent
+            # as "your regex is invalid".
+            f'[ "$pc" -eq 2 ] && {{ printf "%s" "$perr"; exit {_GREP_BAD_PATTERN_EXIT}; }}; '
+            f'[ "$pc" -le 1 ] || exit 2; '
             f"if [ -d {quoted} ]; then "
             # Capture grep's stderr (per-file read errors) into `errs` while matches flow to the real
             # stdout via fd 3; `find`'s own stderr stays discarded, so an unreadable *subdirectory* is
@@ -903,15 +1181,17 @@ class SandboxDockerSession:
             # busybox ash. fd 3 must be closed *after* `ec=$?` so the close can't clobber the status.
             f"exec 3>&1; "
             f"errs=$({{ {{ find {quoted} -mindepth 1 {prune} -type f -print0 2>/dev/null || true; }} "
-            f"| xargs -0 grep -HnF -e {quoted_pattern} /dev/null; }} 2>&1 1>&3 3>&-); ec=$?; exec 3>&-; "
+            f"| xargs -0 grep {ci}-HnE -e {quoted_pattern} /dev/null; }} 2>&1 1>&3 3>&-); ec=$?; exec 3>&-; "
             # A non-empty `errs` means a searched file couldn't be read -> surface it as exit 2.
             f'[ -z "$errs" ] || exit 2; '
             # No read error: xargs collapsed grep's 1 (no match) and 2 into 123, so 0/123 are both
             # success here; anything else (e.g. 127 grep-missing) becomes exit 2 -> RuntimeError.
             f'[ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2; '
-            f"else grep -HnF -e {quoted_pattern} -- {quoted} 2>/dev/null; fi"
+            f"else grep {ci}-HnE -e {quoted_pattern} -- {quoted} 2>/dev/null; fi"
         )
         result = self._run_path_guarded(path, body)
+        if result.exit_code == _GREP_BAD_PATTERN_EXIT:
+            raise InvalidGrepPatternError(result.output.strip() or f"invalid pattern: {pattern!r}")
         if result.exit_code >= 2:
             raise RuntimeError(f"grep failed (exit {result.exit_code}) for {path!r}")
         matches: list[GrepHit] = []
@@ -921,6 +1201,8 @@ class SandboxDockerSession:
                 file_path, line_no, text = parts[0], int(parts[1]), parts[2]
                 if glob is None or fnmatch.fnmatchcase(PurePosixPath(file_path).name, glob):
                     matches.append(GrepHit(file_path, line_no, text))
+                    if head_limit is not None and len(matches) >= head_limit:
+                        break
         return matches
 
     def find_paths(self, path: str, excludes: tuple[str, ...] = ()) -> list[DirEntry]:

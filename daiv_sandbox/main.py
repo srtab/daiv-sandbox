@@ -50,6 +50,7 @@ from daiv_sandbox.sessions import (
     SKILLS_ROOT,
     TYPE_CMD_EXECUTOR,
     WORKSPACE_ROOT,
+    InvalidGrepPatternError,
     SandboxDockerSession,
     SessionUnavailableError,
     _validate_sandbox_path,
@@ -586,13 +587,25 @@ async def fs_grep(
     async with _workspace_executor(http_request, session_id) as cmd:
         try:
             excludes = _merge_excludes(request.exclude)
-            matches = await asyncio.to_thread(cmd.grep, request.pattern, request.path, request.glob, excludes)
+            matches = await asyncio.to_thread(
+                cmd.grep,
+                request.pattern,
+                request.path,
+                request.glob,
+                excludes,
+                case_insensitive=request.case_insensitive,
+                multiline=request.multiline,
+                head_limit=request.head_limit,
+            )
         except FileNotFoundError:
             return FsGrepResponse(error=FsError(code=FsErrorCode.NOT_FOUND, message=f"No such path: {request.path}"))
         except PermissionError:
             return FsGrepResponse(
                 error=FsError(code=FsErrorCode.PERMISSION_DENIED, message=f"Permission denied: {request.path}")
             )
+        except InvalidGrepPatternError as exc:
+            # The engine's own (agent-readable) parse-error message is forwarded verbatim.
+            return FsGrepResponse(error=FsError(code=FsErrorCode.INVALID_PATTERN, message=str(exc)))
         except RuntimeError as exc:
             logger.exception("fs_grep failed for %s", request.path)
             return FsGrepResponse(error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
