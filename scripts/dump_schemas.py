@@ -9,6 +9,13 @@ the two sides. To refresh the dump:
 """
 
 import json
+import sys
+from pathlib import Path
+
+# Running `python scripts/dump_schemas.py` puts `scripts/` (not the repo root) on sys.path[0], so the
+# `daiv_sandbox` package would not import. Prepend the repo root so the documented invocation works
+# without requiring an editable install or an explicit PYTHONPATH.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from daiv_sandbox.schemas import (
     FsDeleteRequest,
@@ -60,8 +67,6 @@ _TYPES = [
 
 
 def main() -> None:
-    import sys
-
     schemas = {cls.__name__: cls.model_json_schema() for cls in _TYPES}
     sys.stdout.write(json.dumps(schemas, indent=2, sort_keys=True))
     sys.stdout.write("\n")

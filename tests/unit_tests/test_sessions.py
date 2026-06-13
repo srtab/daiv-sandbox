@@ -9,15 +9,18 @@ from docker.models.images import Image
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.sessions import (
+    _GREP_BAD_PATTERN_EXIT,
     _PATH_ABSENT_EXIT,
     _PATH_DENIED_EXIT,
     _PATH_WRONG_TYPE_EXIT,
     PIPEFAIL_WRAPPER,
+    RIPGREP_CONTAINER_PATH,
     SANDBOX_HOME,
     SANDBOX_ROOT,
     SCRATCH_ROOT,
     SKILLS_ROOT,
     WORKSPACE_ROOT,
+    InvalidGrepPatternError,
     SandboxDockerSession,
     SessionUnavailableError,
     _build_single_file_tar_stream,
@@ -139,6 +142,58 @@ def test_start_container_force_removes_on_bootstrap_failure(mock_docker_client):
         session._start_container("img:latest")
 
     mock_container.remove.assert_called_once_with(force=True)
+
+
+def test_inject_ripgrep_sets_path_on_matching_arch(mock_docker_client, monkeypatch):
+    """A detectable arch with a bundled binary -> binary is put_archive'd and `_rg_path` is set."""
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"x86_64\n")
+    mock_container.put_archive.return_value = True
+    monkeypatch.setattr("daiv_sandbox.sessions.Path.read_bytes", lambda self: b"\x7fELF-fake-rg")
+
+    session._inject_ripgrep(mock_container)
+
+    assert session._rg_path == RIPGREP_CONTAINER_PATH
+    mock_container.exec_run.assert_any_call(["uname", "-m"])
+    assert mock_container.put_archive.called
+
+
+def test_inject_ripgrep_unknown_arch_degrades_to_none(mock_docker_client):
+    """An arch with no bundled binary leaves `_rg_path` None (POSIX fallback) and never raises."""
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"riscv64\n")
+
+    session._inject_ripgrep(mock_container)  # must not raise
+
+    assert session._rg_path is None
+    assert not mock_container.put_archive.called
+
+
+def test_inject_ripgrep_put_archive_failure_degrades_to_none(mock_docker_client, monkeypatch):
+    """A put_archive failure is logged and tolerated: `_rg_path` stays None, no exception escapes."""
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"aarch64\n")
+    mock_container.put_archive.return_value = False
+    monkeypatch.setattr("daiv_sandbox.sessions.Path.read_bytes", lambda self: b"fake")
+
+    session._inject_ripgrep(mock_container)  # must not raise
+
+    assert session._rg_path is None
+
+
+def test_inject_ripgrep_uname_failure_degrades_to_none(mock_docker_client):
+    """If `uname -m` itself fails, fall back to POSIX grep without raising."""
+    session = SandboxDockerSession()
+    mock_container = mock_docker_client.containers.run.return_value
+    mock_container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
+
+    session._inject_ripgrep(mock_container)  # must not raise
+
+    assert session._rg_path is None
+    assert not mock_container.put_archive.called
 
 
 def _resolv_exec_cmd(nameservers):
@@ -1126,11 +1181,13 @@ def test_start_container_creates_scratch_root(mock_docker_client):
     assert any(SCRATCH_ROOT in c.args[0] for c in chown_calls), "scratch root not chowned"
 
 
-def _session_with_container():
+def _session_with_container(rg_path=None):
     s = SandboxDockerSession.__new__(SandboxDockerSession)
     s.container = Mock()
     s.client = Mock()
     s.session_id = "sid"
+    # Default to no ripgrep so `grep` takes the POSIX fallback unless a test opts into the rg path.
+    s._rg_path = rg_path
     return s
 
 
@@ -1444,15 +1501,22 @@ def test_grep_permission_denied_raises():
 
 
 def test_grep_directory_branch_uses_find_xargs_with_prune_and_sentinel():
-    s = _session_with_container()
+    s = _session_with_container()  # rg unavailable -> POSIX fallback
     s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
     s.grep("needle", "/scratch", glob=None, excludes=(".git",))
     cmd = s.execute_command.call_args.args[0]
     assert "if [ -d '/scratch' ]" in cmd  # directory branch
     assert r"\( -name '.git' \) -prune -o" in cmd  # pruning applied
     assert "-type f -print0" in cmd
-    assert "xargs -0 grep -HnF -e 'needle' /dev/null" in cmd  # /dev/null sentinel, literal pattern
-    assert "else grep -HnF -e 'needle' --" in cmd  # single-file fallback branch
+    assert "xargs -0 grep -HnE -e 'needle' /dev/null" in cmd  # /dev/null sentinel, ERE (regex) pattern
+    assert "else grep -HnE -e 'needle' --" in cmd  # single-file fallback branch
+    # The pattern is probed against empty input first so a bad ERE is mapped to invalid_pattern.
+    assert "grep -E -e 'needle' </dev/null" in cmd
+    # The bad-pattern sentinel fires ONLY on exit 2 (a real parse error); a higher probe exit
+    # (126 not-executable / 127 grep-missing) must fall through to `exit 2` -> RuntimeError, so a
+    # missing grep is never misreported to the agent as an invalid regex.
+    assert f'[ "$pc" -eq 2 ] && {{ printf "%s" "$perr"; exit {_GREP_BAD_PATTERN_EXIT}; }};' in cmd
+    assert '[ "$pc" -le 1 ] || exit 2;' in cmd
     # Lock the read-error contract (only integration tests exercise it for real, so pin its shape
     # here so a refactor can't silently drop it): grep's stderr is captured via the fd-swap while
     # matches flow through fd 3, and a non-empty capture surfaces the read error as exit 2.
@@ -1475,6 +1539,127 @@ def test_grep_without_excludes_still_builds_directory_branch():
     cmd = s.execute_command.call_args.args[0]
     assert "if [ -d '/scratch' ]" in cmd
     assert "-prune" not in cmd  # empty predicate => no prune fragment
+
+
+# --- ripgrep (primary) path -------------------------------------------------
+
+
+def _rg_match_event(path: str, line_no: int, text: str) -> str:
+    """One rg --json 'match' event line, as rg emits it (path/line text under nested 'text' keys)."""
+    import json as _json
+
+    return _json.dumps({
+        "type": "match",
+        "data": {"path": {"text": path}, "line_number": line_no, "lines": {"text": text}},
+    })
+
+
+def test_grep_uses_ripgrep_when_available():
+    """When `_rg_path` is set, grep runs `<rg> --json`, not the POSIX find|xargs pipeline."""
+    s = _session_with_container(rg_path=RIPGREP_CONTAINER_PATH)
+    s.execute_command = Mock(return_value=Mock(exit_code=1, output=""))  # exit 1 = no matches
+    s.grep("needle", "/scratch", glob=None)
+    cmd = s.execute_command.call_args.args[0]
+    assert f"{_sh_quote(RIPGREP_CONTAINER_PATH)} --json" in cmd
+    assert "-e 'needle'" in cmd
+    assert "find" not in cmd and "xargs" not in cmd  # not the POSIX fallback
+
+
+def test_grep_ripgrep_parses_json_stream():
+    """rg's JSON event stream is parsed into GrepHit, ignoring non-match events; paths may contain ':'."""
+    s = _session_with_container(rg_path=RIPGREP_CONTAINER_PATH)
+    output = (
+        '{"type":"begin","data":{"path":{"text":"/scratch/a:b.py"}}}\n'
+        + _rg_match_event("/scratch/a:b.py", 7, "found here\n")
+        + "\n"
+        + '{"type":"end","data":{}}\n'
+        + '{"type":"summary","data":{}}\n'
+    )
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=output))
+    matches = s.grep("found", "/scratch", glob=None)
+    # The ':' in the path survives because rg --json carries the path as structured JSON, not split text.
+    assert matches == [("/scratch/a:b.py", 7, "found here")]
+
+
+def test_grep_ripgrep_head_limit_caps_matches():
+    s = _session_with_container(rg_path=RIPGREP_CONTAINER_PATH)
+    output = "\n".join(_rg_match_event(f"/scratch/f{i}.py", i, f"hit {i}") for i in range(1, 6)) + "\n"
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=output))
+    matches = s.grep("hit", "/scratch", glob=None, head_limit=2)
+    assert len(matches) == 2
+    assert matches == [("/scratch/f1.py", 1, "hit 1"), ("/scratch/f2.py", 2, "hit 2")]
+
+
+def test_grep_ripgrep_case_insensitive_and_multiline_flags():
+    s = _session_with_container(rg_path=RIPGREP_CONTAINER_PATH)
+    s.execute_command = Mock(return_value=Mock(exit_code=1, output=""))
+    s.grep("x", "/scratch", glob="*.py", excludes=("node_modules",), case_insensitive=True, multiline=True)
+    cmd = s.execute_command.call_args.args[0]
+    assert " -i " in f" {cmd} "  # case-insensitive flag
+    assert "--multiline" in cmd
+    assert "--glob '*.py'" in cmd  # basename glob threaded to rg
+    assert "--glob '!**/node_modules/**'" in cmd  # exclude pruned via rg glob
+
+
+def test_grep_ripgrep_invalid_pattern_raises_invalid_pattern_error():
+    """rg exit 2 with a regex parse error is surfaced as InvalidGrepPatternError carrying rg's message."""
+    s = _session_with_container(rg_path=RIPGREP_CONTAINER_PATH)
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="regex parse error:\n  unclosed group"))
+    with pytest.raises(InvalidGrepPatternError) as excinfo:
+        s.grep("(", "/scratch", glob=None)
+    assert "regex parse error" in str(excinfo.value)
+
+
+def test_grep_ripgrep_other_exit_2_raises_runtime_error():
+    """An exit-2 that is NOT a regex parse error stays a RuntimeError (not invalid_pattern)."""
+    s = _session_with_container(rg_path=RIPGREP_CONTAINER_PATH)
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="rg: /scratch: No such file or directory"))
+    with pytest.raises(RuntimeError):
+        s.grep("x", "/scratch", glob=None)
+
+
+# --- POSIX fallback regex/limit behavior ------------------------------------
+
+
+def test_grep_posix_invalid_pattern_raises_invalid_pattern_error():
+    """The fallback's empty-input probe maps a bad ERE (sentinel exit) to InvalidGrepPatternError."""
+    s = _session_with_container()  # no rg
+    s.execute_command = Mock(return_value=Mock(exit_code=_GREP_BAD_PATTERN_EXIT, output="grep: Unmatched ( or \\("))
+    with pytest.raises(InvalidGrepPatternError) as excinfo:
+        s.grep("(", "/scratch", glob=None)
+    assert "Unmatched" in str(excinfo.value)
+
+
+def test_grep_posix_missing_grep_is_runtime_error_not_invalid_pattern():
+    """A missing/non-executable grep makes the probe fall through to `exit 2`, which the shell yields
+    as exit 2 -> RuntimeError (exec_failed), NOT the bad-pattern sentinel. Guards against reporting an
+    environment fault to the agent as 'your regex is invalid' (the failure class this feature fights)."""
+    s = _session_with_container()  # no rg -> POSIX path
+    # exit 2 is what the guarded body returns when the probe saw 126/127 and ran `|| exit 2`.
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="sh: grep: not found"))
+    with pytest.raises(RuntimeError):
+        s.grep("needle", "/scratch", glob=None)
+    # And it must NOT be the bad-pattern subclass.
+    s.execute_command = Mock(return_value=Mock(exit_code=2, output="sh: grep: not found"))
+    with pytest.raises(RuntimeError) as excinfo:
+        s.grep("needle", "/scratch", glob=None)
+    assert not isinstance(excinfo.value, InvalidGrepPatternError)
+
+
+def test_grep_posix_head_limit_caps_matches():
+    s = _session_with_container()
+    out = "".join(f"/scratch/f{i}.py:{i}:hit\n" for i in range(1, 6))
+    s.execute_command = Mock(return_value=Mock(exit_code=0, output=out))
+    matches = s.grep("hit", "/scratch", glob=None, head_limit=3)
+    assert len(matches) == 3
+
+
+def test_grep_posix_case_insensitive_adds_flag():
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=1, output=""))
+    s.grep("abc", "/scratch", glob=None, case_insensitive=True)
+    cmd = s.execute_command.call_args.args[0]
+    assert "grep -i -HnE -e 'abc'" in cmd
 
 
 def test_read_file_bytes_directory_raises_is_a_directory():
