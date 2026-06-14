@@ -83,6 +83,12 @@ _PATH_ABSENT_EXIT = 7
 _PATH_WRONG_TYPE_EXIT = 8
 _PATH_DENIED_EXIT = 9
 
+# Sentinel exit emitted by `grep` when the search pattern is not a valid POSIX ERE. The pattern is
+# probed against /dev/null (no workspace file is read) before the real search, so this cleanly
+# separates a bad regex (a model-fixable error) from a per-file read error (also exit 2). 6 is
+# unused by test/ls/grep/find/xargs and the path-guard sentinels (7/8/9), so it can't collide.
+_GREP_BAD_PATTERN_EXIT = 6
+
 
 def _sh_quote(value: str) -> str:
     """

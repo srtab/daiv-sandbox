@@ -69,6 +69,7 @@ class FsErrorCode(StrEnum):
     INVALID_OFFSET = "invalid_offset"
     PERMISSION_DENIED = "permission_denied"
     EXEC_FAILED = "exec_failed"
+    INVALID_PATTERN = "invalid_pattern"
 
 
 class FsError(BaseModel):
