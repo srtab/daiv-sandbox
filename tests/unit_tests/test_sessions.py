@@ -9,6 +9,7 @@ from docker.models.images import Image
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.sessions import (
+    _GREP_BAD_PATTERN_EXIT,
     _PATH_ABSENT_EXIT,
     _PATH_DENIED_EXIT,
     _PATH_WRONG_TYPE_EXIT,
@@ -1164,6 +1165,26 @@ def test_grep_parses_matches():
     assert matches == [("/scratch/a.py", 3, "found here")]
 
 
+def test_grep_uses_extended_regex_not_fixed_strings():
+    """grep must run in ERE mode (-E), never fixed-strings (-F), and probe the pattern first."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=1, output=""))
+    s.grep("foo|bar", "/scratch", glob=None)
+    cmd = s.execute_command.call_args.args[0]
+    assert "-HnE" in cmd
+    assert "-HnF" not in cmd
+    assert "grep -E -e" in cmd  # the /dev/null validity probe
+    assert f"exit {_GREP_BAD_PATTERN_EXIT}" in cmd
+
+
+def test_grep_invalid_pattern_raises_value_error():
+    """An invalid ERE (probe exits 2 -> sentinel) surfaces as ValueError, not RuntimeError."""
+    s = _session_with_container()
+    s.execute_command = Mock(return_value=Mock(exit_code=_GREP_BAD_PATTERN_EXIT, output=""))
+    with pytest.raises(ValueError, match="invalid regular expression"):
+        s.grep("foo(", "/scratch", glob=None)
+
+
 def test_delete_file_runs_rm():
     s = _session_with_container()
     s.execute_command = Mock(return_value=Mock(exit_code=0, output=""))
@@ -1451,8 +1472,8 @@ def test_grep_directory_branch_uses_find_xargs_with_prune_and_sentinel():
     assert "if [ -d '/scratch' ]" in cmd  # directory branch
     assert r"\( -name '.git' \) -prune -o" in cmd  # pruning applied
     assert "-type f -print0" in cmd
-    assert "xargs -0 grep -HnF -e 'needle' /dev/null" in cmd  # /dev/null sentinel, literal pattern
-    assert "else grep -HnF -e 'needle' --" in cmd  # single-file fallback branch
+    assert "xargs -0 grep -HnE -e 'needle' /dev/null" in cmd  # /dev/null sentinel, ERE pattern
+    assert "else grep -HnE -e 'needle' --" in cmd  # single-file fallback branch
     # Lock the read-error contract (only integration tests exercise it for real, so pin its shape
     # here so a refactor can't silently drop it): grep's stderr is captured via the fd-swap while
     # matches flow through fd 3, and a non-empty capture surfaces the read error as exit 2.
