@@ -890,7 +890,9 @@ def test_fs_grep_missing_directory_returns_empty(mock_session, client):
 
 
 def test_fs_grep_invalid_pattern_returns_invalid_pattern_code(mock_session, client):
-    mock_session.grep.side_effect = ValueError("invalid regular expression: 'foo('")
+    from daiv_sandbox.sessions import GrepPatternError
+
+    mock_session.grep.side_effect = GrepPatternError("invalid regular expression: 'foo('")
     resp = client.post(
         f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/tmp", "pattern": "foo("}
     )
@@ -898,6 +900,27 @@ def test_fs_grep_invalid_pattern_returns_invalid_pattern_code(mock_session, clie
     body = resp.json()
     assert body["matches"] == []
     assert body["error"]["code"] == "invalid_pattern"
+
+
+def test_fs_grep_unexpected_value_error_maps_to_exec_failed(mock_session, client):
+    """A non-pattern ValueError must NOT be relabelled invalid_pattern — it maps to exec_failed."""
+    mock_session.grep.side_effect = ValueError("some unrelated failure")
+    resp = client.post(f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/tmp", "pattern": "x"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["matches"] == []
+    assert body["error"]["code"] == "exec_failed"
+
+
+def test_fs_grep_exactly_at_cap_is_not_truncated(mock_session, client):
+    from daiv_sandbox.main import _GREP_MATCH_CAP
+
+    mock_session.grep.return_value = [(f"/workspace/tmp/f{i}.py", 1, "x") for i in range(_GREP_MATCH_CAP)]
+    resp = client.post(f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/tmp", "pattern": "x"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["matches"]) == _GREP_MATCH_CAP
+    assert body["truncated"] is False
 
 
 def test_fs_grep_caps_matches_and_sets_truncated(mock_session, client):

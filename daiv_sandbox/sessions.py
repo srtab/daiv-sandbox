@@ -48,6 +48,15 @@ class SessionUnavailableError(RuntimeError):
         self.action = action
 
 
+class GrepPatternError(ValueError):
+    """The grep search pattern is not a valid POSIX ERE (probe tripped ``_GREP_BAD_PATTERN_EXIT``).
+
+    A ``ValueError`` subclass so existing callers/tests that catch ``ValueError`` still match, while
+    letting the endpoint distinguish a model-fixable bad pattern from any *other* ``ValueError`` that
+    might escape ``grep`` (which must not be silently relabelled ``invalid_pattern``).
+    """
+
+
 class DirEntry(NamedTuple):
     """A single filesystem entry returned by ``list_dir``/``find_paths``."""
 
@@ -85,8 +94,11 @@ _PATH_DENIED_EXIT = 9
 
 # Sentinel exit emitted by `grep` when the search pattern is not a valid POSIX ERE. The pattern is
 # probed against /dev/null (no workspace file is read) before the real search, so this cleanly
-# separates a bad regex (a model-fixable error) from a per-file read error (also exit 2). 6 is
-# unused by test/ls/grep/find/xargs and the path-guard sentinels (7/8/9), so it can't collide.
+# separates a bad regex (a model-fixable error) from a per-file read error (also exit 2). The probe's
+# explicit `exit 6` is the *only* place this code is produced: the directory branch remaps any child
+# status other than 0/123 to exit 2 (and the single-file branch raises on grep's own >= 2), so a
+# natural exit 6 from grep/xargs can never survive to the Python-side check below. 6 is also outside
+# the path-guard sentinel range (7/8/9), so the two sentinel schemes don't overlap.
 _GREP_BAD_PATTERN_EXIT = 6
 
 
@@ -925,7 +937,7 @@ class SandboxDockerSession:
         )
         result = self._run_path_guarded(path, body)
         if result.exit_code == _GREP_BAD_PATTERN_EXIT:
-            raise ValueError(f"invalid regular expression: {pattern!r}")
+            raise GrepPatternError(f"invalid regular expression: {pattern!r}")
         if result.exit_code >= 2:
             raise RuntimeError(f"grep failed (exit {result.exit_code}) for {path!r}")
         matches: list[GrepHit] = []

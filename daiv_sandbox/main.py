@@ -50,6 +50,7 @@ from daiv_sandbox.sessions import (
     SKILLS_ROOT,
     TYPE_CMD_EXECUTOR,
     WORKSPACE_ROOT,
+    GrepPatternError,
     SandboxDockerSession,
     SessionUnavailableError,
     _validate_sandbox_path,
@@ -598,9 +599,11 @@ async def fs_grep(
             return FsGrepResponse(
                 error=FsError(code=FsErrorCode.PERMISSION_DENIED, message=f"Permission denied: {request.path}")
             )
-        except ValueError as exc:
+        except GrepPatternError as exc:
             return FsGrepResponse(error=FsError(code=FsErrorCode.INVALID_PATTERN, message=str(exc)))
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
+            # ValueError here is unexpected (a bad pattern is the GrepPatternError above) — log it
+            # rather than silently relabel it ``invalid_pattern`` and mislead the model.
             logger.exception("fs_grep failed for %s", request.path)
             return FsGrepResponse(error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
         truncated = len(matches) > _GREP_MATCH_CAP
