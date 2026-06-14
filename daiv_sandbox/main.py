@@ -427,6 +427,11 @@ async def version() -> dict[Literal["version"], str]:
 
 _WORKSPACE_ROOTS = (WORKSPACE_ROOT,)
 
+# Hard cap on grep matches returned over the wire. Bounds the LLM-facing payload (and tool-result
+# eviction pressure) regardless of how broad the pattern is; the response's ``truncated`` flag tells
+# the caller results were dropped so it can narrow the search.
+_GREP_MATCH_CAP = 200
+
 
 def _validate_workspace_dir(path: str) -> None:
     """Validate a directory path for ls/grep/glob: the workspace root itself or anything under it.
@@ -593,10 +598,14 @@ async def fs_grep(
             return FsGrepResponse(
                 error=FsError(code=FsErrorCode.PERMISSION_DENIED, message=f"Permission denied: {request.path}")
             )
+        except ValueError as exc:
+            return FsGrepResponse(error=FsError(code=FsErrorCode.INVALID_PATTERN, message=str(exc)))
         except RuntimeError as exc:
             logger.exception("fs_grep failed for %s", request.path)
             return FsGrepResponse(error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
-        return FsGrepResponse(matches=[FsGrepMatch(path=p, line=n, text=t) for p, n, t in matches])
+        truncated = len(matches) > _GREP_MATCH_CAP
+        capped = matches[:_GREP_MATCH_CAP]
+        return FsGrepResponse(matches=[FsGrepMatch(path=p, line=n, text=t) for p, n, t in capped], truncated=truncated)
 
 
 @app.post("/session/{session_id}/fs/glob", responses=_fs_responses, name="Glob workspace files")

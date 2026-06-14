@@ -889,6 +889,36 @@ def test_fs_grep_missing_directory_returns_empty(mock_session, client):
     assert body["error"]["code"] == "not_found"
 
 
+def test_fs_grep_invalid_pattern_returns_invalid_pattern_code(mock_session, client):
+    mock_session.grep.side_effect = ValueError("invalid regular expression: 'foo('")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/tmp", "pattern": "foo("}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["matches"] == []
+    assert body["error"]["code"] == "invalid_pattern"
+
+
+def test_fs_grep_caps_matches_and_sets_truncated(mock_session, client):
+    from daiv_sandbox.main import _GREP_MATCH_CAP
+
+    mock_session.grep.return_value = [(f"/workspace/tmp/f{i}.py", 1, "x") for i in range(_GREP_MATCH_CAP + 5)]
+    resp = client.post(f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/tmp", "pattern": "x"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["matches"]) == _GREP_MATCH_CAP
+    assert body["truncated"] is True
+
+
+def test_fs_grep_under_cap_is_not_truncated(mock_session, client):
+    mock_session.grep.return_value = [("/workspace/tmp/a.py", 1, "x")]
+    resp = client.post(f"/session/{mock_session.session_id}/fs/grep", json={"path": "/workspace/tmp", "pattern": "x"})
+    body = resp.json()
+    assert body["truncated"] is False
+    assert len(body["matches"]) == 1
+
+
 def test_fs_glob_unbalanced_bracket_is_literal(mock_session, client):
     """An unbalanced '[' is treated as a literal (shell-like), not rejected as a 400.
 
