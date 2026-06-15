@@ -34,6 +34,7 @@ dev = [
   "prek>=0.4.4",
   "pyopenssl==26.3.0",
   "pyproject-fmt==2.24.1",
+  "pytest-asyncio==1.4.0",
   "pytest-cov==7.1.0",
   "pytest-env==1.6.0",
   "pytest-mock==3.15.1",
@@ -116,6 +117,7 @@ ignore_missing_imports = true
 
 [tool.pytest]
 ini_options.addopts = "--cov --cov-config=.coveragerc"
+ini_options.asyncio_mode = "auto"
 
 [tool.pytest_env]
 DAIV_SANDBOX_API_KEY = "notsosecret"
