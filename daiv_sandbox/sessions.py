@@ -48,6 +48,15 @@ class SessionUnavailableError(RuntimeError):
         self.action = action
 
 
+class GrepPatternError(ValueError):
+    """The grep search pattern is not a valid POSIX ERE (probe tripped ``_GREP_BAD_PATTERN_EXIT``).
+
+    A ``ValueError`` subclass so existing callers/tests that catch ``ValueError`` still match, while
+    letting the endpoint distinguish a model-fixable bad pattern from any *other* ``ValueError`` that
+    might escape ``grep`` (which must not be silently relabelled ``invalid_pattern``).
+    """
+
+
 class DirEntry(NamedTuple):
     """A single filesystem entry returned by ``list_dir``/``find_paths``."""
 
@@ -82,6 +91,15 @@ _PATH_ABSENT_EXIT = 7
 # 8 and 9 are unused by test/ls/grep/find, so they can't collide.
 _PATH_WRONG_TYPE_EXIT = 8
 _PATH_DENIED_EXIT = 9
+
+# Sentinel exit emitted by `grep` when the search pattern is not a valid POSIX ERE. The pattern is
+# probed against /dev/null (no workspace file is read) before the real search, so this cleanly
+# separates a bad regex (a model-fixable error) from a per-file read error (also exit 2). The probe's
+# explicit `exit 6` is the *only* place this code is produced: the directory branch remaps any child
+# status other than 0/123 to exit 2 (and the single-file branch raises on grep's own >= 2), so a
+# natural exit 6 from grep/xargs can never survive to the Python-side check below. 6 is also outside
+# the path-guard sentinel range (7/8/9), so the two sentinel schemes don't overlap.
+_GREP_BAD_PATTERN_EXIT = 6
 
 
 def _sh_quote(value: str) -> str:
@@ -863,7 +881,7 @@ class SandboxDockerSession:
         return entries
 
     def grep(self, pattern: str, path: str, glob: str | None, excludes: tuple[str, ...] = ()) -> list[GrepHit]:
-        """Literal recursive search. Returns GrepHit(path, line, text).
+        """Regular-expression (POSIX ERE) recursive search. Returns GrepHit(path, line, text).
 
         For a directory target, files are enumerated with a prune-aware ``find`` and piped to
         ``grep`` (``--exclude-dir`` is GNU-only, so busybox can't prune in grep itself); this makes
@@ -891,6 +909,12 @@ class SandboxDockerSession:
         quoted_pattern = _sh_quote(pattern)
         prune = _prune_predicate(excludes)
         body = (
+            # Validate the regex up front against /dev/null (no workspace file is read): grep exits
+            # exactly 2 on a bad ERE, 0/1 on match/no-match. A missing grep (127) is left to fall
+            # through to the real run below, which raises as before. `-ne 2` so only a true bad
+            # pattern trips the sentinel.
+            f"grep -E -e {quoted_pattern} /dev/null 2>/dev/null; gp=$?; "
+            f'[ "$gp" -ne 2 ] || exit {_GREP_BAD_PATTERN_EXIT}; '
             f"if [ -d {quoted} ]; then "
             # Capture grep's stderr (per-file read errors) into `errs` while matches flow to the real
             # stdout via fd 3; `find`'s own stderr stays discarded, so an unreadable *subdirectory* is
@@ -903,15 +927,17 @@ class SandboxDockerSession:
             # busybox ash. fd 3 must be closed *after* `ec=$?` so the close can't clobber the status.
             f"exec 3>&1; "
             f"errs=$({{ {{ find {quoted} -mindepth 1 {prune} -type f -print0 2>/dev/null || true; }} "
-            f"| xargs -0 grep -HnF -e {quoted_pattern} /dev/null; }} 2>&1 1>&3 3>&-); ec=$?; exec 3>&-; "
+            f"| xargs -0 grep -HnE -e {quoted_pattern} /dev/null; }} 2>&1 1>&3 3>&-); ec=$?; exec 3>&-; "
             # A non-empty `errs` means a searched file couldn't be read -> surface it as exit 2.
             f'[ -z "$errs" ] || exit 2; '
             # No read error: xargs collapsed grep's 1 (no match) and 2 into 123, so 0/123 are both
             # success here; anything else (e.g. 127 grep-missing) becomes exit 2 -> RuntimeError.
             f'[ "$ec" -eq 0 ] || [ "$ec" -eq 123 ] || exit 2; '
-            f"else grep -HnF -e {quoted_pattern} -- {quoted} 2>/dev/null; fi"
+            f"else grep -HnE -e {quoted_pattern} -- {quoted} 2>/dev/null; fi"
         )
         result = self._run_path_guarded(path, body)
+        if result.exit_code == _GREP_BAD_PATTERN_EXIT:
+            raise GrepPatternError(f"invalid regular expression: {pattern!r}")
         if result.exit_code >= 2:
             raise RuntimeError(f"grep failed (exit {result.exit_code}) for {path!r}")
         matches: list[GrepHit] = []
