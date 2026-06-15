@@ -34,23 +34,6 @@ def make_probe_content(size_bytes: int, marker: str | None = None) -> bytes:
     return body + b"x" * (size_bytes - len(body))
 
 
-def _nested_path(index: int, depth: int) -> str:
-    # Bucket files into 8 dirs per level so a tree of arbitrary file_count nests to `depth`.
-    parts = [f"d{(index >> (3 * level)) & 0x7}" for level in range(depth)]
-    return "/".join([*parts, f"file_{index:06d}.txt"])
-
-
-def make_synthetic_corpus(name: str, file_count: int, depth: int, file_size: int = 256) -> Corpus:
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for i in range(file_count):
-            data = make_probe_content(file_size)
-            info = tarfile.TarInfo(name=f"{name}/{_nested_path(i, depth)}")
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
-    return Corpus(name=name, archive_bytes=buf.getvalue(), file_count=file_count)
-
-
 def _count_tar_files(archive: bytes) -> int:
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
         return sum(1 for m in tar.getmembers() if m.isfile())

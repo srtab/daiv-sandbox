@@ -32,9 +32,7 @@ def summarize(samples_ms: list[float]) -> Summary:
 
 
 def _percentile(ordered: list[float], pct: float) -> float:
-    # Nearest-rank percentile on an already-sorted, non-empty list.
-    if not ordered:
-        raise ValueError("percentile of an empty sequence")
+    # Nearest-rank percentile on an already-sorted, non-empty list (summarize guarantees non-empty).
     rank = math.ceil((pct / 100) * len(ordered))
     index = min(max(rank, 1), len(ordered)) - 1
     return ordered[index]

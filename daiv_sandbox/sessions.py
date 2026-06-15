@@ -112,6 +112,17 @@ def _sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def _resolve_under_root(value: str | None) -> str:
+    """Resolve a workdir/destination path against ``SANDBOX_ROOT``.
+
+    Defaults to ``SANDBOX_ROOT`` when *value* is empty, keeps an absolute path as-is, and resolves a
+    relative path under ``SANDBOX_ROOT``.
+    """
+    if not value:
+        return SANDBOX_ROOT
+    return value if Path(value).is_absolute() else (Path(SANDBOX_ROOT) / value).as_posix()
+
+
 def _prune_predicate(excludes: tuple[str, ...]) -> str:
     """
     Build a busybox-safe ``find`` fragment that prunes directories matching *excludes* by basename.
@@ -644,12 +655,7 @@ class SandboxDockerSession:
         """
         tardata.seek(0)
 
-        # Resolve destination: default to SANDBOX_ROOT, absolute stays absolute, relative resolves under SANDBOX_ROOT
-        to_dir = SANDBOX_ROOT
-        if dest:
-            to_dir = dest if Path(dest).is_absolute() else (Path(SANDBOX_ROOT) / dest).as_posix()
-
-        to_dir_norm = to_dir.rstrip("/") or "/"
+        to_dir_norm = _resolve_under_root(dest).rstrip("/") or "/"
         if to_dir_norm in {"", "/"}:
             raise ValueError("Refusing to extract an archive into the container root directory")
 
@@ -710,10 +716,7 @@ class SandboxDockerSession:
         Returns:
             RunResult: The result of the command.
         """
-        # Resolve workdir: default to SANDBOX_ROOT, absolute stays absolute, relative resolves under SANDBOX_ROOT
-        command_workdir = SANDBOX_ROOT
-        if workdir:
-            command_workdir = workdir if Path(workdir).is_absolute() else (Path(SANDBOX_ROOT) / workdir).as_posix()
+        command_workdir = _resolve_under_root(workdir)
 
         logger.info("Executing command in %s:%s -> '%s'", self.container.short_id, command_workdir, command)
 

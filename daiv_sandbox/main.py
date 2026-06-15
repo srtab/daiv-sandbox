@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Literal
 import sentry_sdk
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, UploadFile, status
 from fastapi import Path as FastAPIPath
+from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from redis.asyncio import Redis
 
@@ -150,8 +151,6 @@ app.state.session_lock_manager = NoopSessionLockManager()
 
 @app.exception_handler(SessionBusyError)
 async def _handle_session_busy(request: Request, exc: SessionBusyError) -> Response:
-    from fastapi.responses import JSONResponse
-
     return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": "Session is busy"})
 
 
@@ -160,8 +159,6 @@ async def _handle_session_unavailable(request: Request, exc: SessionUnavailableE
     # The container exists but a Docker fault prevented restarting/stopping it. This is an
     # infrastructure problem, not a missing session, so report 503 (retryable) rather than masking
     # it as a 404 or surfacing a bare 500.
-    from fastapi.responses import JSONResponse
-
     return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"detail": str(exc)})
 
 
@@ -266,12 +263,7 @@ async def seed_session(
             detail="At least one of repo_archive or skills_archive must be provided",
         )
 
-    async with http_request.app.state.session_lock_manager.acquire(session_id):
-        cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
-
-        if not cmd_executor.container:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
-
+    async with _workspace_executor(http_request, session_id) as cmd_executor:
         check = await asyncio.to_thread(
             cmd_executor.container.exec_run, ["/bin/sh", "-c", f"test -f {SEED_MARKER}"], user="root"
         )
@@ -323,12 +315,7 @@ async def run_on_session(
     """
     Run a set of commands on a session and return each command's result.
     """
-    async with http_request.app.state.session_lock_manager.acquire(session_id):
-        cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
-
-        if not cmd_executor.container:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
-
+    async with _workspace_executor(http_request, session_id) as cmd_executor:
         raw_timeout = request.timeout if request.timeout is not None else settings.COMMAND_TIMEOUT
         effective_timeout = float(raw_timeout) if raw_timeout > 0 else None
 
@@ -392,10 +379,7 @@ async def get_session(
     Return 204 if the session's container exists (restarting it if stopped, i.e. warming it for
     reuse), or 404 if it does not. Lock-guarded so it can't race the reaper.
     """
-    async with request.app.state.session_lock_manager.acquire(session_id):
-        cmd_executor = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
-        if not cmd_executor.container:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
+    async with _workspace_executor(request, session_id):
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -640,11 +624,11 @@ async def fs_glob(
         except RuntimeError as exc:
             logger.exception("fs_glob failed for %s", request.path)
             return FsGlobResponse(error=FsError(code=FsErrorCode.EXEC_FAILED, message=str(exc)))
-        base = request.path.rstrip("/")
+        prefix = f"{request.path.rstrip('/')}/"
         matched = [
             FsEntry(path=p, is_dir=d)
             for (p, d) in all_entries
-            if p.startswith(f"{base}/") and regex.match(p[len(base) + 1 :])
+            if p.startswith(prefix) and regex.match(p.removeprefix(prefix))
         ]
         matched.sort(key=lambda e: e.path)
         return FsGlobResponse(matches=matched)

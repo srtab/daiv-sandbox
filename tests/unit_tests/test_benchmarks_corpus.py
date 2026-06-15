@@ -3,7 +3,18 @@ import tarfile
 
 import pytest
 
-from benchmarks.corpus import PROBE_SIZES, Corpus, fetch_repo_corpus, make_probe_content, make_synthetic_corpus
+from benchmarks.corpus import PROBE_SIZES, fetch_repo_corpus, make_probe_content
+
+
+def _tar_gz_with_files(prefix: str, count: int) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for i in range(count):
+            data = b"x"
+            info = tarfile.TarInfo(name=f"{prefix}/file_{i:03d}.txt")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 
 
 def test_probe_sizes_present():
@@ -27,22 +38,11 @@ def test_make_probe_content_marker_too_long_raises():
         make_probe_content(2, marker="OLD")
 
 
-def test_make_synthetic_corpus_file_count_and_names():
-    corpus = make_synthetic_corpus("syn", file_count=50, depth=3)
-    assert isinstance(corpus, Corpus)
-    assert corpus.file_count == 50
-    with tarfile.open(fileobj=io.BytesIO(corpus.archive_bytes), mode="r:gz") as tar:
-        files = [m for m in tar.getmembers() if m.isfile()]
-    assert len(files) == 50
-    assert all(m.name.startswith("syn/") for m in files)
-
-
 def test_fetch_repo_corpus_uses_cache_without_network(tmp_path):
-    # Pre-seed the cache with a synthetic tarball at the expected filename; client=None
+    # Pre-seed the cache with a tarball at the expected filename; client=None
     # must NOT trigger a network call because the cache hit short-circuits.
-    cached = make_synthetic_corpus("requests-deadbeef", file_count=7, depth=2)
     cache_file = tmp_path / "psf-requests-deadbeef.tar.gz"
-    cache_file.write_bytes(cached.archive_bytes)
+    cache_file.write_bytes(_tar_gz_with_files("requests-deadbeef", 7))
 
     corpus = fetch_repo_corpus("psf", "requests", "deadbeef", name="small", cache_dir=tmp_path, client=None)
     assert corpus.name == "small"
