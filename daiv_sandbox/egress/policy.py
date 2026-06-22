@@ -44,7 +44,12 @@ class EgressPolicy:
 
     def _match(self, host: str, method: str) -> _Rule | None:
         for rule in self._rules:
-            if fnmatch.fnmatch(host, rule.host) and ("*" in rule.methods or method.upper() in rule.methods):
+            # CONNECT is a host-reachability check: the TLS tunnel hasn't been established yet,
+            # so the real HTTP method is unknown. Match any host-listed rule; the specific method
+            # restriction is enforced later at the request (post-interception) phase.
+            if fnmatch.fnmatch(host, rule.host) and (
+                method.upper() == "CONNECT" or "*" in rule.methods or method.upper() in rule.methods
+            ):
                 return rule
         return None
 
@@ -52,7 +57,11 @@ class EgressPolicy:
         rule = self._match(host, method)
         if rule is not None:
             inject = self._secrets.get(rule.inject) if rule.inject else None
-            intercept = self._intercept == "all" or inject is not None
+            # A method-restricted rule must be intercepted (MITM) so we can see the actual HTTP
+            # method after TLS termination. Without interception the tunnel is opaque and the
+            # method restriction becomes a fail-open passthrough — even in "credentialed" mode.
+            method_restricted = "*" not in rule.methods
+            intercept = self._intercept == "all" or inject is not None or method_restricted
             return Decision(allow=True, intercept=intercept, inject=inject)
         if self._default == "allow":
             return Decision(allow=True, intercept=self._intercept == "all", inject=None)

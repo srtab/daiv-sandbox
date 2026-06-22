@@ -63,3 +63,38 @@ def test_policy_store_reloads_on_mtime_change(tmp_path):
 def test_policy_store_missing_file_is_deny_all(tmp_path):
     store = PolicyStore(str(tmp_path / "nope.json"))
     assert store.current().evaluate("github.com", "GET").allow is False
+
+
+def test_connect_reaches_method_restricted_host_and_intercepts():
+    """CONNECT (HTTPS tunnel) must be allowed for a host-listed rule and must force interception
+    so the real HTTP method can be inspected post-TLS; POST must still be denied at request phase."""
+    p = EgressPolicy.from_config(_cfg(rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    connect = p.evaluate("api.github.com", "CONNECT")
+    assert connect.allow is True
+    assert connect.intercept is True  # method-restricted ⇒ must MITM
+    assert p.evaluate("api.github.com", "GET").allow is True
+    assert p.evaluate("api.github.com", "POST").allow is False  # enforced at request phase
+
+
+def test_method_restricted_rule_forces_interception_in_credentialed_mode():
+    """In credentialed (non-all) intercept mode a method-restricted rule still forces MITM —
+    without it the TLS tunnel is opaque and the method restriction is a fail-open passthrough."""
+    p = EgressPolicy.from_config(_cfg(intercept="credentialed", rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    connect = p.evaluate("api.github.com", "CONNECT")
+    assert connect.allow is True
+    assert connect.intercept is True  # forced because method-restricted, even without inject
+
+
+def test_wildcard_methods_rule_respects_credentialed_passthrough():
+    """A wildcard-methods rule with no inject key should NOT force interception in credentialed
+    mode — confirming we did not over-force interception for unrestricted hosts."""
+    p = EgressPolicy.from_config(_cfg(intercept="credentialed", rules=[{"host": "pypi.org", "methods": ["*"]}]))
+    connect = p.evaluate("pypi.org", "CONNECT")
+    assert connect.allow is True
+    assert connect.intercept is False  # no restriction, no inject ⇒ passthrough
+
+
+def test_connect_to_unlisted_host_still_denied():
+    """CONNECT reachability is gated by the host allowlist — unlisted hosts must still be denied."""
+    p = EgressPolicy.from_config(_cfg(rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    assert p.evaluate("evil.example", "CONNECT").allow is False
