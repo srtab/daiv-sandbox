@@ -378,15 +378,15 @@ After creating a session, call `POST /session/{session_id}/egress/` with a JSON 
     ]
   },
   "secrets": {
-    "github-token": "Bearer ghp_…"
+    "github-token": { "header": "Authorization", "value": "Bearer ghp_…" }
   }
 }
 ```
 
 - **`policy.default`** — `"deny"` (allowlist; only hosts with a matching rule are reachable) or `"allow"` (denylist; all hosts are reachable unless blocked).
-- **`policy.intercept`** — `"all"` (MITM every connection) or `"credentialed"` (MITM only hosts that inject credentials, tunnel the rest untouched).
-- **`policy.rules`** — list of per-host rules. `host` is a glob (e.g. `*.github.com`). `methods` restricts which HTTP methods are permitted (`["*"]` allows all). `inject` names a secret to inject as an `Authorization` header.
-- **`secrets`** — named header values injected by the sidecar. Keys are referenced from `inject` in rules; values are never forwarded to the sandbox.
+- **`policy.intercept`** — `"all"` (MITM every connection) or `"credentialed"` (MITM only hosts that inject credentials or carry a `methods` restriction; tunnel the rest untouched).
+- **`policy.rules`** — list of per-host rules. `host` is a glob (e.g. `*.github.com`), matched case-insensitively. `methods` restricts which HTTP methods are permitted (`["*"]` allows all). `inject` names a secret (from `secrets`) whose configured header is set on requests to this host.
+- **`secrets`** — named `{ "header", "value" }` pairs injected by the sidecar. Keys are referenced from `inject` in rules; the header name is arbitrary (e.g. `Authorization`, `PRIVATE-TOKEN`), and values are redacted in logs and never forwarded to the sandbox.
 
 > [!NOTE]
 > A rule with `methods` set to anything other than `["*"]` causes that host to be intercepted (MITM'd) regardless of the `intercept` mode, so the method can be enforced after TLS termination. Such hosts require the shared CA, which is installed into every egress sandbox automatically.

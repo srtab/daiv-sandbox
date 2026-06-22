@@ -116,3 +116,74 @@ def test_default_allow_still_enforces_method_limit_on_listed_host():
     assert p.evaluate("api.github.com", "CONNECT").allow is True
     # Host with NO rule at all still follows default-allow
     assert p.evaluate("unlisted.example", "POST").allow is True
+
+
+def test_host_matching_is_case_insensitive_under_default_allow():
+    """Hostnames are case-insensitive (DNS/RFC 4343). Untrusted sandbox code controls the requested
+    host, so an uppercased host must NOT slip past a per-host method limit under default="allow"."""
+    p = EgressPolicy.from_config(_cfg(default="allow", rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    # Uppercased host still matches the rule (allowed method)
+    assert p.evaluate("API.GITHUB.COM", "GET").allow is True
+    # ...and the method limit is still enforced — no bypass via case
+    assert p.evaluate("API.GITHUB.COM", "POST").allow is False
+    assert p.evaluate("Api.GitHub.Com", "POST").allow is False
+
+
+def test_host_matching_normalizes_rule_case():
+    """A rule whose host is written with mixed case still matches a lowercase request host."""
+    p = EgressPolicy.from_config(_cfg(rules=[{"host": "API.GitHub.Com", "methods": ["GET"]}]))
+    assert p.evaluate("api.github.com", "GET").allow is True
+
+
+def test_host_glob_is_case_insensitive():
+    """Glob rules match regardless of host case (default-deny: an uppercase host must still be allowed
+    by a matching wildcard, and an unlisted host still denied)."""
+    p = EgressPolicy.from_config(_cfg(rules=[{"host": "*.githubusercontent.com", "methods": ["GET"]}]))
+    assert p.evaluate("RAW.GithubUserContent.com", "GET").allow is True
+
+
+def test_policy_store_malformed_json_is_deny_all(tmp_path):
+    """A present-but-corrupt config (invalid JSON) must fail closed to deny-all, not crash/fail open."""
+    path = tmp_path / "config.json"
+    path.write_text("{ not valid json")
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("github.com", "GET").allow is False
+
+
+def test_policy_store_structurally_bad_config_is_deny_all(tmp_path):
+    """A structurally-bad config (e.g. `secrets` is a list, not a dict) makes from_config raise a
+    TypeError/AttributeError. That must still fail closed — if it escaped into the mitmproxy hook the
+    flow would be allowed through (mitmproxy fails open on hook exceptions)."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"policy": {"default": "deny", "rules": []}, "secrets": ["not", "a", "dict"]}))
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("github.com", "GET").allow is False
+
+
+def test_policy_store_reverts_to_deny_all_when_good_config_replaced_with_garbage(tmp_path):
+    """A config that loaded cleanly once and is then replaced with garbage must revert to deny-all,
+    not keep serving the previous allow policy."""
+    import os
+    import time
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_cfg(default="allow")))
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("github.com", "GET").allow is True
+    path.write_text("garbage{")
+    os.utime(path, (time.time() + 1, time.time() + 1))
+    assert store.current().evaluate("github.com", "GET").allow is False
+
+
+def test_unknown_default_value_fails_closed_to_deny():
+    """A typo'd `default` (e.g. "allowed") must not be treated as allow — it must fail closed."""
+    p = EgressPolicy.from_config(_cfg(default="allowed"))  # typo for "allow"
+    assert p.evaluate("unlisted.example", "GET").allow is False
+
+
+def test_unknown_intercept_value_fails_closed_to_full_interception():
+    """A typo'd `intercept` mode must not silently downgrade to passthrough; fail closed to full MITM."""
+    p = EgressPolicy.from_config(_cfg(default="allow", intercept="credentialled"))  # typo for "credentialed"
+    d = p.evaluate("pypi.org", "GET")
+    assert d.allow is True
+    assert d.intercept is True  # coerced to "all" rather than silently passing through un-inspected

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -50,8 +49,14 @@ class EgressProxyManager:
     def __init__(self, client: DockerClient):
         self.client = client
 
+    @staticmethod
+    def _internal_network_name(token: str) -> str:
+        """The per-session internal network name. Single source of truth so callers that need to
+        resolve the proxy's IP on it (see proxy_internal_ip) can't drift from create_network."""
+        return f"daiv-egress-{token}"
+
     def create_network(self, token: str) -> str:
-        name = f"daiv-egress-{token}"
+        name = self._internal_network_name(token)
         self.client.networks.create(
             name=name,
             driver="bridge",
@@ -90,12 +95,17 @@ class EgressProxyManager:
         with _build_single_file_tar_stream(
             filename, ca_pem, mode=0o600, uid=settings.RUN_UID, gid=settings.RUN_GID
         ) as tar:
-            proxy.put_archive(parent, tar)
+            # put_archive returns False (it does not always raise) when the daemon rejects the copy.
+            # Fail closed: a proxy booted without the configured CA would silently fall back to its own
+            # self-generated CA, which the sandbox does not trust.
+            if not proxy.put_archive(parent, tar):
+                raise RuntimeError(f"egress: failed to inject CA into sidecar confdir for {token}")
         proxy.start()
         logger.info("egress: started proxy %s for token %s", proxy.short_id, token)
         return proxy
 
-    def proxy_internal_ip(self, token: str, network_name: str) -> str:
+    def proxy_internal_ip(self, token: str) -> str:
+        network_name = self._internal_network_name(token)
         proxy = self._proxy(token)
         proxy.reload()
         nets = proxy.attrs["NetworkSettings"]["Networks"]
@@ -116,9 +126,16 @@ class EgressProxyManager:
                 raise RuntimeError(f"egress: failed to provision config for {token}")
 
     def teardown(self, token: str) -> None:
+        # Best-effort: an already-gone resource (NotFound) is success; any other failure is logged and
+        # swallowed so one stuck resource never masks the caller's original error or skips the rest of
+        # the cleanup (the reaper retries on the next sweep).
         for proxy in self._list(TYPE_EGRESS_PROXY, token):
-            with contextlib.suppress(NotFound):
+            try:
                 proxy.remove(force=True)
+            except NotFound:
+                pass
+            except Exception:
+                logger.exception("egress: failed to remove proxy %s", getattr(proxy, "short_id", "?"))
         for net in self.client.networks.list(filters={"label": f"{EGRESS_SESSION_LABEL}={token}"}):
             try:
                 net.remove()

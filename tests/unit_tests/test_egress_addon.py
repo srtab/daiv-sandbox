@@ -67,3 +67,30 @@ def test_tls_clienthello_passthrough_for_allowed_noncred(tmp_path):
     data = types.SimpleNamespace(client_hello=types.SimpleNamespace(sni="pypi.org"), ignore_connection=False)
     a.tls_clienthello(data)
     assert data.ignore_connection is True  # not intercepted -> tunnel untouched
+
+
+def test_request_denies_disallowed_method_on_method_restricted_host(tmp_path):
+    """The real per-host method limit is enforced post-MITM in request(): a host reachable via CONNECT
+    (methods:["GET"]) must still have a POST blocked at the request phase. This is the actual
+    enforcement point for method limits — the policy-layer test alone does not exercise it."""
+    a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    flow = _flow(host="api.github.com", method="POST")
+    a.request(flow)
+    assert flow.response == "FORBIDDEN"
+
+
+def test_request_allows_permitted_method_on_method_restricted_host(tmp_path):
+    a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    flow = _flow(host="api.github.com", method="GET")
+    a.request(flow)
+    assert flow.response is None
+
+
+def test_addon_denies_when_config_is_malformed(tmp_path):
+    """A corrupt config.json must make the addon fail closed (deny), not fall open to allow."""
+    path = tmp_path / "config.json"
+    path.write_text("{ not valid json")
+    a = EgressAddon(str(path))
+    flow = _flow(host="github.com", method="GET")
+    a.http_connect(flow)
+    assert flow.response == "FORBIDDEN"

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import sentry_sdk
+from docker.errors import NotFound
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, UploadFile, status
 from fastapi import Path as FastAPIPath
 from fastapi.responses import JSONResponse
@@ -62,6 +63,7 @@ from daiv_sandbox.sessions import (
     SandboxDockerSession,
     SessionUnavailableError,
     _validate_sandbox_path,
+    egress_token,
 )
 
 if TYPE_CHECKING:
@@ -240,15 +242,19 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         try:
             ca_cert = Path(settings.EGRESS_CA_CERT_FILE).read_bytes()
             ca_combined = Path(settings.EGRESS_CA_KEY_FILE).read_bytes() + b"\n" + ca_cert
-        except OSError:
+        except OSError as exc:
+            # Distinct from the "not configured" guard above: the files ARE configured here, they just
+            # can't be read (missing on disk, permission denied, mid-rotation). Log the errno so the
+            # real cause reaches Sentry/logs; keep the client message path-free.
+            logger.error("Egress proxy: cannot read EGRESS CA files: %s", exc)
             raise HTTPException(
-                status_code=500, detail="Egress proxy enabled but EGRESS CA files are not configured"
-            ) from None
+                status_code=500, detail="Egress proxy enabled but EGRESS CA files could not be read"
+            ) from exc
         manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
         try:
             network_name = await asyncio.to_thread(manager.create_network, token)
             await asyncio.to_thread(manager.start_proxy, token, network_name, ca_combined)
-            proxy_ip = await asyncio.to_thread(manager.proxy_internal_ip, token, network_name)
+            proxy_ip = await asyncio.to_thread(manager.proxy_internal_ip, token)
             cmd_executor_labels[EGRESS_SESSION_LABEL] = token
             cmd_executor_kwargs["network"] = network_name
             cmd_executor_kwargs["apply_dns_fix"] = False
@@ -404,7 +410,7 @@ async def configure_egress(
     if not settings.EGRESS_PROXY_ENABLED:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Egress proxy not enabled")
     async with _workspace_executor(http_request, session_id) as cmd:
-        token = (getattr(cmd.container, "labels", None) or {}).get(EGRESS_SESSION_LABEL)
+        token = egress_token(cmd.container)
         if not token:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session has no egress proxy")
         config = {
@@ -432,8 +438,15 @@ async def close_session(
     async with request.app.state.session_lock_manager.acquire(session_id):
         cmd_executor = SandboxDockerSession()
         cmd_executor.session_id = session_id
-        cmd_executor.container = await asyncio.to_thread(cmd_executor._get_container, session_id)
-        token = (getattr(cmd_executor.container, "labels", None) or {}).get(EGRESS_SESSION_LABEL)
+        # Read the egress token from the container labels WITHOUT warming a stopped container.
+        # _get_container restarts a stopped container on access, but DELETE only stops/removes it — a
+        # raw lookup avoids the pointless restart (and a spurious 503 on force-remove) and tolerates a
+        # missing container (nothing to tear down). stop_container/remove_container do their own lookup.
+        try:
+            container = await asyncio.to_thread(cmd_executor.client.containers.get, session_id)
+        except NotFound:
+            container = None
+        token = egress_token(container)
 
         if force:
             await asyncio.to_thread(cmd_executor.remove_container)

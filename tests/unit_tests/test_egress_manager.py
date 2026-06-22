@@ -1,5 +1,8 @@
 from unittest.mock import MagicMock
 
+import pytest
+from docker.errors import APIError, NotFound
+
 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 from daiv_sandbox.sessions import EGRESS_SESSION_LABEL, TYPE_EGRESS_NETWORK, TYPE_EGRESS_PROXY
 
@@ -45,6 +48,24 @@ def test_exec_proxy_env_points_clients_at_proxy_and_ca():
     assert env["NODE_EXTRA_CA_CERTS"].endswith("ca-certificates.crt")
 
 
+def test_start_proxy_raises_when_ca_put_archive_fails(monkeypatch):
+    """If the CA copy into the sidecar confdir is rejected, start_proxy must fail closed (raise) and
+    NOT boot the proxy — otherwise mitmdump starts with a self-generated CA the sandbox won't trust,
+    silently diverging from the configured posture."""
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_PROXY_IMAGE", "img:test")
+    monkeypatch.setattr(settings, "EGRESS_PROXY_NETWORK", "egress-net")
+    client = MagicMock()
+    proxy = client.containers.create.return_value
+    proxy.put_archive.return_value = False  # daemon rejected the CA copy
+    mgr = EgressProxyManager(client)
+
+    with pytest.raises(RuntimeError, match="CA"):
+        mgr.start_proxy("tok123", "daiv-egress-tok123", ca_pem=b"PEM")
+    proxy.start.assert_not_called()
+
+
 def test_teardown_removes_proxy_and_network():
     client = MagicMock()
     proxy, net = MagicMock(), MagicMock()
@@ -53,3 +74,27 @@ def test_teardown_removes_proxy_and_network():
     EgressProxyManager(client).teardown("tok123")
     proxy.remove.assert_called_once_with(force=True)
     net.remove.assert_called_once()
+
+
+def test_teardown_suppresses_notfound_on_proxy_remove():
+    """A proxy already gone (NotFound) is fine and must not stop network cleanup."""
+    client = MagicMock()
+    proxy, net = MagicMock(), MagicMock()
+    proxy.remove.side_effect = NotFound("already gone")
+    client.containers.list.return_value = [proxy]
+    client.networks.list.return_value = [net]
+    EgressProxyManager(client).teardown("tok123")  # must not raise
+    net.remove.assert_called_once()
+
+
+def test_teardown_logs_and_continues_when_proxy_remove_errors():
+    """A non-NotFound proxy-remove failure (e.g. daemon busy) must be logged and swallowed, NOT
+    propagated — otherwise it masks the caller's original error and skips network cleanup, leaking
+    the internal network."""
+    client = MagicMock()
+    proxy, net = MagicMock(), MagicMock()
+    proxy.remove.side_effect = APIError("daemon busy")
+    client.containers.list.return_value = [proxy]
+    client.networks.list.return_value = [net]
+    EgressProxyManager(client).teardown("tok123")  # must not raise
+    net.remove.assert_called_once()  # network still cleaned up despite the proxy failure

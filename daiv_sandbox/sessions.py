@@ -37,6 +37,12 @@ TYPE_EGRESS_NETWORK = "egress_network"
 # Links a sandbox to its egress proxy + network (all three carry the same token value).
 EGRESS_SESSION_LABEL = "daiv.sandbox.egress"
 
+
+def egress_token(container: Container | None) -> str | None:
+    """The egress session token from a container's labels, or None if it has no triad."""
+    return (getattr(container, "labels", None) or {}).get(EGRESS_SESSION_LABEL)
+
+
 # Where the shared egress CA cert is installed inside a sandbox, and the system bundle the language
 # runtime env vars point at after update-ca-certificates folds the cert in.
 SANDBOX_CA_PATH = "/usr/local/share/ca-certificates/daiv-egress.crt"
@@ -1119,13 +1125,13 @@ class SandboxDockerSession:
         if self._egress_env_cache is not None:
             return self._egress_env_cache
         env: dict[str, str] = {}
-        token = (getattr(self.container, "labels", None) or {}).get(EGRESS_SESSION_LABEL)
+        token = egress_token(self.container)
         if settings.EGRESS_PROXY_ENABLED and token:
             try:
                 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 
                 mgr = EgressProxyManager(self.client)
-                ip = mgr.proxy_internal_ip(token, f"daiv-egress-{token}")
+                ip = mgr.proxy_internal_ip(token)
                 env = exec_proxy_env(ip, settings.EGRESS_PROXY_PORT)
             except Exception:
                 logger.exception("egress: could not resolve proxy endpoint for session %s", self.session_id)

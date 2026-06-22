@@ -472,7 +472,7 @@ def test_close_session_stops_container_by_default(client):
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
         mock_cmd_executor = Mock()
         mock_cmd_executor.session_id = "cmd-executor-id"
-        mock_cmd_executor._get_container.return_value = Mock(labels={})
+        mock_cmd_executor.client.containers.get.return_value = Mock(labels={})
         mock_session_class.return_value = mock_cmd_executor
 
         response = client.delete("/session/cmd-executor-id/")
@@ -487,7 +487,7 @@ def test_close_session_force_removes_container(client):
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
         mock_cmd_executor = Mock()
         mock_cmd_executor.session_id = "cmd-executor-id"
-        mock_cmd_executor._get_container.return_value = Mock(labels={})
+        mock_cmd_executor.client.containers.get.return_value = Mock(labels={})
         mock_session_class.return_value = mock_cmd_executor
 
         response = client.delete("/session/cmd-executor-id/?force=true")
@@ -495,6 +495,23 @@ def test_close_session_force_removes_container(client):
         assert response.status_code == 204
         mock_cmd_executor.remove_container.assert_called_once()
         mock_cmd_executor.stop_container.assert_not_called()
+
+
+def test_close_session_does_not_warm_stopped_container(client):
+    """DELETE reads the egress label via a raw container lookup and must NOT call _get_container,
+    which restarts a stopped container on access — wasteful (it's about to be stopped) and a source
+    of spurious 503s on a force-remove."""
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.session_id = "cmd-executor-id"
+        mock_cmd_executor.client.containers.get.return_value = Mock(labels={})
+        mock_session_class.return_value = mock_cmd_executor
+
+        response = client.delete("/session/cmd-executor-id/")
+
+        assert response.status_code == 204
+        mock_cmd_executor._get_container.assert_not_called()
+        mock_cmd_executor.stop_container.assert_called_once()
 
 
 def test_force_close_tears_down_triad(client, monkeypatch):
@@ -506,7 +523,7 @@ def test_force_close_tears_down_triad(client, monkeypatch):
     ):
         cmd = cls.return_value
         cmd.session_id = "sbx"
-        cls.return_value._get_container.return_value = Mock(labels={"daiv.sandbox.egress": "tok123"})
+        cls.return_value.client.containers.get.return_value = Mock(labels={"daiv.sandbox.egress": "tok123"})
         resp = client.delete("/session/sbx/?force=true")
         assert resp.status_code == 204
         cls.return_value.remove_container.assert_called_once()
@@ -1333,9 +1350,29 @@ def test_start_session_egress_disabled_keeps_direct_network(client, monkeypatch)
         assert "daiv.sandbox.egress" not in mock_session_class.start.call_args.kwargs.get("labels", {})
 
 
+def test_start_session_egress_500_when_ca_files_not_configured(client, monkeypatch):
+    """If a CA env setting is unset, the endpoint returns 500 with a distinct 'not configured' message
+    and no Docker resources are created."""
+    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", "")
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", "/some/key.pem")
+
+    with (
+        patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
+        resp = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
+
+        assert resp.status_code == 500, resp.text
+        assert "not configured" in resp.json()["detail"]
+        mock_mgr_class.return_value.create_network.assert_not_called()
+        mock_session_class.start.assert_not_called()
+
+
 def test_start_session_egress_500_when_ca_file_unreadable(client, monkeypatch, tmp_path):
-    """If the configured CA files do not exist on disk, the endpoint returns 500 and no Docker
-    resources are created (EgressProxyManager.create_network is never called)."""
+    """If the configured CA files exist as settings but cannot be read (e.g. missing on disk), the
+    endpoint returns 500 with a distinct 'could not be read' message (NOT 'not configured', which would
+    misdirect an operator who set both env vars) and no Docker resources are created."""
     monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
     monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(tmp_path / "missing.crt"))
     monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(tmp_path / "missing.key"))
@@ -1349,7 +1386,7 @@ def test_start_session_egress_500_when_ca_file_unreadable(client, monkeypatch, t
         resp = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
 
         assert resp.status_code == 500, resp.text
-        assert "CA" in resp.json()["detail"] or "configured" in resp.json()["detail"]
+        assert "could not be read" in resp.json()["detail"]
         # No Docker resources must have been created.
         mock_mgr_class.return_value.create_network.assert_not_called()
         mock_session_class.start.assert_not_called()

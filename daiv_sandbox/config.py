@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     # Egress proxy (per-session MITM sidecar). When EGRESS_PROXY_ENABLED, a network-enabled session
     # is created as a triad (internal network + mitmdump sidecar + sandbox) instead of attaching the
     # sandbox directly to a network. Credentials/rules are provisioned into the sidecar, never the
-    # sandbox. See docs/superpowers/specs/2026-06-22-sandbox-egress-proxy-design.md.
+    # sandbox. See the "Network Egress Proxy" section of the README.
     EGRESS_PROXY_ENABLED: bool = False
     EGRESS_PROXY_IMAGE: str = "ghcr.io/srtab/daiv-sandbox-egress:latest"
     EGRESS_PROXY_PORT: int = 8080

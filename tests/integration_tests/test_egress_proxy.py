@@ -83,7 +83,7 @@ def test_triad_blocks_unlisted_and_allows_listed(docker_client):
                 "secrets": {},
             }).encode(),
         )
-        ip = mgr.proxy_internal_ip(token, net)
+        ip = mgr.proxy_internal_ip(token)
         env = exec_proxy_env(ip, settings.EGRESS_PROXY_PORT)
 
         sandbox = docker_client.containers.run("curlimages/curl:latest", command="sleep 60", detach=True, network=net)

@@ -1,3 +1,10 @@
+"""Egress policy evaluator and mtime-reloading config store.
+
+This module is copied verbatim into the mitmproxy sidecar image, which runs Python 3.13 (the repo
+targets 3.14). Keep it free of 3.14-only syntax — e.g. an unparenthesized `except A, B:` (PEP 758)
+is a SyntaxError on 3.13 and would crash the addon at import (failing OPEN). See egress_proxy/Dockerfile.
+"""
+
 from __future__ import annotations
 
 import fnmatch
@@ -36,25 +43,48 @@ class EgressPolicy:
     def from_config(cls, data: dict) -> EgressPolicy:
         policy = data.get("policy", {})
         secrets = {name: (s["header"], s["value"]) for name, s in (data.get("secrets") or {}).items()}
-        rules = [
-            _Rule(host=r["host"], methods=tuple(m.upper() for m in r.get("methods", ["*"])), inject=r.get("inject"))
-            for r in policy.get("rules", [])
-        ]
-        return cls(policy.get("default", "deny"), policy.get("intercept", "all"), rules, secrets)
+        rules = []
+        for r in policy.get("rules", []):
+            # Hostnames are case-insensitive (RFC 4343): normalise the rule host to lower-case so host
+            # matching cannot be bypassed by varying the case of the requested host (see _match/evaluate).
+            methods = tuple(m.upper() for m in r.get("methods", ["*"]))
+            rules.append(_Rule(host=r["host"].lower(), methods=methods, inject=r.get("inject")))
+        # Unknown default/intercept values are a misconfiguration: fail closed (deny / full MITM) and warn
+        # rather than relying on `== "allow"`/`== "all"` to accidentally do the safe thing for a typo.
+        default = policy.get("default", "deny")
+        if default not in ("deny", "allow"):
+            logger.warning("egress: unknown policy default %r; failing closed to 'deny'", default)
+            default = "deny"
+        intercept = policy.get("intercept", "all")
+        if intercept not in ("all", "credentialed"):
+            logger.warning("egress: unknown intercept mode %r; failing closed to 'all'", intercept)
+            intercept = "all"
+        return cls(default, intercept, rules, secrets)
 
-    def _match(self, host: str, method: str) -> _Rule | None:
+    def _match(self, host: str, method: str) -> tuple[_Rule | None, bool]:
+        """Return (rule allowing host+method, whether any rule's host matched at all).
+
+        `host` is already lower-cased and `method` already upper-cased by evaluate(); rule hosts are
+        lower-cased in from_config, so fnmatchcase (which skips the redundant os.path.normcase that
+        fnmatch.fnmatch does on both args) is the case-insensitive match. The host_listed flag lets
+        evaluate() distinguish 'host not listed' from 'host listed but this method isn't permitted'
+        in a single pass over the rules.
+        """
+        host_listed = False
         for rule in self._rules:
-            # CONNECT is a host-reachability check: the TLS tunnel hasn't been established yet,
-            # so the real HTTP method is unknown. Match any host-listed rule; the specific method
-            # restriction is enforced later at the request (post-interception) phase.
-            if fnmatch.fnmatch(host, rule.host) and (
-                method.upper() == "CONNECT" or "*" in rule.methods or method.upper() in rule.methods
-            ):
-                return rule
-        return None
+            if fnmatch.fnmatchcase(host, rule.host):
+                host_listed = True
+                # CONNECT is a host-reachability check: the TLS tunnel hasn't been established yet, so
+                # the real HTTP method is unknown. Match any host-listed rule; the specific method
+                # restriction is enforced later at the request (post-interception) phase.
+                if method == "CONNECT" or "*" in rule.methods or method in rule.methods:
+                    return rule, True
+        return None, host_listed
 
     def evaluate(self, host: str, method: str) -> Decision:
-        rule = self._match(host, method)
+        host = host.lower()  # case-insensitive host matching; rule hosts are lower-cased in from_config
+        method = method.upper()
+        rule, host_listed = self._match(host, method)
         if rule is not None:
             inject = self._secrets.get(rule.inject) if rule.inject else None
             method_restricted = "*" not in rule.methods
@@ -65,7 +95,7 @@ class EgressPolicy:
         # (otherwise a per-host method limit would silently no-op under default="allow"). CONNECT
         # stays a reachability-only check, so the TLS tunnel still opens and the method is enforced
         # at the request phase.
-        if method.upper() != "CONNECT" and any(fnmatch.fnmatch(host, r.host) for r in self._rules):
+        if method != "CONNECT" and host_listed:
             return Decision(allow=False, intercept=False, inject=None)
         if self._default == "allow":
             return Decision(allow=True, intercept=self._intercept == "all", inject=None)
@@ -93,18 +123,16 @@ class PolicyStore:
             self._mtime, self._policy = None, _DENY_ALL
             return self._policy
         if mtime != self._mtime:
-            # Parens around the exception tuple are REQUIRED, not stylistic: this module is copied
-            # verbatim into the mitmproxy sidecar image, which runs Python 3.13 where the
-            # unparenthesized `except A, B, C:` (PEP 758, 3.14+) is a hard SyntaxError that crashes the
-            # addon at import. The repo targets 3.14, so `ruff format` would strip the parens — the
-            # `# fmt: off/on` guard keeps them so the source stays valid on 3.13.
-            # fmt: off
             try:
                 with open(self._path, encoding="utf-8") as fh:  # noqa: PTH123
                     self._policy = EgressPolicy.from_config(json.load(fh))
-            except (OSError, ValueError, KeyError):
+            except Exception:
+                # Catch broadly ON PURPOSE: this evaluator backs a security boundary, and the addon
+                # hooks that call it run inside mitmproxy, which FAILS OPEN on an unhandled hook
+                # exception (it logs and lets the flow through). Any parse/structure error here
+                # (OSError, JSON ValueError, KeyError, or a TypeError/AttributeError from a
+                # structurally-bad config) must therefore collapse to deny-all, never propagate.
                 logger.exception("egress: failed to load policy from %s; failing closed (deny-all)", self._path)
                 self._policy = _DENY_ALL
-            # fmt: on
             self._mtime = mtime
         return self._policy
