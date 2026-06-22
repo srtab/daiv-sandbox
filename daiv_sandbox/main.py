@@ -401,6 +401,8 @@ async def configure_egress(
     Idempotent: called once after start and again on warm reuse with refreshed tokens. The secrets
     reach only the sidecar — never the sandbox.
     """
+    if not settings.EGRESS_PROXY_ENABLED:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Egress proxy not enabled")
     async with _workspace_executor(http_request, session_id) as cmd:
         token = (getattr(cmd.container, "labels", None) or {}).get(EGRESS_SESSION_LABEL)
         if not token:

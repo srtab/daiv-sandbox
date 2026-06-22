@@ -1425,11 +1425,22 @@ def test_configure_egress_provisions_policy(mock_session, client, monkeypatch):
         assert b"Bearer t" in payload  # the resolved secret value reaches the sidecar config
 
 
-def test_configure_egress_404_when_session_missing(client):
+def test_configure_egress_404_when_egress_disabled(client):
+    """The endpoint returns 404 immediately when EGRESS_PROXY_ENABLED is False (the default)."""
+    resp = client.post("/session/any-session-id/egress/", json={"policy": {}, "secrets": {}})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Egress proxy not enabled"
+
+
+def test_configure_egress_404_when_session_missing(client, monkeypatch):
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
     with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
         cls.return_value.container = None
         resp = client.post("/session/nope/egress/", json={"policy": {}, "secrets": {}})
         assert resp.status_code == 404
+        assert resp.json()["detail"] == "Session not found or already closed"
 
 
 def test_configure_egress_409_when_no_proxy_for_session(mock_session, client, monkeypatch):
