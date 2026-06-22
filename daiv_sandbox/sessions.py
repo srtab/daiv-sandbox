@@ -470,6 +470,7 @@ class SandboxDockerSession:
         self.session_id: str | None = session_id
         self.client: DockerClient = client or self._get_shared_client()
         self.container: Container | None = self._get_container(session_id) if session_id else None
+        self._egress_env_cache: dict[str, str] | None = None
 
     @classmethod
     def ping(cls, *, client: DockerClient | None = None) -> bool:
@@ -522,7 +523,7 @@ class SandboxDockerSession:
             logger.info("Pulling image '%s'", image)
             self.client.images.pull(image)
 
-    def _start_container(self, image: str, **kwargs):
+    def _start_container(self, image: str, apply_dns_fix: bool = True, **kwargs):
         """
         Create a new container from the image.
 
@@ -538,7 +539,7 @@ class SandboxDockerSession:
         # start) point resolv.conf at real upstreams. runc honours the embedded resolver, so it needs none
         # of this; and without an explicit `network` (Docker's default bridge) resolv.conf already carries
         # real upstreams, so the gVisor failure mode doesn't apply.
-        fix_gvisor_dns = bool(kwargs.get("network")) and settings.RUNTIME == "runsc"
+        fix_gvisor_dns = apply_dns_fix and bool(kwargs.get("network")) and settings.RUNTIME == "runsc"
         if fix_gvisor_dns and settings.EXTRA_HOSTS:
             kwargs.setdefault("extra_hosts", {}).update(self._resolve_extra_hosts(settings.EXTRA_HOSTS))
 
@@ -1099,13 +1100,38 @@ class SandboxDockerSession:
         This avoids failures when HOME is unset, set to '/', or non-writable.
         """
         home = SANDBOX_HOME
-        return {
+        base = {
             "HOME": home,
             "XDG_CACHE_HOME": f"{home}/.cache",
             "XDG_CONFIG_HOME": f"{home}/.config",
             "XDG_STATE_HOME": f"{home}/.local/state",
             "XDG_DATA_HOME": f"{home}/.local/share",
         }
+        return {**base, **self._egress_environment()}
+
+    def _egress_environment(self) -> dict[str, str]:
+        """Proxy + CA env for an egress-enabled session, or {} otherwise. Cached on the instance.
+
+        The proxy IP is resolved from the running sidecar (correct across warm restarts, which keep
+        the sidecar's endpoint since it is stopped, not removed). Any failure degrades to {} — the
+        sandbox then has no usable egress (fail closed) rather than a half-set proxy.
+        """
+        if self._egress_env_cache is not None:
+            return self._egress_env_cache
+        env: dict[str, str] = {}
+        token = (getattr(self.container, "labels", None) or {}).get(EGRESS_SESSION_LABEL)
+        if settings.EGRESS_PROXY_ENABLED and token:
+            try:
+                from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
+
+                mgr = EgressProxyManager(self.client)
+                ip = mgr.proxy_internal_ip(token, f"daiv-egress-{token}")
+                env = exec_proxy_env(ip, settings.EGRESS_PROXY_PORT)
+            except Exception:
+                logger.exception("egress: could not resolve proxy endpoint for session %s", self.session_id)
+                env = {}
+        self._egress_env_cache = env
+        return env
 
     def _get_container(self, session_id: str) -> Container | None:
         """
