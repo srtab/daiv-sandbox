@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import Base64Bytes, BaseModel, Field, computed_field, model_validator
+from pydantic import Base64Bytes, BaseModel, Field, SecretStr, computed_field, field_validator, model_validator
 
 
 class StartSessionRequest(BaseModel):
@@ -197,3 +199,46 @@ class FsDeleteResponse(BaseModel):
         if self.error is not None and self.removed:
             raise ValueError("removed must be False when an error is present")
         return self
+
+
+# --- Egress proxy wire schemas -----------------------------------------------
+
+
+class EgressRule(BaseModel):
+    host: str = Field(description="Destination host glob (e.g. 'github.com', '*.githubusercontent.com').")
+    methods: list[str] = Field(default_factory=lambda: ["*"], description="Allowed HTTP methods, or ['*'] for any.")
+    inject: str | None = Field(default=None, description="Name of the secret whose header is injected for this host.")
+
+    @field_validator("methods", mode="after")
+    @classmethod
+    def _upper(cls, value: list[str]) -> list[str]:
+        return [m.upper() for m in value]
+
+
+class EgressSecret(BaseModel):
+    header: str = Field(description="Header name to set (e.g. 'Authorization', 'PRIVATE-TOKEN').")
+    value: SecretStr = Field(description="Header value; redacted in logs/repr.")
+
+
+class EgressPolicy(BaseModel):
+    default: Literal["deny", "allow"] = Field(default="deny", description="Reachability for unlisted hosts.")
+    intercept: Literal["all", "credentialed"] = Field(
+        default="all", description="'all' MITMs every reachable host; 'credentialed' MITMs only inject hosts."
+    )
+    rules: list[EgressRule] = Field(default_factory=list)
+
+
+class EgressConfigRequest(BaseModel):
+    policy: EgressPolicy = Field(default_factory=EgressPolicy)
+    secrets: dict[str, EgressSecret] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _injects_resolve(self) -> EgressConfigRequest:
+        for rule in self.policy.rules:
+            if rule.inject is not None and rule.inject not in self.secrets:
+                raise ValueError(f"rule for host {rule.host!r} references unknown secret {rule.inject!r}")
+        return self
+
+
+class EgressConfigResponse(BaseModel):
+    ok: bool = Field(default=True, description="True when the policy was provisioned to the sidecar.")
