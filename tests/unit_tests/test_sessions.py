@@ -315,6 +315,13 @@ def _bare_session(client):
     return s
 
 
+def _session_with_container():
+    """A fully-constructed session (mock_docker_client patches from_env) with a mock container."""
+    s = SandboxDockerSession()
+    s.container = MagicMock()
+    return s
+
+
 def test_get_container_returns_running_container():
     container = Mock(status="running")
     client = Mock()
@@ -399,6 +406,33 @@ def test_copy_to_runtime_creates_directory(mock_docker_client):
     assert session.container.put_archive.called
     verbs = [c.args[0][0] for c in session.container.exec_run.call_args_list if c.args and c.args[0]]
     assert "chmod" not in verbs and "chown" not in verbs
+
+
+def test_install_ca_cert_ships_cert_and_updates_store(mock_docker_client):
+    from daiv_sandbox.sessions import SANDBOX_CA_PATH
+
+    s = _session_with_container()
+    s.container.put_archive = Mock(return_value=True)
+    s.container.exec_run = Mock(return_value=ExecResult(exit_code=0, output=b""))
+
+    s.install_ca_cert(b"-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n")
+
+    # cert shipped to /usr/local/share/ca-certificates as root
+    parent = SANDBOX_CA_PATH.rsplit("/", 1)[0]
+    assert s.container.put_archive.call_args.args[0] == parent
+    # update-ca-certificates run as root
+    assert any(
+        c.args[0][:1] == ["update-ca-certificates"] and c.kwargs.get("user") == "root"
+        for c in s.container.exec_run.call_args_list
+    )
+
+
+def test_install_ca_cert_fails_closed_when_update_fails(mock_docker_client):
+    s = _session_with_container()
+    s.container.put_archive = Mock(return_value=True)
+    s.container.exec_run = Mock(return_value=ExecResult(exit_code=1, output=b"update-ca-certificates: not found"))
+    with pytest.raises(RuntimeError, match="CA"):
+        s.install_ca_cert(b"cert")
 
 
 def test_execute_command(mock_docker_client):

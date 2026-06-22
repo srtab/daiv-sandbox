@@ -32,6 +32,15 @@ SCRATCH_ROOT = "/workspace/tmp"
 # Container label identifying daiv-sandbox cmd-executor containers (used for discovery/reaping).
 DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
 TYPE_CMD_EXECUTOR = "cmd_executor"
+TYPE_EGRESS_PROXY = "egress_proxy"
+TYPE_EGRESS_NETWORK = "egress_network"
+# Links a sandbox to its egress proxy + network (all three carry the same token value).
+EGRESS_SESSION_LABEL = "daiv.sandbox.egress"
+
+# Where the shared egress CA cert is installed inside a sandbox, and the system bundle the language
+# runtime env vars point at after update-ca-certificates folds the cert in.
+SANDBOX_CA_PATH = "/usr/local/share/ca-certificates/daiv-egress.crt"
+SANDBOX_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 
 class SessionUnavailableError(RuntimeError):
@@ -704,6 +713,24 @@ class SandboxDockerSession:
         # used to walk the whole extracted tree — thousands of files for a large seed — were therefore
         # redundant and have been removed. (The archive also rejects symlinks/hardlinks, so nothing
         # in it can point outside the tree.)
+
+    def install_ca_cert(self, cert_pem: bytes) -> None:
+        """Install the egress CA cert into the sandbox trust store. Fail closed (raise) on any error.
+
+        Ships the cert as root via the archive API, then runs update-ca-certificates (Debian/Ubuntu/
+        Alpine). Used only for egress-enabled sessions; a failure must abort session start rather than
+        leave a sandbox whose every HTTPS call breaks.
+        """
+        parent, _, filename = SANDBOX_CA_PATH.rpartition("/")
+        mkdir = self.container.exec_run(["mkdir", "-p", "--", parent], user="root")
+        if mkdir.exit_code != 0:
+            raise RuntimeError(f"egress: failed to create CA dir {parent}: {mkdir.output!r}")
+        with _build_single_file_tar_stream(filename, cert_pem, mode=0o644) as tar:
+            if not self.container.put_archive(parent, tar):
+                raise RuntimeError(f"egress: failed to copy CA cert to {parent}")
+        result = self.container.exec_run(["update-ca-certificates"], user="root")
+        if result.exit_code != 0:
+            raise RuntimeError(f"egress: update-ca-certificates failed (exit {result.exit_code}): {result.output!r}")
 
     def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
         """
