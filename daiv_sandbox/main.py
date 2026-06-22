@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import glob
+import json
 import logging
 import re
 import uuid
@@ -22,6 +23,8 @@ from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, 
 from daiv_sandbox.logs import LOGGING_CONFIG
 from daiv_sandbox.reaper import start_reaper
 from daiv_sandbox.schemas import (
+    EgressConfigRequest,
+    EgressConfigResponse,
     ErrorMessage,
     FsDeleteRequest,
     FsDeleteResponse,
@@ -384,6 +387,33 @@ async def run_on_session(
                 break
 
         return RunResponse(results=results)
+
+
+@app.post("/session/{session_id}/egress/", responses=common_responses, name="Configure session egress")
+async def configure_egress(
+    http_request: Request,
+    session_id: Annotated[str, FastAPIPath(title="The ID of the session to configure egress for.")],
+    request: EgressConfigRequest,
+    api_key: str = Depends(get_api_key),
+) -> EgressConfigResponse:
+    """Provision (or replace) the egress policy + credentials for a session's sidecar proxy.
+
+    Idempotent: called once after start and again on warm reuse with refreshed tokens. The secrets
+    reach only the sidecar — never the sandbox.
+    """
+    async with _workspace_executor(http_request, session_id) as cmd:
+        token = (getattr(cmd.container, "labels", None) or {}).get(EGRESS_SESSION_LABEL)
+        if not token:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session has no egress proxy")
+        config = {
+            "policy": request.policy.model_dump(),
+            "secrets": {
+                name: {"header": s.header, "value": s.value.get_secret_value()} for name, s in request.secrets.items()
+            },
+        }
+        manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
+        await asyncio.to_thread(manager.provision, token, json.dumps(config).encode("utf-8"))
+        return EgressConfigResponse()
 
 
 @app.delete("/session/{session_id}/", responses=common_responses, name="Close a session")

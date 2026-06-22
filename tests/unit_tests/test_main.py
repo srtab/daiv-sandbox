@@ -1402,3 +1402,39 @@ def test_fs_grep_forwards_default_plus_request_excludes(mock_session, client, mo
     call = mock_session.grep.call_args
     passed = call.args[3] if len(call.args) > 3 else call.kwargs["excludes"]
     assert tuple(passed) == (".git", "vendor")
+
+
+def test_configure_egress_provisions_policy(mock_session, client, monkeypatch):
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
+    mock_session.container.labels = {"daiv.sandbox.egress": "tok123"}
+    with patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class:
+        mgr = mock_mgr_class.return_value
+        resp = client.post(
+            f"/session/{mock_session.session_id}/egress/",
+            json={
+                "policy": {"default": "deny", "rules": [{"host": "github.com", "inject": "gh"}]},
+                "secrets": {"gh": {"header": "Authorization", "value": "Bearer t"}},
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True}
+        token, payload = mgr.provision.call_args.args
+        assert token == "tok123"  # noqa: S105
+        assert b"Bearer t" in payload  # the resolved secret value reaches the sidecar config
+
+
+def test_configure_egress_404_when_session_missing(client):
+    with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
+        cls.return_value.container = None
+        resp = client.post("/session/nope/egress/", json={"policy": {}, "secrets": {}})
+        assert resp.status_code == 404
+
+
+def test_configure_egress_409_when_no_proxy_for_session(mock_session, client, monkeypatch):
+    """A session that wasn't started with egress has no sidecar to provision."""
+    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
+    mock_session.container.labels = {}  # no egress token
+    resp = client.post(f"/session/{mock_session.session_id}/egress/", json={"policy": {}, "secrets": {}})
+    assert resp.status_code == 409
