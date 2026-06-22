@@ -234,11 +234,16 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         if not settings.EGRESS_CA_CERT_FILE or not settings.EGRESS_CA_KEY_FILE:
             raise HTTPException(status_code=500, detail="Egress proxy enabled but EGRESS CA files are not configured")
         token = uuid.uuid4().hex[:12]
-        ca_cert = Path(settings.EGRESS_CA_CERT_FILE).read_bytes()
-        ca_combined = Path(settings.EGRESS_CA_KEY_FILE).read_bytes() + b"\n" + ca_cert
-        manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
-        network_name = await asyncio.to_thread(manager.create_network, token)
         try:
+            ca_cert = Path(settings.EGRESS_CA_CERT_FILE).read_bytes()
+            ca_combined = Path(settings.EGRESS_CA_KEY_FILE).read_bytes() + b"\n" + ca_cert
+        except OSError:
+            raise HTTPException(
+                status_code=500, detail="Egress proxy enabled but EGRESS CA files are not configured"
+            ) from None
+        manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
+        try:
+            network_name = await asyncio.to_thread(manager.create_network, token)
             await asyncio.to_thread(manager.start_proxy, token, network_name, ca_combined)
             proxy_ip = await asyncio.to_thread(manager.proxy_internal_ip, token, network_name)
             cmd_executor_labels[EGRESS_SESSION_LABEL] = token
@@ -269,9 +274,7 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         except Exception:
             await asyncio.to_thread(cmd_executor.remove_container)
             await asyncio.to_thread(manager.teardown, token)
-            raise HTTPException(  # noqa: B904
-                status_code=500, detail="Egress proxy: failed to install CA into the sandbox"
-            )
+            raise HTTPException(status_code=500, detail="Egress proxy: failed to install CA into the sandbox") from None
 
     return StartSessionResponse(session_id=cmd_executor.session_id)
 

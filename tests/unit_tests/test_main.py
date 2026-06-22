@@ -1315,6 +1315,62 @@ def test_start_session_egress_disabled_keeps_direct_network(client, monkeypatch)
         assert "daiv.sandbox.egress" not in mock_session_class.start.call_args.kwargs.get("labels", {})
 
 
+def test_start_session_egress_500_when_ca_file_unreadable(client, monkeypatch, tmp_path):
+    """If the configured CA files do not exist on disk, the endpoint returns 500 and no Docker
+    resources are created (EgressProxyManager.create_network is never called)."""
+    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(tmp_path / "missing.crt"))
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(tmp_path / "missing.key"))
+
+    with (
+        patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
+        mock_session_class.start.return_value = Mock(session_id="id")
+
+        resp = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
+
+        assert resp.status_code == 500, resp.text
+        assert "CA" in resp.json()["detail"] or "configured" in resp.json()["detail"]
+        # No Docker resources must have been created.
+        mock_mgr_class.return_value.create_network.assert_not_called()
+        mock_session_class.start.assert_not_called()
+
+
+def test_start_session_egress_tears_down_on_triad_failure(monkeypatch, tmp_path):
+    """If any triad step (create_network, start_proxy, proxy_internal_ip) raises, teardown is called
+    and the request fails. This covers the fix that moved create_network inside the try."""
+    cert = tmp_path / "ca.crt"
+    cert.write_text("CERT")
+    key = tmp_path / "ca.key"
+    key.write_text("KEY")
+    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(cert))
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(key))
+
+    with (
+        patch("daiv_sandbox.main.start_reaper", return_value=None),
+        TestClient(
+            app,
+            headers={"X-API-Key": settings.API_KEY.get_secret_value()},
+            root_path=settings.API_V1_STR,
+            raise_server_exceptions=False,
+        ) as test_client,
+        patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
+        mock_session_class.start.return_value = Mock(session_id="id")
+        mgr = mock_mgr_class.return_value
+        # Simulate a failure in start_proxy (after create_network succeeds).
+        mgr.start_proxy.side_effect = RuntimeError("proxy container failed to start")
+
+        resp = test_client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
+
+        assert resp.status_code == 500, resp.text
+        # teardown must have been called to clean up whatever was partially created.
+        mgr.teardown.assert_called_once()
+
+
 def test_fs_glob_forwards_default_plus_request_excludes(mock_session, client, monkeypatch):
     from daiv_sandbox import main
     from daiv_sandbox.sessions import DirEntry
