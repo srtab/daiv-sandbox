@@ -63,6 +63,15 @@ All settings are configurable via environment variables. The available settings 
 | **DAIV_SANDBOX_NETWORK**                      | Docker network that network-enabled sessions attach to. Sessions without networking stay isolated (`network_mode=none`); when unset, network-enabled sessions use Docker's default network.                                                                       | Optional                                                                    |
 | **DAIV_SANDBOX_DNS**                          | Comma-separated DNS resolvers written into a network-enabled session's `/etc/resolv.conf` under `runsc`, since gVisor can't reach Docker's embedded resolver (`127.0.0.11`). Ignored under `runc`.                                                                | Default: `1.1.1.1,8.8.8.8`                                                  |
 | **DAIV_SANDBOX_EXTRA_HOSTS**                  | Comma-separated sibling hostnames (e.g. `gitlab`) resolved at session start and injected as static `/etc/hosts` entries in network-enabled `runsc` sessions, restoring compose-service name resolution dropped by the resolv.conf override. Ignored under `runc`. | Optional                                                                    |
+| **DAIV_SANDBOX_EGRESS_PROXY_ENABLED**         | Enable the per-session MITM egress proxy (triad). When enabled, network-enabled sessions are built as a triad (internal network + sidecar + sandbox) instead of attaching the sandbox directly to a network.                                                      | Default: False                                                              |
+| **DAIV_SANDBOX_EGRESS_PROXY_IMAGE**           | Docker image for the mitmproxy sidecar.                                                                                                                                                                                                                           | Default: `ghcr.io/srtab/daiv-sandbox-egress:latest`                         |
+| **DAIV_SANDBOX_EGRESS_PROXY_PORT**            | Port the sidecar proxy listens on.                                                                                                                                                                                                                                | Default: 8080                                                               |
+| **DAIV_SANDBOX_EGRESS_PROXY_RUNTIME**         | Container runtime for the sidecar. The sidecar runs trusted code and stays on `runc` by default even when sandboxes use `runsc`.                                                                                                                                  | Options: `runc`, `runsc`<br>Default: "runc"                                 |
+| **DAIV_SANDBOX_EGRESS_PROXY_NETWORK**         | Egress-side Docker network the sidecar's upstream NIC joins. Falls back to `DAIV_SANDBOX_NETWORK`, then Docker's default bridge.                                                                                                                                  | Optional                                                                    |
+| **DAIV_SANDBOX_EGRESS_PROXY_MEMORY_BYTES**    | Memory limit for the sidecar container (bytes).                                                                                                                                                                                                                   | Optional                                                                    |
+| **DAIV_SANDBOX_EGRESS_PROXY_CPUS**            | CPU quota for the sidecar container.                                                                                                                                                                                                                              | Optional                                                                    |
+| **DAIV_SANDBOX_EGRESS_CA_CERT_FILE**          | Path to the shared egress CA certificate. Installed into every egress sandbox automatically. Required when egress proxy is enabled.                                                                                                                               | Optional                                                                    |
+| **DAIV_SANDBOX_EGRESS_CA_KEY_FILE**           | Path to the shared egress CA private key. Provided only to sidecars, never to the sandbox. Required when egress proxy is enabled.                                                                                                                                 | Optional                                                                    |
 | **DAIV_SANDBOX_FS_PRUNE_DIRS**                | Comma-separated directory basenames/globs pruned by default from `fs/glob`/`fs/grep` (caches/metadata/build output). Excludes dependency-source dirs so agents can read deps. Setting this replaces the baseline entirely.                                        | Default: `.git,__pycache__,…`                                               |
 | **DAIV_SANDBOX_COMMAND_TIMEOUT**              | Default per-command timeout in seconds. `0` disables the default. Overridable per request via `timeout`.                                                                                                                                                          | Default: 0                                                                  |
 | **DAIV_SANDBOX_REDIS_URL**                    | Redis URL used for cross-replica per-session locking. When unset, an in-process lock is used.                                                                                                                                                                     | Optional                                                                    |
@@ -336,6 +345,73 @@ The response will be an empty body with a status code of 204.
 
 > [!TIP]
 > Why closing a sandbox session is important? By default it stops the container so the next turn can reuse it warm; the background reaper later removes it to free resources. Pass `?force=true` to remove it right away.
+
+### Network Egress Proxy
+
+When `DAIV_SANDBOX_EGRESS_PROXY_ENABLED=true`, a network-enabled session is built as a **triad**:
+
+1. An `internal` Docker network with no gateway (the sandbox can only talk to the sidecar).
+2. A `mitmproxy` sidecar dual-homed on the internal network and an egress-side network — it is the sole gateway to the internet.
+3. The sandbox attached only to the internal network, with its `HTTP_PROXY`/`HTTPS_PROXY` environment variables pointing at the sidecar.
+
+Credentials (API tokens, bearer headers) live in the sidecar and **never enter the sandbox container**.
+
+#### Configuring egress per session
+
+After creating a session, call `POST /session/{session_id}/egress/` with a JSON body of the form:
+
+```json
+{
+  "policy": {
+    "default": "deny",
+    "intercept": "credentialed",
+    "rules": [
+      {
+        "host": "*.github.com",
+        "methods": ["GET", "POST"],
+        "inject": "github-token"
+      },
+      {
+        "host": "pypi.org",
+        "methods": ["*"]
+      }
+    ]
+  },
+  "secrets": {
+    "github-token": "Bearer ghp_…"
+  }
+}
+```
+
+- **`policy.default`** — `"deny"` (allowlist; only hosts with a matching rule are reachable) or `"allow"` (denylist; all hosts are reachable unless blocked).
+- **`policy.intercept`** — `"all"` (MITM every connection) or `"credentialed"` (MITM only hosts that inject credentials, tunnel the rest untouched).
+- **`policy.rules`** — list of per-host rules. `host` is a glob (e.g. `*.github.com`). `methods` restricts which HTTP methods are permitted (`["*"]` allows all). `inject` names a secret to inject as an `Authorization` header.
+- **`secrets`** — named header values injected by the sidecar. Keys are referenced from `inject` in rules; values are never forwarded to the sandbox.
+
+> [!NOTE]
+> A rule with `methods` set to anything other than `["*"]` causes that host to be intercepted (MITM'd) regardless of the `intercept` mode, so the method can be enforced after TLS termination. Such hosts require the shared CA, which is installed into every egress sandbox automatically.
+
+This endpoint returns `404` when `DAIV_SANDBOX_EGRESS_PROXY_ENABLED` is off and is idempotent — re-calling it replaces the sidecar's policy.
+
+#### CA generation (operator one-time step)
+
+TLS interception requires a shared CA. Generate it once and mount the files into the service:
+
+```sh
+# One-time: generate the shared egress CA (operator step). Mount the files and point the settings at them.
+openssl req -x509 -newkey rsa:4096 -nodes -keyout egress-ca.key -out egress-ca.crt -days 3650 -subj "/CN=daiv-sandbox-egress"
+```
+
+Then set:
+
+- `DAIV_SANDBOX_EGRESS_CA_CERT_FILE` — path to `egress-ca.crt` (installed into every egress sandbox).
+- `DAIV_SANDBOX_EGRESS_CA_KEY_FILE` — path to `egress-ca.key` (provided only to sidecars).
+
+#### Limitations
+
+- **Cert-pinned clients** will fail — the proxy terminates and re-signs TLS, so any client that pins the upstream certificate will reject it.
+- **SSH-based git** and other non-HTTP(S) protocols are not proxied and are blocked by the internal network isolation.
+- **Non-HTTP egress** (raw TCP, UDP, etc.) is out of scope.
 
 ## Contributing
 
