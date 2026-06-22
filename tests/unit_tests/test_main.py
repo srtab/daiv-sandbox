@@ -1270,6 +1270,51 @@ def test_glob_to_regex_table():
         assert bool(_glob_to_regex(pat).match(s)) is expected, (pat, s)
 
 
+def test_start_session_builds_triad_when_egress_enabled(client, monkeypatch, tmp_path):
+    from daiv_sandbox.config import settings
+
+    cert = tmp_path / "ca.crt"
+    cert.write_text("CERT")
+    key = tmp_path / "ca.key"
+    key.write_text("KEY")
+    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(cert))
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(key))
+
+    with (
+        patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
+        cmd = Mock(session_id="sbx-id")
+        mock_session_class.start.return_value = cmd
+        mgr = mock_mgr_class.return_value
+        mgr.proxy_internal_ip.return_value = "10.7.0.2"
+
+        resp = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
+
+        assert resp.status_code == 200, resp.text
+        mgr.create_network.assert_called_once()
+        mgr.start_proxy.assert_called_once()
+        # sandbox started on the internal network with the egress token label + proxy env, DNS-fix off
+        start_kwargs = mock_session_class.start.call_args.kwargs
+        assert start_kwargs["network"] == mgr.create_network.return_value
+        assert "daiv.sandbox.egress" in start_kwargs["labels"]
+        assert start_kwargs["environment"]["HTTPS_PROXY"] == "http://10.7.0.2:8080"
+        assert start_kwargs["apply_dns_fix"] is False
+        cmd.install_ca_cert.assert_called_once()
+
+
+def test_start_session_egress_disabled_keeps_direct_network(client, monkeypatch):
+    """With the feature off, network_enabled keeps today's direct-attach behavior (no triad)."""
+    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", False)
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_session_class.start.return_value = Mock(session_id="id")
+        resp = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
+        assert resp.status_code == 200, resp.text
+        assert "labels" in mock_session_class.start.call_args.kwargs  # cmd_executor label, no egress token
+        assert "daiv.sandbox.egress" not in mock_session_class.start.call_args.kwargs.get("labels", {})
+
+
 def test_fs_glob_forwards_default_plus_request_excludes(mock_session, client, monkeypatch):
     from daiv_sandbox import main
     from daiv_sandbox.sessions import DirEntry

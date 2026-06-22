@@ -3,7 +3,9 @@ import base64
 import glob
 import logging
 import re
+import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import sentry_sdk
@@ -15,6 +17,7 @@ from redis.asyncio import Redis
 
 from daiv_sandbox import __version__
 from daiv_sandbox.config import settings
+from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, SessionBusyError
 from daiv_sandbox.logs import LOGGING_CONFIG
 from daiv_sandbox.reaper import start_reaper
@@ -46,6 +49,7 @@ from daiv_sandbox.schemas import (
 )
 from daiv_sandbox.sessions import (
     DAIV_SANDBOX_TYPE_LABEL,
+    EGRESS_SESSION_LABEL,
     SANDBOX_HOME,
     SANDBOX_ROOT,
     SKILLS_ROOT,
@@ -214,28 +218,61 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     This session ID ensures a consistent execution environment for the commands, including files and directories.
     """
     cmd_executor_labels = {DAIV_SANDBOX_TYPE_LABEL: TYPE_CMD_EXECUTOR}
-
-    cmd_executor_kwargs = {}
-
-    if not request.network_enabled:
-        cmd_executor_kwargs["network_mode"] = "none"
-    elif settings.NETWORK:
-        cmd_executor_kwargs["network"] = settings.NETWORK
-
-    if request.environment:
-        cmd_executor_kwargs["environment"] = request.environment
+    cmd_executor_kwargs: dict = {}
 
     if request.memory_bytes:
         cmd_executor_kwargs["mem_limit"] = request.memory_bytes
-
     if request.cpus:
         cmd_executor_kwargs["cpus"] = request.cpus
+
+    use_egress = request.network_enabled and settings.EGRESS_PROXY_ENABLED
+
+    if not request.network_enabled:
+        cmd_executor_kwargs["network_mode"] = "none"
+    elif use_egress:
+        # Triad: internal network + sidecar proxy; the sandbox reaches the internet only via the proxy.
+        if not settings.EGRESS_CA_CERT_FILE or not settings.EGRESS_CA_KEY_FILE:
+            raise HTTPException(status_code=500, detail="Egress proxy enabled but EGRESS CA files are not configured")
+        token = uuid.uuid4().hex[:12]
+        ca_cert = Path(settings.EGRESS_CA_CERT_FILE).read_bytes()
+        ca_combined = Path(settings.EGRESS_CA_KEY_FILE).read_bytes() + b"\n" + ca_cert
+        manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
+        network_name = await asyncio.to_thread(manager.create_network, token)
+        try:
+            await asyncio.to_thread(manager.start_proxy, token, network_name, ca_combined)
+            proxy_ip = await asyncio.to_thread(manager.proxy_internal_ip, token, network_name)
+            cmd_executor_labels[EGRESS_SESSION_LABEL] = token
+            cmd_executor_kwargs["network"] = network_name
+            cmd_executor_kwargs["apply_dns_fix"] = False
+            cmd_executor_kwargs["environment"] = {
+                **(request.environment or {}),
+                **exec_proxy_env(proxy_ip, settings.EGRESS_PROXY_PORT),
+            }
+        except Exception:
+            await asyncio.to_thread(manager.teardown, token)
+            raise
+    elif settings.NETWORK:
+        cmd_executor_kwargs["network"] = settings.NETWORK
+
+    if request.environment and not use_egress:
+        cmd_executor_kwargs["environment"] = request.environment
 
     cmd_executor = await asyncio.to_thread(
         SandboxDockerSession.start, image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
     )
     if cmd_executor.session_id is None:
         raise RuntimeError("Started session is missing a session ID")
+
+    if use_egress:
+        try:
+            await asyncio.to_thread(cmd_executor.install_ca_cert, ca_cert)
+        except Exception:
+            await asyncio.to_thread(cmd_executor.remove_container)
+            await asyncio.to_thread(manager.teardown, token)
+            raise HTTPException(  # noqa: B904
+                status_code=500, detail="Egress proxy: failed to install CA into the sandbox"
+            )
+
     return StartSessionResponse(session_id=cmd_executor.session_id)
 
 
