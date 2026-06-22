@@ -1,6 +1,6 @@
 # Makefile
 
-.PHONY: help test lint lint-check lint-format lint-fix lint-typing run
+.PHONY: help test lint lint-check lint-format lint-fix lint-typing run build-egress-proxy
 
 help:
 	@echo "Available commands:"
@@ -34,3 +34,6 @@ lint-typing:
 
 run:
 	uv run fastapi dev daiv_sandbox/main.py --reload --port 8888
+
+build-egress-proxy:  ## Build the per-session egress proxy sidecar image
+	docker build -f egress_proxy/Dockerfile -t ghcr.io/srtab/daiv-sandbox-egress:latest .
