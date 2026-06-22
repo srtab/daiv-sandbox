@@ -76,3 +76,16 @@ def test_fs_prune_dirs_default():
 def test_fs_prune_dirs_parse_comma_separated_env(monkeypatch):
     monkeypatch.setenv("DAIV_SANDBOX_FS_PRUNE_DIRS", ".git, node_modules ,__pycache__")
     assert Settings().FS_PRUNE_DIRS == [".git", "node_modules", "__pycache__"]
+
+
+def test_egress_defaults():
+    assert settings.EGRESS_PROXY_ENABLED is False
+    assert settings.EGRESS_PROXY_PORT == 8080
+    assert settings.EGRESS_PROXY_RUNTIME == "runc"
+    assert settings.EGRESS_PROXY_NETWORK is None
+    assert settings.EGRESS_CA_CERT_FILE is None
+    assert settings.EGRESS_CA_KEY_FILE is None
+
+
+def test_egress_proxy_image_default():
+    assert settings.EGRESS_PROXY_IMAGE.endswith("daiv-sandbox-egress:latest")

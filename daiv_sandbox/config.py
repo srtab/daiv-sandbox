@@ -52,6 +52,25 @@ class Settings(BaseSettings):
     # compose-service name resolution that overriding resolv.conf (see DNS) would otherwise drop.
     # Ignored under runc. Names that fail to resolve are skipped with a warning.
     EXTRA_HOSTS: Annotated[list[str], NoDecode] = []
+    # Egress proxy (per-session MITM sidecar). When EGRESS_PROXY_ENABLED, a network-enabled session
+    # is created as a triad (internal network + mitmdump sidecar + sandbox) instead of attaching the
+    # sandbox directly to a network. Credentials/rules are provisioned into the sidecar, never the
+    # sandbox. See docs/superpowers/specs/2026-06-22-sandbox-egress-proxy-design.md.
+    EGRESS_PROXY_ENABLED: bool = False
+    EGRESS_PROXY_IMAGE: str = "ghcr.io/srtab/daiv-sandbox-egress:latest"
+    EGRESS_PROXY_PORT: int = 8080
+    # The sidecar runs trusted code (not untrusted), so it stays on runc even when sandboxes use runsc;
+    # runc also avoids gVisor's embedded-DNS quirks for the proxy's own upstream resolution.
+    EGRESS_PROXY_RUNTIME: Literal["runc", "runsc"] = "runc"
+    # Egress-side network the sidecar's second NIC joins for upstream. None -> fall back to NETWORK,
+    # then Docker's default bridge.
+    EGRESS_PROXY_NETWORK: str | None = None
+    EGRESS_PROXY_MEMORY_BYTES: int | None = None
+    EGRESS_PROXY_CPUS: float | None = None
+    # Shared CA used for MITM: cert is installed into every sandbox; key is given to sidecars only.
+    # Paths are read at use time (typically files under /run/secrets).
+    EGRESS_CA_CERT_FILE: str | None = None
+    EGRESS_CA_KEY_FILE: str | None = None
     # Directory basenames/globs pruned by default from fs/glob and fs/grep traversals (comma-separated
     # env, e.g. ".git,__pycache__"). These are caches, IDE/VCS metadata, and build output that is never
     # hand-authored source and never dependency *source* — matching is basename-based via `find -name`,
