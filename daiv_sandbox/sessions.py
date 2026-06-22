@@ -181,13 +181,18 @@ _SINGLE_FILE_TAR_SPOOL_LIMIT = 1 << 20  # 1 MiB
 _SANITIZED_ARCHIVE_SPOOL_LIMIT = 8 << 20  # 8 MiB — sanitized seed archives spill past this
 
 
-def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int) -> IO[bytes]:
+def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int, uid: int = 0, gid: int = 0) -> IO[bytes]:
     """
     Build an uncompressed tar containing one regular-file member.
 
     Returns a seekable file-like object positioned at offset 0. Small archives stay
     in memory; larger ones spill to disk. Caller owns the stream and must close it
     (use as a context manager).
+
+    ``uid``/``gid`` set the member's ownership; they default to root (0/0) so existing
+    callers are unchanged. Callers extracting into a container that reads the file as a
+    non-root user (e.g. the egress proxy running as RUN_UID) must pass that uid/gid so the
+    extracted file is owned by — and readable by — that user.
     """
     stream = tempfile.SpooledTemporaryFile(max_size=_SINGLE_FILE_TAR_SPOOL_LIMIT)  # noqa: SIM115
     try:
@@ -196,6 +201,8 @@ def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int) -
             info.size = len(content)
             info.mode = mode & 0o7777
             info.type = tarfile.REGTYPE
+            info.uid = uid
+            info.gid = gid
             tf.addfile(info, io.BytesIO(content))
         stream.seek(0)
     except BaseException:

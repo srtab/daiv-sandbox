@@ -80,11 +80,18 @@ class PolicyStore:
             self._mtime, self._policy = None, _DENY_ALL
             return self._policy
         if mtime != self._mtime:
+            # Parens around the exception tuple are REQUIRED, not stylistic: this module is copied
+            # verbatim into the mitmproxy sidecar image, which runs Python 3.13 where the
+            # unparenthesized `except A, B, C:` (PEP 758, 3.14+) is a hard SyntaxError that crashes the
+            # addon at import. The repo targets 3.14, so `ruff format` would strip the parens — the
+            # `# fmt: off/on` guard keeps them so the source stays valid on 3.13.
+            # fmt: off
             try:
                 with open(self._path, encoding="utf-8") as fh:  # noqa: PTH123
                     self._policy = EgressPolicy.from_config(json.load(fh))
-            except OSError, ValueError, KeyError:
+            except (OSError, ValueError, KeyError):
                 logger.exception("egress: failed to load policy from %s; failing closed (deny-all)", self._path)
                 self._policy = _DENY_ALL
+            # fmt: on
             self._mtime = mtime
         return self._policy

@@ -9,7 +9,9 @@ COPY daiv_sandbox/egress/policy.py /addon/policy.py
 COPY daiv_sandbox/egress/constants.py /addon/constants.py
 COPY daiv_sandbox/egress/addon.py /addon/addon.py
 
-RUN mkdir -p /run/egress
+# Owned by the run user (uid 1000 = the image's mitmproxy user and daiv-sandbox's RUN_UID default) so
+# the non-root proxy can read its provisioned config/CA and write the CA files mitmproxy derives at boot.
+RUN mkdir -p /run/egress && chown 1000:1000 /run/egress
 
 # `--mode regular` = forward proxy; confdir holds mitmproxy-ca.pem (provisioned by the server before
 # start). --set connection_strategy=lazy so unintercepted (passthrough) flows aren't eagerly opened.
