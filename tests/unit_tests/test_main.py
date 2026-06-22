@@ -509,6 +509,7 @@ def test_force_close_tears_down_triad(client, monkeypatch):
         cls.return_value._get_container.return_value = Mock(labels={"daiv.sandbox.egress": "tok123"})
         resp = client.delete("/session/sbx/?force=true")
         assert resp.status_code == 204
+        cls.return_value.remove_container.assert_called_once()
         mock_mgr_class.return_value.teardown.assert_called_once_with("tok123")
 
 

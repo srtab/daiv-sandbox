@@ -98,3 +98,21 @@ def test_connect_to_unlisted_host_still_denied():
     """CONNECT reachability is gated by the host allowlist — unlisted hosts must still be denied."""
     p = EgressPolicy.from_config(_cfg(rules=[{"host": "api.github.com", "methods": ["GET"]}]))
     assert p.evaluate("evil.example", "CONNECT").allow is False
+
+
+def test_default_allow_still_enforces_method_limit_on_listed_host():
+    """Under default="allow", a host listed with method restrictions must still deny disallowed methods.
+
+    Without this fix a POST to api.github.com (methods:["GET"]) would miss _match and fall through
+    to the default-allow branch — silently granting access. CONNECT stays reachability-only so the
+    TLS tunnel can open; the method is enforced at the request (post-interception) phase.
+    """
+    p = EgressPolicy.from_config(_cfg(default="allow", rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    # Allowed method on listed host
+    assert p.evaluate("api.github.com", "GET").allow is True
+    # Disallowed method on listed host — must deny despite default="allow"
+    assert p.evaluate("api.github.com", "POST").allow is False
+    # CONNECT is still allowed (reachability-only check)
+    assert p.evaluate("api.github.com", "CONNECT").allow is True
+    # Host with NO rule at all still follows default-allow
+    assert p.evaluate("unlisted.example", "POST").allow is True

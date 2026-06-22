@@ -11,6 +11,7 @@ help:
 	@echo "  make lint-fix       - Fix linting and formatting issues"
 	@echo "  make lint-typing    - Run type checking with mypy"
 	@echo "  make run            - Run the application"
+	@echo "  make build-egress-proxy - Build the per-session egress proxy sidecar image"
 
 test:
 	uv run --all-extras pytest -s tests

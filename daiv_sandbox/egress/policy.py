@@ -57,12 +57,16 @@ class EgressPolicy:
         rule = self._match(host, method)
         if rule is not None:
             inject = self._secrets.get(rule.inject) if rule.inject else None
-            # A method-restricted rule must be intercepted (MITM) so we can see the actual HTTP
-            # method after TLS termination. Without interception the tunnel is opaque and the
-            # method restriction becomes a fail-open passthrough — even in "credentialed" mode.
             method_restricted = "*" not in rule.methods
             intercept = self._intercept == "all" or inject is not None or method_restricted
             return Decision(allow=True, intercept=intercept, inject=inject)
+        # No rule allows host+method. If the host IS listed in a rule but this (non-CONNECT) method
+        # isn't permitted, the operator constrained that host -> deny regardless of `default`
+        # (otherwise a per-host method limit would silently no-op under default="allow"). CONNECT
+        # stays a reachability-only check, so the TLS tunnel still opens and the method is enforced
+        # at the request phase.
+        if method.upper() != "CONNECT" and any(fnmatch.fnmatch(host, r.host) for r in self._rules):
+            return Decision(allow=False, intercept=False, inject=None)
         if self._default == "allow":
             return Decision(allow=True, intercept=self._intercept == "all", inject=None)
         return Decision(allow=False, intercept=False, inject=None)

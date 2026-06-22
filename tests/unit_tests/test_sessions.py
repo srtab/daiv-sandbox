@@ -560,11 +560,6 @@ def test_exec_env_includes_proxy_when_egress_enabled(mock_docker_client, monkeyp
     monkeypatch.setattr(
         "daiv_sandbox.egress.manager.EgressProxyManager.proxy_internal_ip", lambda self, token, net=None: "10.7.0.2"
     )
-    monkeypatch.setattr(
-        "daiv_sandbox.egress.manager.EgressProxyManager._network_name_for",
-        lambda self, token: "daiv-egress-tok123",
-        raising=False,
-    )
     env = s._get_exec_environment()
     assert env["HTTPS_PROXY"] == "http://10.7.0.2:8080"
     assert env["HOME"]  # base env still present
@@ -575,6 +570,20 @@ def test_exec_env_has_no_proxy_when_disabled(mock_docker_client):
     s.session_id = "sid"
     s.container = MagicMock()
     s.container.labels = {}
+    assert s._get_exec_environment() == EXPECTED_EXEC_ENV
+
+
+def test_exec_env_degrades_to_base_on_proxy_error(mock_docker_client, monkeypatch):
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
+    s = SandboxDockerSession()
+    s.container = MagicMock()
+    s.container.labels = {"daiv.sandbox.egress": "tok123"}
+    monkeypatch.setattr(
+        "daiv_sandbox.egress.manager.EgressProxyManager.proxy_internal_ip",
+        lambda self, token, net=None: (_ for _ in ()).throw(RuntimeError("unreachable")),
+    )
     assert s._get_exec_environment() == EXPECTED_EXEC_ENV
 
 

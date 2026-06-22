@@ -212,6 +212,8 @@ class EgressRule(BaseModel):
     @field_validator("methods", mode="after")
     @classmethod
     def _upper(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("methods must not be empty; use ['*'] to allow all methods")
         return [m.upper() for m in value]
 
 

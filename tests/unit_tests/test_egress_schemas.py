@@ -10,6 +10,13 @@ def test_methods_uppercased_and_default_star():
     assert EgressRule(host="x", methods=["get", "Head"]).methods == ["GET", "HEAD"]
 
 
+def test_empty_methods_raises_validation_error():
+    """An explicit empty methods list is a footgun: the host is reachable via CONNECT but every
+    request is blocked. Reject it at validation time so the operator sees a clear error."""
+    with pytest.raises(ValidationError, match="must not be empty"):
+        EgressRule(host="x", methods=[])
+
+
 def test_policy_defaults_are_deny_and_intercept_all():
     p = EgressPolicy()
     assert p.default == "deny"

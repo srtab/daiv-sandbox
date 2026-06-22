@@ -85,6 +85,8 @@ def test_egress_defaults():
     assert settings.EGRESS_PROXY_NETWORK is None
     assert settings.EGRESS_CA_CERT_FILE is None
     assert settings.EGRESS_CA_KEY_FILE is None
+    assert settings.EGRESS_PROXY_MEMORY_BYTES is None
+    assert settings.EGRESS_PROXY_CPUS is None
 
 
 def test_egress_proxy_image_default():
