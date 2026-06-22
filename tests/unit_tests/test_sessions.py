@@ -427,11 +427,31 @@ def test_install_ca_cert_ships_cert_and_updates_store(mock_docker_client):
     )
 
 
+def test_install_ca_cert_fails_closed_when_mkdir_fails(mock_docker_client):
+    s = _session_with_container()
+    s.container.exec_run = Mock(return_value=ExecResult(exit_code=1, output=b"mkdir: permission denied"))
+    with pytest.raises(RuntimeError, match="CA dir"):
+        s.install_ca_cert(b"cert")
+
+
+def test_install_ca_cert_fails_closed_when_put_archive_fails(mock_docker_client):
+    s = _session_with_container()
+    s.container.put_archive = Mock(return_value=False)
+    s.container.exec_run = Mock(return_value=ExecResult(exit_code=0, output=b""))
+    with pytest.raises(RuntimeError, match="copy CA cert"):
+        s.install_ca_cert(b"cert")
+
+
 def test_install_ca_cert_fails_closed_when_update_fails(mock_docker_client):
     s = _session_with_container()
     s.container.put_archive = Mock(return_value=True)
-    s.container.exec_run = Mock(return_value=ExecResult(exit_code=1, output=b"update-ca-certificates: not found"))
-    with pytest.raises(RuntimeError, match="CA"):
+    s.container.exec_run = Mock(
+        side_effect=[
+            ExecResult(exit_code=0, output=b""),  # mkdir succeeds
+            ExecResult(exit_code=1, output=b"update-ca-certificates: not found"),  # update fails
+        ]
+    )
+    with pytest.raises(RuntimeError, match="update-ca-certificates"):
         s.install_ca_cert(b"cert")
 
 
