@@ -1,5 +1,6 @@
+import asyncio
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from docker.errors import APIError, NotFound
 
@@ -46,7 +47,7 @@ def test_list_stopped_filters_out_running():
 
 
 def _stopped_container(cid: str, finished_at: str):
-    return Mock(id=cid, status="exited", attrs={"State": {"FinishedAt": finished_at}}, remove=Mock())
+    return Mock(id=cid, status="exited", labels={}, attrs={"State": {"FinishedAt": finished_at}}, remove=Mock())
 
 
 class _BusyLockManager:
@@ -185,3 +186,24 @@ def test_start_reaper_returns_none_when_disabled(monkeypatch):
     monkeypatch.setattr(cfg, "REAPER_ENABLED", False)
     app = Mock()
     assert reaper.start_reaper(app) is None
+
+
+class _Noop:
+    def acquire(self, _id):
+        class _Ctx:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *a):
+                return False
+
+        return _Ctx()
+
+
+def test_reaper_tears_down_triad_for_egress_sandbox():
+    """Reaper tears down the egress triad after force-removing an egress sandbox container."""
+    container = MagicMock(id="sbx", status="exited", labels={"daiv.sandbox.egress": "tok123"})
+    with patch("daiv_sandbox.reaper.EgressProxyManager") as mock_mgr_class:
+        asyncio.run(_remove_guarded(container, _Noop()))
+        mock_mgr_class.return_value.teardown.assert_called_once_with("tok123")
+        container.remove.assert_called_once_with(force=True)

@@ -7,8 +7,9 @@ from datetime import UTC, datetime
 from docker.errors import NotFound
 
 from daiv_sandbox.config import settings
+from daiv_sandbox.egress.manager import EgressProxyManager
 from daiv_sandbox.locks import SessionBusyError
-from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, TYPE_CMD_EXECUTOR, SandboxDockerSession
+from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, EGRESS_SESSION_LABEL, TYPE_CMD_EXECUTOR, SandboxDockerSession
 
 logger = logging.getLogger("daiv_sandbox")
 
@@ -65,6 +66,10 @@ async def _remove_guarded(container, lock_manager) -> bool:
                 logger.info("Reaper: container %s is running again; skipping removal", container.id)
                 return False
             await asyncio.to_thread(container.remove, force=True)
+            token = (getattr(container, "labels", None) or {}).get(EGRESS_SESSION_LABEL)
+            if token:
+                manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
+                await asyncio.to_thread(manager.teardown, token)
     except SessionBusyError:
         logger.info("Reaper: session %s busy; skipping this tick", container.id)
         return False

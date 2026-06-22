@@ -432,9 +432,14 @@ async def close_session(
     async with request.app.state.session_lock_manager.acquire(session_id):
         cmd_executor = SandboxDockerSession()
         cmd_executor.session_id = session_id
+        cmd_executor.container = await asyncio.to_thread(cmd_executor._get_container, session_id)
+        token = (getattr(cmd_executor.container, "labels", None) or {}).get(EGRESS_SESSION_LABEL)
 
         if force:
             await asyncio.to_thread(cmd_executor.remove_container)
+            if token:
+                manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
+                await asyncio.to_thread(manager.teardown, token)
         else:
             await asyncio.to_thread(cmd_executor.stop_container)
 

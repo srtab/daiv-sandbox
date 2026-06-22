@@ -472,6 +472,7 @@ def test_close_session_stops_container_by_default(client):
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
         mock_cmd_executor = Mock()
         mock_cmd_executor.session_id = "cmd-executor-id"
+        mock_cmd_executor._get_container.return_value = Mock(labels={})
         mock_session_class.return_value = mock_cmd_executor
 
         response = client.delete("/session/cmd-executor-id/")
@@ -486,6 +487,7 @@ def test_close_session_force_removes_container(client):
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
         mock_cmd_executor = Mock()
         mock_cmd_executor.session_id = "cmd-executor-id"
+        mock_cmd_executor._get_container.return_value = Mock(labels={})
         mock_session_class.return_value = mock_cmd_executor
 
         response = client.delete("/session/cmd-executor-id/?force=true")
@@ -493,6 +495,21 @@ def test_close_session_force_removes_container(client):
         assert response.status_code == 204
         mock_cmd_executor.remove_container.assert_called_once()
         mock_cmd_executor.stop_container.assert_not_called()
+
+
+def test_force_close_tears_down_triad(client, monkeypatch):
+    """Force-closing an egress session tears down the proxy triad after removing the container."""
+    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
+    with (
+        patch("daiv_sandbox.main.SandboxDockerSession") as cls,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
+        cmd = cls.return_value
+        cmd.session_id = "sbx"
+        cls.return_value._get_container.return_value = Mock(labels={"daiv.sandbox.egress": "tok123"})
+        resp = client.delete("/session/sbx/?force=true")
+        assert resp.status_code == 204
+        mock_mgr_class.return_value.teardown.assert_called_once_with("tok123")
 
 
 def test_get_session_returns_204_when_present(client):
