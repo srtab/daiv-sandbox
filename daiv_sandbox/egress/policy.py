@@ -35,15 +35,9 @@ class EgressPolicy:
     @classmethod
     def from_config(cls, data: dict) -> EgressPolicy:
         policy = data.get("policy", {})
-        secrets = {
-            name: (s["header"], s["value"]) for name, s in (data.get("secrets") or {}).items()
-        }
+        secrets = {name: (s["header"], s["value"]) for name, s in (data.get("secrets") or {}).items()}
         rules = [
-            _Rule(
-                host=r["host"],
-                methods=tuple(m.upper() for m in r.get("methods", ["*"])),
-                inject=r.get("inject"),
-            )
+            _Rule(host=r["host"], methods=tuple(m.upper() for m in r.get("methods", ["*"])), inject=r.get("inject"))
             for r in policy.get("rules", [])
         ]
         return cls(policy.get("default", "deny"), policy.get("intercept", "all"), rules, secrets)
@@ -89,7 +83,7 @@ class PolicyStore:
             try:
                 with open(self._path, encoding="utf-8") as fh:  # noqa: PTH123
                     self._policy = EgressPolicy.from_config(json.load(fh))
-            except (OSError, ValueError, KeyError):
+            except OSError, ValueError, KeyError:
                 logger.exception("egress: failed to load policy from %s; failing closed (deny-all)", self._path)
                 self._policy = _DENY_ALL
             self._mtime = mtime
