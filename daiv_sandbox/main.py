@@ -230,22 +230,28 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     if request.cpus:
         cmd_executor_kwargs["cpus"] = request.cpus
 
-    use_egress = request.network_enabled and settings.EGRESS_PROXY_ENABLED
+    use_egress = request.network_enabled
 
     if not request.network_enabled:
         cmd_executor_kwargs["network_mode"] = "none"
-    elif use_egress:
-        # Triad: internal network + sidecar proxy; the sandbox reaches the internet only via the proxy.
-        if not settings.EGRESS_CA_CERT_FILE or not settings.EGRESS_CA_KEY_FILE:
-            raise HTTPException(status_code=500, detail="Egress proxy enabled but EGRESS CA files are not configured")
+    else:
+        # Network-enabled sessions reach the internet only through the per-session egress proxy
+        # (internal network + sidecar). Egress is mandatory — there is no direct-network attach.
+        # If the proxy isn't configured (no shared CA), reject rather than silently attaching a
+        # network that would bypass the proxy's allow/deny policy and credential isolation.
+        if not settings.egress_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="network_enabled requires the egress proxy, which is not configured on this deployment",
+            )
         token = uuid.uuid4().hex[:12]
         try:
             ca_cert = Path(settings.EGRESS_CA_CERT_FILE).read_bytes()
             ca_combined = Path(settings.EGRESS_CA_KEY_FILE).read_bytes() + b"\n" + ca_cert
         except OSError as exc:
-            # Distinct from the "not configured" guard above: the files ARE configured here, they just
-            # can't be read (missing on disk, permission denied, mid-rotation). Log the errno so the
-            # real cause reaches Sentry/logs; keep the client message path-free.
+            # The CA files ARE configured (egress_enabled) but can't be read (missing on disk,
+            # permission denied, mid-rotation). Distinct from the 400 above; log the errno so the
+            # real cause reaches Sentry/logs and keep the client message path-free.
             logger.error("Egress proxy: cannot read EGRESS CA files: %s", exc)
             raise HTTPException(
                 status_code=500, detail="Egress proxy enabled but EGRESS CA files could not be read"
@@ -265,8 +271,6 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         except Exception:
             await asyncio.to_thread(manager.teardown, token)
             raise
-    elif settings.NETWORK:
-        cmd_executor_kwargs["network"] = settings.NETWORK
 
     if request.environment and not use_egress:
         cmd_executor_kwargs["environment"] = request.environment
@@ -407,8 +411,8 @@ async def configure_egress(
     Idempotent: called once after start and again on warm reuse with refreshed tokens. The secrets
     reach only the sidecar — never the sandbox.
     """
-    if not settings.EGRESS_PROXY_ENABLED:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Egress proxy not enabled")
+    if not settings.egress_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Egress proxy not configured")
     async with _workspace_executor(http_request, session_id) as cmd:
         token = egress_token(cmd.container)
         if not token:

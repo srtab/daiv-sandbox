@@ -389,8 +389,7 @@ def test_start_session_isolates_network_by_default(client):
 
 
 def test_start_session_passes_resource_limits(client):
-    """memory_bytes/cpus/environment map onto the container start; network_enabled drops the
-    network_mode isolation."""
+    """memory_bytes/cpus/environment map onto the container start kwargs."""
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
         mock_cmd_executor = Mock()
         mock_cmd_executor.session_id = "id"
@@ -398,13 +397,7 @@ def test_start_session_passes_resource_limits(client):
 
         response = client.post(
             "/session/",
-            json={
-                "base_image": "python:3.12",
-                "network_enabled": True,
-                "memory_bytes": 1024,
-                "cpus": 1.5,
-                "environment": {"FOO": "bar"},
-            },
+            json={"base_image": "python:3.12", "memory_bytes": 1024, "cpus": 1.5, "environment": {"FOO": "bar"}},
         )
 
         assert response.status_code == 200, response.text
@@ -412,41 +405,32 @@ def test_start_session_passes_resource_limits(client):
         assert kwargs["mem_limit"] == 1024
         assert kwargs["cpus"] == 1.5
         assert kwargs["environment"] == {"FOO": "bar"}
-        assert "network_mode" not in kwargs  # network_enabled=True -> no isolation
+        assert kwargs["network_mode"] == "none"  # network_enabled defaults to False -> isolated
 
 
-def test_start_session_attaches_configured_network_when_enabled(client, monkeypatch):
-    """A network-enabled session attaches to the Docker network named by DAIV_SANDBOX_NETWORK when
-    one is configured (and never sets network_mode, which would conflict with an explicit network)."""
+def test_start_session_400_when_network_enabled_with_network_configured_but_no_egress(client, monkeypatch):
+    """Even with DAIV_SANDBOX_NETWORK set, a network-enabled session is rejected when egress isn't
+    configured: the direct-network attach that bypassed the proxy has been removed (fail closed)."""
     monkeypatch.setattr(settings, "NETWORK", "daiv-net")
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", None)
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", None)
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
-        mock_cmd_executor = Mock()
-        mock_cmd_executor.session_id = "id"
-        mock_session_class.start.return_value = mock_cmd_executor
-
         response = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
-
-        assert response.status_code == 200, response.text
-        kwargs = mock_session_class.start.call_args.kwargs
-        assert kwargs.get("network") == "daiv-net"
-        assert "network_mode" not in kwargs
+        assert response.status_code == 400, response.text
+        assert "egress" in response.json()["detail"].lower()
+        mock_session_class.start.assert_not_called()
 
 
-def test_start_session_enabled_without_configured_network_uses_default(client, monkeypatch):
-    """A network-enabled session with no DAIV_SANDBOX_NETWORK configured falls back to Docker's
-    default network: neither an explicit `network` nor a `network_mode` kwarg is passed."""
+def test_start_session_400_when_egress_not_configured(client, monkeypatch):
+    """Network requested but no egress CA configured -> 400 (fail closed); no container created."""
     monkeypatch.setattr(settings, "NETWORK", None)
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", None)
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", None)
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
-        mock_cmd_executor = Mock()
-        mock_cmd_executor.session_id = "id"
-        mock_session_class.start.return_value = mock_cmd_executor
-
         response = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
-
-        assert response.status_code == 200, response.text
-        kwargs = mock_session_class.start.call_args.kwargs
-        assert "network" not in kwargs
-        assert "network_mode" not in kwargs
+        assert response.status_code == 400, response.text
+        assert "egress" in response.json()["detail"].lower()
+        mock_session_class.start.assert_not_called()
 
 
 def test_start_session_disabled_network_ignores_configured_network(client, monkeypatch):
@@ -1312,7 +1296,6 @@ def test_start_session_builds_triad_when_egress_enabled(client, monkeypatch, tmp
     cert.write_text("CERT")
     key = tmp_path / "ca.key"
     key.write_text("KEY")
-    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
     monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(cert))
     monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(key))
 
@@ -1339,41 +1322,10 @@ def test_start_session_builds_triad_when_egress_enabled(client, monkeypatch, tmp
         cmd.install_ca_cert.assert_called_once()
 
 
-def test_start_session_egress_disabled_keeps_direct_network(client, monkeypatch):
-    """With the feature off, network_enabled keeps today's direct-attach behavior (no triad)."""
-    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", False)
-    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
-        mock_session_class.start.return_value = Mock(session_id="id")
-        resp = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
-        assert resp.status_code == 200, resp.text
-        assert "labels" in mock_session_class.start.call_args.kwargs  # cmd_executor label, no egress token
-        assert "daiv.sandbox.egress" not in mock_session_class.start.call_args.kwargs.get("labels", {})
-
-
-def test_start_session_egress_500_when_ca_files_not_configured(client, monkeypatch):
-    """If a CA env setting is unset, the endpoint returns 500 with a distinct 'not configured' message
-    and no Docker resources are created."""
-    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
-    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", "")
-    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", "/some/key.pem")
-
-    with (
-        patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class,
-        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
-    ):
-        resp = client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
-
-        assert resp.status_code == 500, resp.text
-        assert "not configured" in resp.json()["detail"]
-        mock_mgr_class.return_value.create_network.assert_not_called()
-        mock_session_class.start.assert_not_called()
-
-
 def test_start_session_egress_500_when_ca_file_unreadable(client, monkeypatch, tmp_path):
     """If the configured CA files exist as settings but cannot be read (e.g. missing on disk), the
     endpoint returns 500 with a distinct 'could not be read' message (NOT 'not configured', which would
     misdirect an operator who set both env vars) and no Docker resources are created."""
-    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
     monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(tmp_path / "missing.crt"))
     monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(tmp_path / "missing.key"))
 
@@ -1399,7 +1351,6 @@ def test_start_session_egress_tears_down_on_triad_failure(monkeypatch, tmp_path)
     cert.write_text("CERT")
     key = tmp_path / "ca.key"
     key.write_text("KEY")
-    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
     monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(cert))
     monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(key))
 
@@ -1462,7 +1413,8 @@ def test_fs_grep_forwards_default_plus_request_excludes(mock_session, client, mo
 def test_configure_egress_provisions_policy(mock_session, client, monkeypatch):
     from daiv_sandbox.config import settings
 
-    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", "/run/secrets/ca.crt")
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", "/run/secrets/ca.key")
     mock_session.container.labels = {"daiv.sandbox.egress": "tok123"}
     with patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class:
         mgr = mock_mgr_class.return_value
@@ -1480,17 +1432,18 @@ def test_configure_egress_provisions_policy(mock_session, client, monkeypatch):
         assert b"Bearer t" in payload  # the resolved secret value reaches the sidecar config
 
 
-def test_configure_egress_404_when_egress_disabled(client):
-    """The endpoint returns 404 immediately when EGRESS_PROXY_ENABLED is False (the default)."""
+def test_configure_egress_404_when_egress_not_configured(client):
+    """The endpoint returns 404 immediately when no egress CA is configured (the default)."""
     resp = client.post("/session/any-session-id/egress/", json={"policy": {}, "secrets": {}})
     assert resp.status_code == 404
-    assert resp.json()["detail"] == "Egress proxy not enabled"
+    assert resp.json()["detail"] == "Egress proxy not configured"
 
 
 def test_configure_egress_404_when_session_missing(client, monkeypatch):
     from daiv_sandbox.config import settings
 
-    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", "/run/secrets/ca.crt")
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", "/run/secrets/ca.key")
     with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
         cls.return_value.container = None
         resp = client.post("/session/nope/egress/", json={"policy": {}, "secrets": {}})
@@ -1500,7 +1453,8 @@ def test_configure_egress_404_when_session_missing(client, monkeypatch):
 
 def test_configure_egress_409_when_no_proxy_for_session(mock_session, client, monkeypatch):
     """A session that wasn't started with egress has no sidecar to provision."""
-    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", "/run/secrets/ca.crt")
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", "/run/secrets/ca.key")
     mock_session.container.labels = {}  # no egress token
     resp = client.post(f"/session/{mock_session.session_id}/egress/", json={"policy": {}, "secrets": {}})
     assert resp.status_code == 409
