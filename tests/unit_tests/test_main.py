@@ -1312,12 +1312,11 @@ def test_start_session_builds_triad_when_egress_enabled(client, monkeypatch, tmp
         assert resp.status_code == 200, resp.text
         mgr.create_network.assert_called_once()
         mgr.start_proxy.assert_called_once()
-        # sandbox started on the internal network with the egress token label + proxy env, DNS-fix off
+        # sandbox started on the internal network with the egress token label + proxy env
         start_kwargs = mock_session_class.start.call_args.kwargs
         assert start_kwargs["network"] == mgr.create_network.return_value
         assert "daiv.sandbox.egress" in start_kwargs["labels"]
         assert start_kwargs["environment"]["HTTPS_PROXY"] == "http://10.7.0.2:8080"
-        assert start_kwargs["apply_dns_fix"] is False
         cmd.install_ca_cert.assert_called_once()
 
 

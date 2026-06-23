@@ -263,7 +263,6 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
             proxy_ip = await asyncio.to_thread(manager.proxy_internal_ip, token)
             cmd_executor_labels[EGRESS_SESSION_LABEL] = token
             cmd_executor_kwargs["network"] = network_name
-            cmd_executor_kwargs["apply_dns_fix"] = False
             cmd_executor_kwargs["environment"] = {
                 **(request.environment or {}),
                 **exec_proxy_env(proxy_ip, settings.EGRESS_PROXY_PORT),
