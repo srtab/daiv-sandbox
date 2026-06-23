@@ -38,25 +38,15 @@ class Settings(BaseSettings):
     RUN_UID: int = 1000
     RUN_GID: int = 1000
     COMMAND_TIMEOUT: int = Field(default=0, ge=0)  # per-command timeout in seconds; 0 = no timeout
-    # Network attached to cmd-executor containers when a session is network-enabled. None -> Docker's
-    # default bridge (no compose-service DNS). Set to a compose/user-defined network (e.g.
-    # "daiv_default") so containers can resolve & reach sibling services like "gitlab:8929".
+    # Upstream network for the egress sidecar's second NIC (its route to the internet). The sandbox
+    # is never attached to this network directly — network-enabled sessions reach the internet only
+    # through the proxy. None -> EGRESS_PROXY_NETWORK falls back here, then to Docker's default bridge.
     NETWORK: str | None = None
-    # DNS resolvers written into a network-enabled cmd-executor's /etc/resolv.conf under the gVisor
-    # (runsc) runtime. gVisor's netstack can't reach the embedded Docker resolver (127.0.0.11) that a
-    # user-defined NETWORK injects, so name resolution is pointed at real upstreams instead. Ignored
-    # under runc (its embedded resolver works). Comma-separated env value, e.g. "1.1.1.1,8.8.8.8".
-    DNS: Annotated[list[str], NoDecode] = ["1.1.1.1", "8.8.8.8"]
-    # Sibling service hostnames (comma-separated, e.g. "gitlab") resolved at session start and injected
-    # as static /etc/hosts entries in network-enabled gVisor cmd-executors. This restores the
-    # compose-service name resolution that overriding resolv.conf (see DNS) would otherwise drop.
-    # Ignored under runc. Names that fail to resolve are skipped with a warning.
-    EXTRA_HOSTS: Annotated[list[str], NoDecode] = []
-    # Egress proxy (per-session MITM sidecar). When EGRESS_PROXY_ENABLED, a network-enabled session
-    # is created as a triad (internal network + mitmdump sidecar + sandbox) instead of attaching the
-    # sandbox directly to a network. Credentials/rules are provisioned into the sidecar, never the
-    # sandbox. See the "Network Egress Proxy" section of the README.
-    EGRESS_PROXY_ENABLED: bool = False
+    # Egress proxy (per-session MITM sidecar). Egress is enabled by configuring the shared CA
+    # (EGRESS_CA_CERT_FILE + EGRESS_CA_KEY_FILE); when configured, a network-enabled session is
+    # built as a triad (internal network + mitmdump sidecar + sandbox) and the sandbox reaches the
+    # internet only through the sidecar. A network_enabled request without the CA is rejected (400).
+    # See the "Network Egress Proxy" section of the README.
     EGRESS_PROXY_IMAGE: str = "ghcr.io/srtab/daiv-sandbox-egress:latest"
     EGRESS_PROXY_PORT: int = 8080
     # The sidecar runs trusted code (not untrusted), so it stays on runc even when sandboxes use runsc;
@@ -113,7 +103,7 @@ class Settings(BaseSettings):
         "obj",
     ]
 
-    @field_validator("DNS", "EXTRA_HOSTS", "FS_PRUNE_DIRS", mode="before")
+    @field_validator("FS_PRUNE_DIRS", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:
         """Accept comma-separated env strings (e.g. "1.1.1.1,8.8.8.8") for list settings."""

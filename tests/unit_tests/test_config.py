@@ -49,25 +49,6 @@ def test_session_lock_defaults():
     assert settings.SESSION_LOCK_REFRESH_SECONDS == 30.0
 
 
-def test_dns_and_extra_hosts_defaults():
-    assert settings.DNS == ["1.1.1.1", "8.8.8.8"]
-    assert settings.EXTRA_HOSTS == []
-
-
-def test_dns_and_extra_hosts_parse_comma_separated_env(monkeypatch):
-    monkeypatch.setenv("DAIV_SANDBOX_DNS", "1.1.1.1, 8.8.8.8 ,9.9.9.9")
-    monkeypatch.setenv("DAIV_SANDBOX_EXTRA_HOSTS", "gitlab, redis")
-    parsed = Settings()
-    assert parsed.DNS == ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
-    assert parsed.EXTRA_HOSTS == ["gitlab", "redis"]
-
-
-def test_empty_extra_hosts_env_falls_back_to_default(monkeypatch):
-    # env_ignore_empty=True: an empty value is treated as unset, keeping the default.
-    monkeypatch.setenv("DAIV_SANDBOX_EXTRA_HOSTS", "")
-    assert Settings().EXTRA_HOSTS == []
-
-
 def test_fs_prune_dirs_default():
     # Pin the full default list so an accidental removal is caught; deliberate additions update this.
     assert settings.FS_PRUNE_DIRS == [
@@ -109,7 +90,6 @@ def test_fs_prune_dirs_parse_comma_separated_env(monkeypatch):
 
 
 def test_egress_defaults():
-    assert settings.EGRESS_PROXY_ENABLED is False
     assert settings.EGRESS_PROXY_PORT == 8080
     assert settings.EGRESS_PROXY_RUNTIME == "runc"
     assert settings.EGRESS_PROXY_NETWORK is None
