@@ -1,4 +1,34 @@
+import pytest
+from pydantic import ValidationError
+
 from daiv_sandbox.config import Settings, settings
+
+
+def test_egress_enabled_false_without_ca():
+    assert settings.egress_enabled is False
+
+
+def test_egress_enabled_true_with_both_ca(monkeypatch):
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", "/run/secrets/ca.crt")
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", "/run/secrets/ca.key")
+    assert settings.egress_enabled is True
+
+
+def test_egress_ca_cert_without_key_fails_at_boot():
+    with pytest.raises(ValidationError, match="EGRESS_CA"):
+        Settings(EGRESS_CA_CERT_FILE="/run/secrets/ca.crt")
+
+
+def test_egress_ca_key_without_cert_fails_at_boot():
+    with pytest.raises(ValidationError, match="EGRESS_CA"):
+        Settings(EGRESS_CA_KEY_FILE="/run/secrets/ca.key")
+
+
+def test_egress_ca_both_set_constructs(monkeypatch):
+    monkeypatch.setenv("DAIV_SANDBOX_EGRESS_CA_CERT_FILE", "/run/secrets/ca.crt")
+    monkeypatch.setenv("DAIV_SANDBOX_EGRESS_CA_KEY_FILE", "/run/secrets/ca.key")
+    s = Settings()
+    assert s.egress_enabled is True
 
 
 def test_reaper_defaults():

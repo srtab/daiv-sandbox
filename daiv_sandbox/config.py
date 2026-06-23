@@ -1,7 +1,7 @@
 import warnings
 from typing import Annotated, Literal
 
-from pydantic import Field, HttpUrl, SecretStr, field_validator  # noqa: TC002
+from pydantic import Field, HttpUrl, SecretStr, field_validator, model_validator  # noqa: TC002
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 warnings.filterwarnings(
@@ -120,6 +120,23 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @model_validator(mode="after")
+    def _validate_egress_ca_pair(self) -> Settings:
+        """The shared egress CA is all-or-nothing: cert without key (or vice versa) can never
+        build a working sidecar, so reject the half-configured state loudly at startup instead
+        of silently disabling network egress."""
+        if bool(self.EGRESS_CA_CERT_FILE) != bool(self.EGRESS_CA_KEY_FILE):
+            raise ValueError(
+                "EGRESS_CA_CERT_FILE and EGRESS_CA_KEY_FILE must be set together (both to enable egress, or neither)."
+            )
+        return self
+
+    @property
+    def egress_enabled(self) -> bool:
+        """Egress is available iff the shared CA (cert + key) is configured. Network-enabled
+        sessions require it; there is no direct-network attach to a sandbox."""
+        return bool(self.EGRESS_CA_CERT_FILE and self.EGRESS_CA_KEY_FILE)
 
     # Session locking
     REDIS_URL: str | None = None
