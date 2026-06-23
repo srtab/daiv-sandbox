@@ -72,7 +72,8 @@ container that has been warmed again — closing a TOCTOU race against in-flight
 **Error-status contract (deliberate — keep these distinct).** Missing session → `404`. A Docker fault
 while restarting/stopping an existing container → `SessionUnavailableError` → `503` (retryable infra
 fault, **not** masked as 404). Lock contention → `SessionBusyError` → `409`. Missing/invalid API key →
-`403`.
+`403`. A `network_enabled=true` request on a deployment without the egress CA configured → `400` (egress
+is mandatory for network access; there is no direct-network attach).
 
 **`fs/*` is Python-free and defends a container boundary, not a path prefix.** File content moves via
 the Docker archive API; search/listing shells out to POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work
@@ -84,7 +85,7 @@ prefix. `fs/read` caps a single response at `READ_MAX_OUTPUT_BYTES` (512 KB); `f
 codes from `FsErrorCode` in `schemas.py`): absence is `not_found` (distinct from an empty
 listing/no-match), a type mismatch is `not_a_directory`/`is_a_directory`, a malformed path is
 `invalid_path`, and `fs/delete` reports a `removed` boolean. HTTP status codes remain reserved for
-session/transport concerns (404 missing session, 409 lock, 503 infra, 403 auth, 500 unexpected).
+session/transport concerns (404 missing session, 409 lock, 503 infra, 403 auth, 400 network-without-egress, 500 unexpected).
 
 **Untrusted-input handling.** Uploaded archives are sanitised before extraction (`_sanitize_archive_stream`):
 symlinks/hardlinks/device nodes/FIFOs and absolute/`..` paths are rejected, ownership is normalised to
