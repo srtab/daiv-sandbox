@@ -30,8 +30,12 @@ class _Rule:
     inject: str | None
 
 
-class EgressPolicy:
-    """Pure evaluator over a parsed config dict ({"policy": {...}, "secrets": {...}})."""
+class PolicyEvaluator:
+    """Pure evaluator over a parsed config dict ({"policy": {...}, "secrets": {...}}).
+
+    Named distinctly from the ``EgressPolicy`` *wire schema* (daiv_sandbox.schemas): this is the
+    runtime evaluator that lives inside the sidecar; that one is the operator-facing request model.
+    """
 
     def __init__(self, default: str, intercept: str, rules: list[_Rule], secrets: dict[str, tuple[str, str]]):
         self._default = default
@@ -40,7 +44,7 @@ class EgressPolicy:
         self._secrets = secrets  # name -> (header, value)
 
     @classmethod
-    def from_config(cls, data: dict) -> EgressPolicy:
+    def from_config(cls, data: dict) -> PolicyEvaluator:
         policy = data.get("policy", {})
         secrets = {name: (s["header"], s["value"]) for name, s in (data.get("secrets") or {}).items()}
         rules = []
@@ -48,6 +52,12 @@ class EgressPolicy:
             # Hostnames are case-insensitive (RFC 4343): normalise the rule host to lower-case so host
             # matching cannot be bypassed by varying the case of the requested host (see _match/evaluate).
             methods = tuple(m.upper() for m in r.get("methods", ["*"]))
+            # Re-enforce the wire schema's invariant (EgressRule._upper) independently: an empty methods
+            # list yields a host reachable via CONNECT but blocking every request. The config file is the
+            # trust boundary the sidecar actually reads (PolicyStore reloads it on mtime change), so the
+            # parser must fail closed on its own — raising here makes PolicyStore collapse to deny-all.
+            if not methods:
+                raise ValueError(f"egress: rule for host {r.get('host')!r} has empty methods; use ['*'] for any")
             rules.append(_Rule(host=r["host"].lower(), methods=methods, inject=r.get("inject")))
         # Unknown default/intercept values are a misconfiguration: fail closed (deny / full MITM) and warn
         # rather than relying on `== "allow"`/`== "all"` to accidentally do the safe thing for a typo.
@@ -102,11 +112,11 @@ class EgressPolicy:
         return Decision(allow=False, intercept=False, inject=None)
 
 
-_DENY_ALL = EgressPolicy("deny", "all", [], {})
+_DENY_ALL = PolicyEvaluator("deny", "all", [], {})
 
 
 class PolicyStore:
-    """Loads the config JSON, caching the parsed EgressPolicy and reloading on mtime change.
+    """Loads the config JSON, caching the parsed PolicyEvaluator and reloading on mtime change.
 
     A missing/unreadable/invalid file yields a deny-all policy — fail closed.
     """
@@ -116,7 +126,7 @@ class PolicyStore:
         self._mtime: float | None = None
         self._policy = _DENY_ALL
 
-    def current(self) -> EgressPolicy:
+    def current(self) -> PolicyEvaluator:
         try:
             mtime = os.path.getmtime(self._path)  # noqa: PTH204
         except OSError:
@@ -125,7 +135,7 @@ class PolicyStore:
         if mtime != self._mtime:
             try:
                 with open(self._path, encoding="utf-8") as fh:  # noqa: PTH123
-                    self._policy = EgressPolicy.from_config(json.load(fh))
+                    self._policy = PolicyEvaluator.from_config(json.load(fh))
             except Exception:
                 # Catch broadly ON PURPOSE: this evaluator backs a security boundary, and the addon
                 # hooks that call it run inside mitmproxy, which FAILS OPEN on an unhandled hook

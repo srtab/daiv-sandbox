@@ -448,7 +448,7 @@ def test_exec_env_includes_proxy_when_egress_enabled(mock_docker_client, monkeyp
     # Container carries the egress token label; manager resolves the proxy IP.
     s.container.labels = {"daiv.sandbox.egress": "tok123"}
     monkeypatch.setattr(
-        "daiv_sandbox.egress.manager.EgressProxyManager.proxy_internal_ip", lambda self, token, net=None: "10.7.0.2"
+        "daiv_sandbox.egress.manager.EgressProxyManager.proxy_internal_ip", lambda self, token: "10.7.0.2"
     )
     env = s._get_exec_environment()
     assert env["HTTPS_PROXY"] == "http://10.7.0.2:8080"
@@ -473,9 +473,35 @@ def test_exec_env_degrades_to_base_on_proxy_error(mock_docker_client, monkeypatc
     s.container.labels = {"daiv.sandbox.egress": "tok123"}
     monkeypatch.setattr(
         "daiv_sandbox.egress.manager.EgressProxyManager.proxy_internal_ip",
-        lambda self, token, net=None: (_ for _ in ()).throw(RuntimeError("unreachable")),
+        lambda self, token: (_ for _ in ()).throw(RuntimeError("unreachable")),
     )
     assert s._get_exec_environment() == EXPECTED_EXEC_ENV
+
+
+def test_exec_env_retries_after_transient_proxy_error(mock_docker_client, monkeypatch):
+    """A transient proxy-IP resolution failure must not be cached: a later command in the same request
+    retries instead of silently running egress-less for the rest of the request."""
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", "/run/secrets/ca.crt")
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", "/run/secrets/ca.key")
+    s = SandboxDockerSession()
+    s.session_id = "sid"
+    s.container = MagicMock()
+    s.container.labels = {"daiv.sandbox.egress": "tok123"}
+
+    calls = {"n": 0}
+
+    def _flaky(self, token):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("unreachable")
+        return "10.7.0.2"
+
+    monkeypatch.setattr("daiv_sandbox.egress.manager.EgressProxyManager.proxy_internal_ip", _flaky)
+
+    assert s._get_exec_environment() == EXPECTED_EXEC_ENV  # 1st call fails -> base env, NOT cached
+    assert s._get_exec_environment()["HTTPS_PROXY"] == "http://10.7.0.2:8080"  # 2nd call retries, succeeds
 
 
 def _sanitize_tar(build) -> tuple[tarfile.TarFile, int]:

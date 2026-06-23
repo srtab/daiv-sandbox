@@ -1,6 +1,8 @@
 import json
 
-from daiv_sandbox.egress.policy import EgressPolicy, PolicyStore
+import pytest
+
+from daiv_sandbox.egress.policy import PolicyEvaluator, PolicyStore
 
 
 def _cfg(default="deny", intercept="all", rules=None, secrets=None):
@@ -8,13 +10,13 @@ def _cfg(default="deny", intercept="all", rules=None, secrets=None):
 
 
 def test_default_deny_blocks_unlisted_host():
-    p = EgressPolicy.from_config(_cfg())
+    p = PolicyEvaluator.from_config(_cfg())
     d = p.evaluate("evil.example", "GET")
     assert d.allow is False
 
 
 def test_allow_lists_host_and_injects_header():
-    p = EgressPolicy.from_config(
+    p = PolicyEvaluator.from_config(
         _cfg(
             rules=[{"host": "github.com", "methods": ["*"], "inject": "gh"}],
             secrets={"gh": {"header": "Authorization", "value": "Bearer t"}},
@@ -26,13 +28,13 @@ def test_allow_lists_host_and_injects_header():
 
 
 def test_host_glob_matches_subdomains():
-    p = EgressPolicy.from_config(_cfg(rules=[{"host": "*.githubusercontent.com", "methods": ["GET"]}]))
+    p = PolicyEvaluator.from_config(_cfg(rules=[{"host": "*.githubusercontent.com", "methods": ["GET"]}]))
     assert p.evaluate("raw.githubusercontent.com", "GET").allow is True
     assert p.evaluate("raw.githubusercontent.com", "POST").allow is False  # method not allowed
 
 
 def test_default_allow_with_credentialed_intercept_passthroughs_noncred():
-    p = EgressPolicy.from_config(
+    p = PolicyEvaluator.from_config(
         _cfg(
             default="allow",
             intercept="credentialed",
@@ -68,7 +70,7 @@ def test_policy_store_missing_file_is_deny_all(tmp_path):
 def test_connect_reaches_method_restricted_host_and_intercepts():
     """CONNECT (HTTPS tunnel) must be allowed for a host-listed rule and must force interception
     so the real HTTP method can be inspected post-TLS; POST must still be denied at request phase."""
-    p = EgressPolicy.from_config(_cfg(rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    p = PolicyEvaluator.from_config(_cfg(rules=[{"host": "api.github.com", "methods": ["GET"]}]))
     connect = p.evaluate("api.github.com", "CONNECT")
     assert connect.allow is True
     assert connect.intercept is True  # method-restricted ⇒ must MITM
@@ -79,7 +81,9 @@ def test_connect_reaches_method_restricted_host_and_intercepts():
 def test_method_restricted_rule_forces_interception_in_credentialed_mode():
     """In credentialed (non-all) intercept mode a method-restricted rule still forces MITM —
     without it the TLS tunnel is opaque and the method restriction is a fail-open passthrough."""
-    p = EgressPolicy.from_config(_cfg(intercept="credentialed", rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    p = PolicyEvaluator.from_config(
+        _cfg(intercept="credentialed", rules=[{"host": "api.github.com", "methods": ["GET"]}])
+    )
     connect = p.evaluate("api.github.com", "CONNECT")
     assert connect.allow is True
     assert connect.intercept is True  # forced because method-restricted, even without inject
@@ -88,7 +92,7 @@ def test_method_restricted_rule_forces_interception_in_credentialed_mode():
 def test_wildcard_methods_rule_respects_credentialed_passthrough():
     """A wildcard-methods rule with no inject key should NOT force interception in credentialed
     mode — confirming we did not over-force interception for unrestricted hosts."""
-    p = EgressPolicy.from_config(_cfg(intercept="credentialed", rules=[{"host": "pypi.org", "methods": ["*"]}]))
+    p = PolicyEvaluator.from_config(_cfg(intercept="credentialed", rules=[{"host": "pypi.org", "methods": ["*"]}]))
     connect = p.evaluate("pypi.org", "CONNECT")
     assert connect.allow is True
     assert connect.intercept is False  # no restriction, no inject ⇒ passthrough
@@ -96,7 +100,7 @@ def test_wildcard_methods_rule_respects_credentialed_passthrough():
 
 def test_connect_to_unlisted_host_still_denied():
     """CONNECT reachability is gated by the host allowlist — unlisted hosts must still be denied."""
-    p = EgressPolicy.from_config(_cfg(rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    p = PolicyEvaluator.from_config(_cfg(rules=[{"host": "api.github.com", "methods": ["GET"]}]))
     assert p.evaluate("evil.example", "CONNECT").allow is False
 
 
@@ -107,7 +111,7 @@ def test_default_allow_still_enforces_method_limit_on_listed_host():
     to the default-allow branch — silently granting access. CONNECT stays reachability-only so the
     TLS tunnel can open; the method is enforced at the request (post-interception) phase.
     """
-    p = EgressPolicy.from_config(_cfg(default="allow", rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    p = PolicyEvaluator.from_config(_cfg(default="allow", rules=[{"host": "api.github.com", "methods": ["GET"]}]))
     # Allowed method on listed host
     assert p.evaluate("api.github.com", "GET").allow is True
     # Disallowed method on listed host — must deny despite default="allow"
@@ -121,7 +125,7 @@ def test_default_allow_still_enforces_method_limit_on_listed_host():
 def test_host_matching_is_case_insensitive_under_default_allow():
     """Hostnames are case-insensitive (DNS/RFC 4343). Untrusted sandbox code controls the requested
     host, so an uppercased host must NOT slip past a per-host method limit under default="allow"."""
-    p = EgressPolicy.from_config(_cfg(default="allow", rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    p = PolicyEvaluator.from_config(_cfg(default="allow", rules=[{"host": "api.github.com", "methods": ["GET"]}]))
     # Uppercased host still matches the rule (allowed method)
     assert p.evaluate("API.GITHUB.COM", "GET").allow is True
     # ...and the method limit is still enforced — no bypass via case
@@ -131,14 +135,14 @@ def test_host_matching_is_case_insensitive_under_default_allow():
 
 def test_host_matching_normalizes_rule_case():
     """A rule whose host is written with mixed case still matches a lowercase request host."""
-    p = EgressPolicy.from_config(_cfg(rules=[{"host": "API.GitHub.Com", "methods": ["GET"]}]))
+    p = PolicyEvaluator.from_config(_cfg(rules=[{"host": "API.GitHub.Com", "methods": ["GET"]}]))
     assert p.evaluate("api.github.com", "GET").allow is True
 
 
 def test_host_glob_is_case_insensitive():
     """Glob rules match regardless of host case (default-deny: an uppercase host must still be allowed
     by a matching wildcard, and an unlisted host still denied)."""
-    p = EgressPolicy.from_config(_cfg(rules=[{"host": "*.githubusercontent.com", "methods": ["GET"]}]))
+    p = PolicyEvaluator.from_config(_cfg(rules=[{"host": "*.githubusercontent.com", "methods": ["GET"]}]))
     assert p.evaluate("RAW.GithubUserContent.com", "GET").allow is True
 
 
@@ -177,13 +181,32 @@ def test_policy_store_reverts_to_deny_all_when_good_config_replaced_with_garbage
 
 def test_unknown_default_value_fails_closed_to_deny():
     """A typo'd `default` (e.g. "allowed") must not be treated as allow — it must fail closed."""
-    p = EgressPolicy.from_config(_cfg(default="allowed"))  # typo for "allow"
+    p = PolicyEvaluator.from_config(_cfg(default="allowed"))  # typo for "allow"
     assert p.evaluate("unlisted.example", "GET").allow is False
 
 
 def test_unknown_intercept_value_fails_closed_to_full_interception():
     """A typo'd `intercept` mode must not silently downgrade to passthrough; fail closed to full MITM."""
-    p = EgressPolicy.from_config(_cfg(default="allow", intercept="credentialled"))  # typo for "credentialed"
+    p = PolicyEvaluator.from_config(_cfg(default="allow", intercept="credentialled"))  # typo for "credentialed"
     d = p.evaluate("pypi.org", "GET")
     assert d.allow is True
     assert d.intercept is True  # coerced to "all" rather than silently passing through un-inspected
+
+
+def test_from_config_rejects_empty_methods():
+    """The sidecar parser must re-enforce the wire schema's "methods not empty" invariant independently:
+    an empty list yields a host reachable via CONNECT but blocking every request. from_config raises so
+    PolicyStore collapses the whole config to deny-all (fail closed) rather than serving the footgun."""
+    with pytest.raises(ValueError, match="methods"):
+        PolicyEvaluator.from_config(_cfg(rules=[{"host": "api.github.com", "methods": []}]))
+
+
+def test_policy_store_empty_methods_config_is_deny_all(tmp_path):
+    """A config with an empty methods list can only reach the sidecar if it bypassed wire validation
+    (hand-edited / corrupt file). It must fail closed to deny-all — including denying CONNECT, so the
+    host isn't even reachable — not leave a tunnel that 403s every request."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_cfg(default="allow", rules=[{"host": "api.github.com", "methods": []}])))
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("api.github.com", "CONNECT").allow is False
+    assert store.current().evaluate("unlisted.example", "GET").allow is False  # default-allow also gone

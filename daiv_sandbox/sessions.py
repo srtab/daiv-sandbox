@@ -37,9 +37,16 @@ TYPE_EGRESS_NETWORK = "egress_network"
 EGRESS_SESSION_LABEL = "daiv.sandbox.egress"
 
 
-def egress_token(container: Container | None) -> str | None:
-    """The egress session token from a container's labels, or None if it has no triad."""
-    return (getattr(container, "labels", None) or {}).get(EGRESS_SESSION_LABEL)
+def egress_token(resource: Container | None) -> str | None:
+    """The egress session token from a triad resource's labels, or None if it carries none.
+
+    Works for both containers (which expose ``.labels``) and Docker networks (which expose labels only
+    via ``attrs['Labels']``), so the reaper can read the token off any triad resource with one helper.
+    """
+    labels = getattr(resource, "labels", None)
+    if not isinstance(labels, dict):  # networks have no `.labels`; fall back to inspect output
+        labels = (getattr(resource, "attrs", None) or {}).get("Labels") or {}
+    return labels.get(EGRESS_SESSION_LABEL)
 
 
 # Where the shared egress CA cert is installed inside a sandbox, and the system bundle the language
@@ -1071,26 +1078,30 @@ class SandboxDockerSession:
         return {**base, **self._egress_environment()}
 
     def _egress_environment(self) -> dict[str, str]:
-        """Proxy + CA env for an egress-enabled session, or {} otherwise. Cached on the instance.
+        """Proxy + CA env for an egress-enabled session, or {} otherwise.
 
-        The proxy IP is resolved from the running sidecar (correct across warm restarts, which keep
-        the sidecar's endpoint since it is stopped, not removed). Any failure degrades to {} — the
-        sandbox then has no usable egress (fail closed) rather than a half-set proxy.
+        The proxy IP is resolved from the running sidecar (correct across warm restarts: a non-force
+        DELETE stops only the sandbox and leaves the sidecar running, so its endpoint is unchanged).
+        A *successful* resolution — and the stable "this session has no egress" case — is cached on the
+        instance. A failed resolution degrades to {} for this call (fail closed: no usable egress rather
+        than a half-set proxy) but is NOT cached, so a later command in the same request retries instead
+        of silently running egress-less once a transient Docker hiccup pinned an empty env.
         """
         if self._egress_env_cache is not None:
             return self._egress_env_cache
-        env: dict[str, str] = {}
         token = egress_token(self.container)
-        if settings.egress_enabled and token:
-            try:
-                from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
+        if not (settings.egress_enabled and token):
+            self._egress_env_cache = {}  # no egress for this session: stable, safe to cache
+            return self._egress_env_cache
+        try:
+            from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 
-                mgr = EgressProxyManager(self.client)
-                ip = mgr.proxy_internal_ip(token)
-                env = exec_proxy_env(ip, settings.EGRESS_PROXY_PORT)
-            except Exception:
-                logger.exception("egress: could not resolve proxy endpoint for session %s", self.session_id)
-                env = {}
+            mgr = EgressProxyManager(self.client)
+            ip = mgr.proxy_internal_ip(token)
+            env = exec_proxy_env(ip, settings.EGRESS_PROXY_PORT)
+        except Exception:
+            logger.exception("egress: could not resolve proxy endpoint for session %s", self.session_id)
+            return {}  # transient: do not cache, so a later command retries
         self._egress_env_cache = env
         return env
 

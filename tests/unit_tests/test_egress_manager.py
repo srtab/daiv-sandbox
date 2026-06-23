@@ -66,6 +66,24 @@ def test_start_proxy_raises_when_ca_put_archive_fails(monkeypatch):
     proxy.start.assert_not_called()
 
 
+def test_start_proxy_removes_created_container_on_failure(monkeypatch):
+    """If a step after containers.create fails (e.g. wiring the second NIC), start_proxy must remove its
+    own container before propagating — so a caller that forgot the teardown wrapper doesn't leak it."""
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_PROXY_IMAGE", "img:test")
+    monkeypatch.setattr(settings, "EGRESS_PROXY_NETWORK", "egress-net")
+    client = MagicMock()
+    proxy = client.containers.create.return_value
+    client.networks.get.return_value.connect.side_effect = APIError("connect failed")
+    mgr = EgressProxyManager(client)
+
+    with pytest.raises(APIError):
+        mgr.start_proxy("tok123", "daiv-egress-tok123", ca_pem=b"PEM")
+    proxy.remove.assert_called_once_with(force=True)
+    proxy.start.assert_not_called()
+
+
 def test_teardown_removes_proxy_and_network():
     client = MagicMock()
     proxy, net = MagicMock(), MagicMock()

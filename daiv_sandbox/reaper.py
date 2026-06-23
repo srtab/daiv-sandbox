@@ -9,7 +9,14 @@ from docker.errors import NotFound
 from daiv_sandbox.config import settings
 from daiv_sandbox.egress.manager import EgressProxyManager
 from daiv_sandbox.locks import SessionBusyError
-from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, TYPE_CMD_EXECUTOR, SandboxDockerSession, egress_token
+from daiv_sandbox.sessions import (
+    DAIV_SANDBOX_TYPE_LABEL,
+    TYPE_CMD_EXECUTOR,
+    TYPE_EGRESS_NETWORK,
+    TYPE_EGRESS_PROXY,
+    SandboxDockerSession,
+    egress_token,
+)
 
 logger = logging.getLogger("daiv_sandbox")
 
@@ -102,6 +109,58 @@ async def _reap_once(client, lock_manager, *, now, grace_seconds: int, max_stopp
         survivors.sort(key=lambda item: item[1] or now)
         for container, _finished in survivors[: len(survivors) - max_stopped]:
             await _remove_guarded(container, lock_manager)
+
+    if settings.egress_enabled:
+        await _reap_orphan_triads(client, now=now, grace_seconds=grace_seconds)
+
+
+async def _reap_orphan_triads(client, *, now, grace_seconds: int) -> None:
+    """Tear down egress triads (sidecar proxy + internal network) whose token no cmd-executor carries.
+
+    A backstop for the rare paths that drop the sandbox<->triad link without tearing the triad down
+    (a crash mid-start, or a swallowed teardown error on a force-close): the normal teardown happens in
+    close_session and ``_remove_guarded`` via the surviving cmd-executor, so an orphan only appears when
+    that container is already gone. There is no per-session lock keyed by the egress token (start_session
+    holds none), so we guard the mid-start TOCTOU by age: a triad whose newest resource is younger than
+    the grace window is left for a later sweep, since a slow start (e.g. a long image pull) may not have
+    created/labelled its cmd-executor yet. ``teardown(token)`` removes both the proxy and the network, so
+    a network-only or proxy-only remnant is reclaimed by token either way."""
+    proxies = await asyncio.to_thread(
+        client.containers.list, all=True, filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_EGRESS_PROXY}"}
+    )
+    networks = await asyncio.to_thread(
+        client.networks.list, filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_EGRESS_NETWORK}"}
+    )
+    cmd_executors = await asyncio.to_thread(
+        client.containers.list, all=True, filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}"}
+    )
+    live_tokens = {tok for tok in (egress_token(c) for c in cmd_executors) if tok}
+
+    # token -> newest creation time across its resources; an unknown creation time maps to `now` so a
+    # resource we can't age is treated as just-created (never reaped) rather than as ancient.
+    newest_created: dict[str, datetime] = {}
+    for resource in [*proxies, *networks]:
+        token = egress_token(resource)
+        if not token:
+            continue
+        created = _parse_docker_timestamp((getattr(resource, "attrs", None) or {}).get("Created", "")) or now
+        newest_created[token] = max(newest_created.get(token, created), created)
+
+    manager = None
+    for token, created in newest_created.items():
+        if token in live_tokens:
+            continue
+        if (now - created).total_seconds() < grace_seconds:
+            continue  # too new (possibly an in-flight start) — let a later sweep reclaim it if it persists
+        if manager is None:
+            manager = EgressProxyManager(client)
+        logger.info("Reaper: tearing down orphaned egress triad %s (no cmd-executor)", token)
+        try:
+            await asyncio.to_thread(manager.teardown, token)
+        except Exception:
+            # Isolate per token: a teardown fault for one orphan (e.g. a daemon error from teardown's
+            # own list calls) must not abort the sweep and starve the remaining orphans this tick.
+            logger.exception("Reaper: failed to tear down orphaned egress triad %s", token)
 
 
 async def _maybe_reap(client, redis, lock_manager, *, grace_seconds: int, max_stopped: int) -> None:

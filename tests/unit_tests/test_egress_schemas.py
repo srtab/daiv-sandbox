@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from daiv_sandbox.schemas import EgressConfigRequest, EgressPolicy, EgressRule
+from daiv_sandbox.schemas import EgressConfigRequest, EgressPolicy, EgressRule, EgressSecret
 
 
 def test_methods_uppercased_and_default_star():
@@ -37,3 +37,41 @@ def test_valid_request_with_secret_round_trips():
     # SecretStr keeps the value out of repr/logs.
     assert "Bearer t" not in repr(req)
     assert req.secrets["gh"].value.get_secret_value() == "Bearer t"
+
+
+def test_secret_header_accepts_valid_token():
+    assert EgressSecret(header="PRIVATE-TOKEN", value="x").header == "PRIVATE-TOKEN"
+
+
+def test_secret_header_rejects_empty():
+    with pytest.raises(ValidationError):
+        EgressSecret(header="", value="x")
+
+
+@pytest.mark.parametrize("header", ["X-Bad\r\nInjected: 1", "X Token", "Authorization\n", "with space"])
+def test_secret_header_rejects_non_token(header):
+    """A header *name* is an RFC 7230 token. Whitespace or CR/LF could smuggle extra headers when the
+    name is injected verbatim into the request (addon.request), so reject anything that isn't a token."""
+    with pytest.raises(ValidationError, match="valid HTTP header name"):
+        EgressSecret(header=header, value="x")
+
+
+@pytest.mark.parametrize("value", ["tok\r\nX-Evil: 1", "tok\ninjected", "line1\rline2"])
+def test_secret_value_rejects_crlf(value):
+    """The value is injected verbatim into request headers (addon.request); CR/LF could smuggle extra
+    headers. A real credential never contains control characters, so reject them at the boundary."""
+    with pytest.raises(ValidationError, match="control characters"):
+        EgressSecret(header="Authorization", value=value)
+
+
+def test_to_sidecar_config_unwraps_secrets_and_dumps_policy():
+    """to_sidecar_config() is the single authority for the wire->sidecar projection: it dumps the
+    policy and unwraps SecretStr values into the {"policy", "secrets"} shape the sidecar parser reads."""
+    req = EgressConfigRequest(
+        policy=EgressPolicy(rules=[EgressRule(host="github.com", inject="gh")]),
+        secrets={"gh": {"header": "Authorization", "value": "Bearer t"}},
+    )
+    cfg = req.to_sidecar_config()
+    assert cfg["secrets"]["gh"] == {"header": "Authorization", "value": "Bearer t"}
+    assert cfg["policy"]["rules"][0]["host"] == "github.com"
+    assert cfg["policy"]["default"] == "deny"

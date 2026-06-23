@@ -1,10 +1,11 @@
 import base64
 import io
 import uuid
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, contextmanager
 from unittest.mock import Mock, patch
 
 import pytest
+from docker.errors import APIError
 from fastapi.testclient import TestClient
 
 from daiv_sandbox import __version__
@@ -1342,9 +1343,7 @@ def test_start_session_egress_500_when_ca_file_unreadable(client, monkeypatch, t
         mock_session_class.start.assert_not_called()
 
 
-def test_start_session_egress_tears_down_on_triad_failure(monkeypatch, tmp_path):
-    """If any triad step (create_network, start_proxy, proxy_internal_ip) raises, teardown is called
-    and the request fails. This covers the fix that moved create_network inside the try."""
+def _egress_ca_settings(monkeypatch, tmp_path):
     cert = tmp_path / "ca.crt"
     cert.write_text("CERT")
     key = tmp_path / "ca.key"
@@ -1352,6 +1351,13 @@ def test_start_session_egress_tears_down_on_triad_failure(monkeypatch, tmp_path)
     monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(cert))
     monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(key))
 
+
+@contextmanager
+def _egress_start_harness(monkeypatch, tmp_path):
+    """Shared harness for egress-enabled start_session error-path tests: CA configured, server errors
+    surfaced as responses (not raised), SandboxDockerSession + EgressProxyManager patched, and the proxy
+    IP resolvable by default. Yields ``(test_client, mock_session_class, mgr)``."""
+    _egress_ca_settings(monkeypatch, tmp_path)
     with (
         patch("daiv_sandbox.main.start_reaper", return_value=None),
         TestClient(
@@ -1363,16 +1369,81 @@ def test_start_session_egress_tears_down_on_triad_failure(monkeypatch, tmp_path)
         patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class,
         patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
     ):
-        mock_session_class.start.return_value = Mock(session_id="id")
         mgr = mock_mgr_class.return_value
+        mgr.proxy_internal_ip.return_value = "10.7.0.2"
+        yield test_client, mock_session_class, mgr
+
+
+def test_start_session_egress_tears_down_on_triad_failure(monkeypatch, tmp_path):
+    """If any triad step (create_network, start_proxy, proxy_internal_ip) raises, teardown is called and
+    the request fails with 503 — a triad that failed to come up is a retryable infra fault, not a 500."""
+    with _egress_start_harness(monkeypatch, tmp_path) as (test_client, mock_session_class, mgr):
+        mock_session_class.start.return_value = Mock(session_id="id")
         # Simulate a failure in start_proxy (after create_network succeeds).
         mgr.start_proxy.side_effect = RuntimeError("proxy container failed to start")
 
         resp = test_client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
 
+        assert resp.status_code == 503, resp.text
+        mgr.teardown.assert_called_once()  # clean up whatever was partially created
+
+
+def test_start_session_egress_tears_down_when_sandbox_start_fails(monkeypatch, tmp_path):
+    """If the sandbox container start fails AFTER the triad is built (e.g. a bad base_image -> image
+    pull error), the triad (network + sidecar) must still be torn down. Nothing else reclaims it: the
+    reaper only removes a triad via its surviving cmd-executor container, which never came up here."""
+    with _egress_start_harness(monkeypatch, tmp_path) as (test_client, mock_session_class, mgr):
+        # The triad builds successfully; the sandbox start then fails (e.g. image pull error).
+        mock_session_class.start.side_effect = RuntimeError("image pull failed")
+
+        resp = test_client.post("/session/", json={"base_image": "nope:latest", "network_enabled": True})
+
         assert resp.status_code == 500, resp.text
-        # teardown must have been called to clean up whatever was partially created.
         mgr.teardown.assert_called_once()
+
+
+def test_start_session_egress_tears_down_when_session_id_missing(monkeypatch, tmp_path):
+    """A started sandbox with no session id is a failure too; the triad must not leak."""
+    with _egress_start_harness(monkeypatch, tmp_path) as (test_client, mock_session_class, mgr):
+        started = Mock(session_id=None)
+        mock_session_class.start.return_value = started
+
+        resp = test_client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
+
+        assert resp.status_code == 500, resp.text
+        mgr.teardown.assert_called_once()
+        started.remove_container.assert_not_called()  # no session id -> nothing to remove
+
+
+def test_start_session_egress_tears_down_and_removes_sandbox_when_ca_install_fails(monkeypatch, tmp_path):
+    """A sandbox that booted but failed CA install is network-attached yet does NOT trust the MITM proxy.
+    Start must remove that sandbox AND tear the triad down, returning 500 — never leave it running."""
+    with _egress_start_harness(monkeypatch, tmp_path) as (test_client, mock_session_class, mgr):
+        cmd = Mock(session_id="sbx-id")
+        cmd.install_ca_cert.side_effect = RuntimeError("update-ca-certificates failed")
+        mock_session_class.start.return_value = cmd
+
+        resp = test_client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
+
+        assert resp.status_code == 500, resp.text
+        assert "CA" in resp.json()["detail"]
+        cmd.remove_container.assert_called_once()
+        mgr.teardown.assert_called_once()
+
+
+def test_start_session_egress_tears_down_even_if_remove_container_faults(monkeypatch, tmp_path):
+    """If cleanup's remove_container itself faults (it only swallows NotFound), the triad teardown must
+    still run — otherwise the network + sidecar leak with nothing to reclaim them promptly."""
+    with _egress_start_harness(monkeypatch, tmp_path) as (test_client, mock_session_class, mgr):
+        cmd = Mock(session_id="sbx-id")
+        cmd.install_ca_cert.side_effect = RuntimeError("update-ca-certificates failed")
+        cmd.remove_container.side_effect = APIError("daemon busy")  # cleanup itself faults
+        mock_session_class.start.return_value = cmd
+
+        resp = test_client.post("/session/", json={"base_image": "python:3.12", "network_enabled": True})
+
+        assert resp.status_code == 500, resp.text
+        mgr.teardown.assert_called_once()  # teardown ran despite remove_container raising
 
 
 def test_fs_glob_forwards_default_plus_request_excludes(mock_session, client, monkeypatch):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Literal
 
@@ -217,15 +218,42 @@ class EgressRule(BaseModel):
         return [m.upper() for m in value]
 
 
+# RFC 7230 token: the grammar for a header field-name. Used with fullmatch so the whole value must be
+# a token — rejects empty/whitespace names and CR/LF (note `$` would match before a trailing newline,
+# so fullmatch, not `$`), which would otherwise be injected verbatim into the request headers by the
+# sidecar addon and could smuggle additional headers.
+_HEADER_NAME_RE = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
+
+
 class EgressSecret(BaseModel):
     header: str = Field(description="Header name to set (e.g. 'Authorization', 'PRIVATE-TOKEN').")
     value: SecretStr = Field(description="Header value; redacted in logs/repr.")
+
+    @field_validator("header", mode="after")
+    @classmethod
+    def _valid_header(cls, value: str) -> str:
+        if not _HEADER_NAME_RE.fullmatch(value):
+            raise ValueError(f"{value!r} is not a valid HTTP header name (RFC 7230 token)")
+        return value
+
+    @field_validator("value", mode="after")
+    @classmethod
+    def _no_control_chars(cls, value: SecretStr) -> SecretStr:
+        # The value is injected verbatim into request headers by the sidecar addon; CR/LF would let an
+        # operator smuggle extra headers. A real credential never contains control characters.
+        if any(c in value.get_secret_value() for c in ("\r", "\n", "\x00")):
+            raise ValueError("header value must not contain control characters (CR, LF, NUL)")
+        return value
 
 
 class EgressPolicy(BaseModel):
     default: Literal["deny", "allow"] = Field(default="deny", description="Reachability for unlisted hosts.")
     intercept: Literal["all", "credentialed"] = Field(
-        default="all", description="'all' MITMs every reachable host; 'credentialed' MITMs only inject hosts."
+        default="all",
+        description=(
+            "'all' MITMs every reachable host; 'credentialed' MITMs only hosts that inject a credential "
+            "or carry a per-host methods restriction (others are tunnelled untouched)."
+        ),
     )
     rules: list[EgressRule] = Field(default_factory=list)
 
@@ -240,6 +268,17 @@ class EgressConfigRequest(BaseModel):
             if rule.inject is not None and rule.inject not in self.secrets:
                 raise ValueError(f"rule for host {rule.host!r} references unknown secret {rule.inject!r}")
         return self
+
+    def to_sidecar_config(self) -> dict:
+        """Project the validated request into the ``{"policy": ..., "secrets": ...}`` dict the sidecar
+        parser (PolicyEvaluator.from_config) reads. Single authority for the wire->sidecar shape and
+        the only place SecretStr values are deliberately unwrapped — keep this in sync with from_config."""
+        return {
+            "policy": self.policy.model_dump(),
+            "secrets": {
+                name: {"header": s.header, "value": s.value.get_secret_value()} for name, s in self.secrets.items()
+            },
+        }
 
 
 class EgressConfigResponse(BaseModel):

@@ -48,15 +48,15 @@ class Settings(BaseSettings):
     # internet only through the sidecar. A network_enabled request without the CA is rejected (400).
     # See the "Network Egress Proxy" section of the README.
     EGRESS_PROXY_IMAGE: str = "ghcr.io/srtab/daiv-sandbox-egress:latest"
-    EGRESS_PROXY_PORT: int = 8080
+    EGRESS_PROXY_PORT: int = Field(default=8080, gt=0)
     # The sidecar runs trusted code (not untrusted), so it stays on runc even when sandboxes use runsc;
     # runc also avoids gVisor's embedded-DNS quirks for the proxy's own upstream resolution.
     EGRESS_PROXY_RUNTIME: Literal["runc", "runsc"] = "runc"
     # Egress-side network the sidecar's second NIC joins for upstream. None -> fall back to NETWORK,
     # then Docker's default bridge.
     EGRESS_PROXY_NETWORK: str | None = None
-    EGRESS_PROXY_MEMORY_BYTES: int | None = None
-    EGRESS_PROXY_CPUS: float | None = None
+    EGRESS_PROXY_MEMORY_BYTES: int | None = Field(default=None, gt=0)
+    EGRESS_PROXY_CPUS: float | None = Field(default=None, gt=0)
     # Shared CA used for MITM: cert is installed into every sandbox; key is given to sidecars only.
     # Paths are read at use time (typically files under /run/secrets).
     EGRESS_CA_CERT_FILE: str | None = None

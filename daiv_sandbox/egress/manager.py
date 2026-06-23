@@ -86,21 +86,33 @@ class EgressProxyManager:
             create_kwargs["nano_cpus"] = int(settings.EGRESS_PROXY_CPUS * 1e9)
 
         proxy = self.client.containers.create(**create_kwargs)
-        # Second NIC for upstream egress.
-        self.client.networks.get(_egress_network_name()).connect(proxy)
-        # Inject the combined CA PEM into the confdir before the process starts (created, not running,
-        # so this lands in the writable layer mitmdump reads at boot). The proxy runs as RUN_UID, so the
-        # member is owned by that user — otherwise a root-owned file would be unreadable to mitmdump.
-        parent, _, filename = CA_PATH.rpartition("/")
-        with _build_single_file_tar_stream(
-            filename, ca_pem, mode=0o600, uid=settings.RUN_UID, gid=settings.RUN_GID
-        ) as tar:
-            # put_archive returns False (it does not always raise) when the daemon rejects the copy.
-            # Fail closed: a proxy booted without the configured CA would silently fall back to its own
-            # self-generated CA, which the sandbox does not trust.
-            if not proxy.put_archive(parent, tar):
-                raise RuntimeError(f"egress: failed to inject CA into sidecar confdir for {token}")
-        proxy.start()
+        # Self-cleaning: any failure between create and a successful start must remove the just-created
+        # container, so this never leaks even when a caller forgot to wrap it in teardown (the caller's
+        # teardown then becomes belt-and-suspenders rather than the only safety net).
+        try:
+            # Second NIC for upstream egress.
+            self.client.networks.get(_egress_network_name()).connect(proxy)
+            # Inject the combined CA PEM into the confdir before the process starts (created, not running,
+            # so this lands in the writable layer mitmdump reads at boot). The proxy runs as RUN_UID, so the
+            # member is owned by that user — otherwise a root-owned file would be unreadable to mitmdump.
+            parent, _, filename = CA_PATH.rpartition("/")
+            with _build_single_file_tar_stream(
+                filename, ca_pem, mode=0o600, uid=settings.RUN_UID, gid=settings.RUN_GID
+            ) as tar:
+                # put_archive returns False (it does not always raise) when the daemon rejects the copy.
+                # Fail closed: a proxy booted without the configured CA would silently fall back to its own
+                # self-generated CA, which the sandbox does not trust.
+                if not proxy.put_archive(parent, tar):
+                    raise RuntimeError(f"egress: failed to inject CA into sidecar confdir for {token}")
+            proxy.start()
+        except Exception:
+            try:
+                proxy.remove(force=True)
+            except NotFound:
+                pass
+            except Exception:
+                logger.exception("egress: failed to clean up partially-created proxy for token %s", token)
+            raise
         logger.info("egress: started proxy %s for token %s", proxy.short_id, token)
         return proxy
 

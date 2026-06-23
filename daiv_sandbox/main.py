@@ -267,26 +267,58 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
                 **(request.environment or {}),
                 **exec_proxy_env(proxy_ip, settings.EGRESS_PROXY_PORT),
             }
-        except Exception:
+        except Exception as exc:
+            # A triad that failed to come up (network/sidecar create, or the proxy never getting an IP
+            # on its internal NIC) is a retryable infrastructure fault, not a 500. Tear down whatever was
+            # partially created and surface 503, consistent with the SessionUnavailableError contract.
+            # Log first: HTTPException is a handled response, so the root cause (a bad EGRESS_PROXY_IMAGE,
+            # a Docker APIError) would otherwise reach neither the logs nor Sentry.
+            logger.exception("Egress proxy: triad failed to start for token %s", token)
             await asyncio.to_thread(manager.teardown, token)
-            raise
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Egress proxy failed to start"
+            ) from exc
 
     if request.environment and not use_egress:
         cmd_executor_kwargs["environment"] = request.environment
 
-    cmd_executor = await asyncio.to_thread(
-        SandboxDockerSession.start, image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
-    )
-    if cmd_executor.session_id is None:
-        raise RuntimeError("Started session is missing a session ID")
+    if not use_egress:
+        cmd_executor = await asyncio.to_thread(
+            SandboxDockerSession.start, image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
+        )
+        if cmd_executor.session_id is None:
+            raise RuntimeError("Started session is missing a session ID")
+        return StartSessionResponse(session_id=cmd_executor.session_id)
 
-    if use_egress:
+    # The triad (internal network + sidecar) already exists. Every step from here on — starting the
+    # sandbox, validating it, installing the CA — must tear the triad down on failure: nothing else
+    # reclaims it, since the reaper only removes a triad via its surviving cmd-executor container.
+    cmd_executor = None
+    try:
+        cmd_executor = await asyncio.to_thread(
+            SandboxDockerSession.start, image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
+        )
+        if cmd_executor.session_id is None:
+            raise RuntimeError("Started session is missing a session ID")
         try:
             await asyncio.to_thread(cmd_executor.install_ca_cert, ca_cert)
-        except Exception:
-            await asyncio.to_thread(cmd_executor.remove_container)
-            await asyncio.to_thread(manager.teardown, token)
-            raise HTTPException(status_code=500, detail="Egress proxy: failed to install CA into the sandbox") from None
+        except Exception as exc:
+            # Log + preserve the cause (the failing CA step and its output): HTTPException won't reach
+            # Sentry, and `from None` would discard the RuntimeError install_ca_cert raised.
+            logger.exception("Egress proxy: failed to install CA into sandbox %s", cmd_executor.session_id)
+            raise HTTPException(status_code=500, detail="Egress proxy: failed to install CA into the sandbox") from exc
+    except Exception:
+        # Remove the sandbox if it was created (SandboxDockerSession.start cleans up its own container
+        # when it raises, so cmd_executor may be None / id-less), then tear down the triad. remove_container
+        # only swallows NotFound, so guard its APIError here — a removal fault must NOT skip the triad
+        # teardown and leak the network + sidecar; the original error is still re-raised below.
+        if cmd_executor is not None and cmd_executor.session_id is not None:
+            try:
+                await asyncio.to_thread(cmd_executor.remove_container)
+            except Exception:
+                logger.exception("Egress proxy: failed to remove sandbox %s during cleanup", cmd_executor.session_id)
+        await asyncio.to_thread(manager.teardown, token)
+        raise
 
     return StartSessionResponse(session_id=cmd_executor.session_id)
 
@@ -416,14 +448,9 @@ async def configure_egress(
         token = egress_token(cmd.container)
         if not token:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session has no egress proxy")
-        config = {
-            "policy": request.policy.model_dump(),
-            "secrets": {
-                name: {"header": s.header, "value": s.value.get_secret_value()} for name, s in request.secrets.items()
-            },
-        }
         manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
-        await asyncio.to_thread(manager.provision, token, json.dumps(config).encode("utf-8"))
+        config_bytes = json.dumps(request.to_sidecar_config()).encode("utf-8")
+        await asyncio.to_thread(manager.provision, token, config_bytes)
         return EgressConfigResponse()
 
 

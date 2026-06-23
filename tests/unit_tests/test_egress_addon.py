@@ -94,3 +94,71 @@ def test_addon_denies_when_config_is_malformed(tmp_path):
     flow = _flow(host="github.com", method="GET")
     a.http_connect(flow)
     assert flow.response == "FORBIDDEN"
+
+
+def _raise(*_a, **_k):
+    raise RuntimeError("boom")
+
+
+def test_http_connect_fails_closed_when_evaluation_raises(tmp_path, monkeypatch):
+    """mitmproxy FAILS OPEN on an unhandled hook exception. If policy evaluation ever raises (a future
+    bug), http_connect must still deny the CONNECT rather than let the tunnel open un-checked."""
+    a = EgressAddon(_write_cfg(tmp_path, default="allow", rules=[{"host": "github.com"}]))
+    monkeypatch.setattr(a._store, "current", _raise)
+    flow = _flow(host="github.com")
+    a.http_connect(flow)
+    assert flow.response == "FORBIDDEN"
+
+
+def test_request_fails_closed_when_evaluation_raises(tmp_path, monkeypatch):
+    """A raise in request() must deny AND never reach the credential-injection branch — not fall open."""
+    a = EgressAddon(
+        _write_cfg(
+            tmp_path,
+            default="allow",
+            rules=[{"host": "github.com", "inject": "gh"}],
+            secrets={"gh": {"header": "Authorization", "value": "Bearer t"}},
+        )
+    )
+    monkeypatch.setattr(a._store, "current", _raise)
+    flow = _flow(host="github.com")
+    a.request(flow)
+    assert flow.response == "FORBIDDEN"
+    assert "Authorization" not in flow.request.headers  # credential never injected on the error path
+
+
+def test_tls_clienthello_fails_closed_when_evaluation_raises(tmp_path, monkeypatch):
+    """An unexpected error while evaluating the SNI must force interception (ignore_connection stays
+    False), never a silent passthrough — mitmproxy fails OPEN on an unhandled hook exception. This
+    covers the except branch, distinct from the `client_hello is None` early return below."""
+    a = EgressAddon(_write_cfg(tmp_path, default="allow", intercept="credentialed", rules=[{"host": "pypi.org"}]))
+    monkeypatch.setattr(a._store, "current", _raise)
+    data = types.SimpleNamespace(client_hello=types.SimpleNamespace(sni="pypi.org"), ignore_connection=False)
+    a.tls_clienthello(data)
+    assert data.ignore_connection is False  # forced interception, not passthrough
+
+
+def test_tls_clienthello_intercepts_when_clienthello_is_none(tmp_path):
+    """A tls_clienthello event can arrive with client_hello=None (the ClientHello failed to parse).
+    Accessing `.sni` would AttributeError -> mitmproxy fails open (passthrough). Must force MITM instead."""
+    a = EgressAddon(_write_cfg(tmp_path, default="allow", intercept="credentialed", rules=[{"host": "pypi.org"}]))
+    data = types.SimpleNamespace(client_hello=None, ignore_connection=False)
+    a.tls_clienthello(data)
+    assert data.ignore_connection is False  # not tunnelled untouched -> intercepted (safe direction)
+
+
+def test_tls_clienthello_intercepts_method_restricted_host(tmp_path):
+    """A method-restricted host must be intercepted (not passed through) so the method limit is enforced
+    post-TLS. The existing passthrough test only covers the allow-and-not-intercept branch."""
+    a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    data = types.SimpleNamespace(client_hello=types.SimpleNamespace(sni="api.github.com"), ignore_connection=False)
+    a.tls_clienthello(data)
+    assert data.ignore_connection is False  # intercepted, not tunnelled
+
+
+def test_tls_clienthello_does_not_passthrough_denied_host(tmp_path):
+    """A denied host must never be tunnelled untouched (ignore_connection stays False so MITM applies)."""
+    a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "github.com"}]))
+    data = types.SimpleNamespace(client_hello=types.SimpleNamespace(sni="evil.example"), ignore_connection=False)
+    a.tls_clienthello(data)
+    assert data.ignore_connection is False

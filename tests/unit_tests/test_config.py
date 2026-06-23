@@ -101,3 +101,11 @@ def test_egress_defaults():
 
 def test_egress_proxy_image_default():
     assert settings.EGRESS_PROXY_IMAGE.endswith("daiv-sandbox-egress:latest")
+
+
+@pytest.mark.parametrize("field", ["EGRESS_PROXY_PORT", "EGRESS_PROXY_CPUS", "EGRESS_PROXY_MEMORY_BYTES"])
+def test_egress_proxy_numeric_settings_reject_nonpositive(field):
+    """Port / CPU / memory must be positive — a zero or negative value can never build a working
+    sidecar, so reject it at boot (matching the gt=0 discipline on the reaper/timeout settings)."""
+    with pytest.raises(ValidationError):
+        Settings(**{field: 0})
