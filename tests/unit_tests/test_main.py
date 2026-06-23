@@ -498,9 +498,8 @@ def test_close_session_does_not_warm_stopped_container(client):
         mock_cmd_executor.stop_container.assert_called_once()
 
 
-def test_force_close_tears_down_triad(client, monkeypatch):
+def test_force_close_tears_down_triad(client):
     """Force-closing an egress session tears down the proxy triad after removing the container."""
-    monkeypatch.setattr(settings, "EGRESS_PROXY_ENABLED", True)
     with (
         patch("daiv_sandbox.main.SandboxDockerSession") as cls,
         patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
