@@ -106,7 +106,7 @@ class Settings(BaseSettings):
     @field_validator("FS_PRUNE_DIRS", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:
-        """Accept comma-separated env strings (e.g. "1.1.1.1,8.8.8.8") for list settings."""
+        """Accept comma-separated env strings (e.g. ".git,node_modules,__pycache__") for list settings."""
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value

@@ -254,7 +254,7 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
             # real cause reaches Sentry/logs and keep the client message path-free.
             logger.error("Egress proxy: cannot read EGRESS CA files: %s", exc)
             raise HTTPException(
-                status_code=500, detail="Egress proxy enabled but EGRESS CA files could not be read"
+                status_code=500, detail="Egress proxy configured but EGRESS CA files could not be read"
             ) from exc
         manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
         try:
