@@ -230,6 +230,13 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     if request.cpus:
         cmd_executor_kwargs["cpus"] = request.cpus
 
+    # Caller-supplied environment is ALWAYS applied to the sandbox, egress or not. When egress is
+    # enabled the proxy/CA vars are layered on top (below) and win on collision — so a caller can't
+    # redirect the proxy — but the caller's own variables are never dropped: egress augments the
+    # environment, it does not replace it.
+    if request.environment:
+        cmd_executor_kwargs["environment"] = dict(request.environment)
+
     use_egress = request.network_enabled
 
     if not request.network_enabled:
@@ -263,8 +270,10 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
             proxy_ip = await asyncio.to_thread(manager.proxy_internal_ip, token)
             cmd_executor_labels[EGRESS_SESSION_LABEL] = token
             cmd_executor_kwargs["network"] = network_name
+            # Layer the proxy/CA env on top of the caller's environment (set above). These keys win on
+            # collision so the sandbox always routes through the proxy and trusts its CA.
             cmd_executor_kwargs["environment"] = {
-                **(request.environment or {}),
+                **cmd_executor_kwargs.get("environment", {}),
                 **exec_proxy_env(proxy_ip, settings.EGRESS_PROXY_PORT),
             }
         except Exception as exc:
@@ -278,9 +287,6 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Egress proxy failed to start"
             ) from exc
-
-    if request.environment and not use_egress:
-        cmd_executor_kwargs["environment"] = request.environment
 
     if not use_egress:
         cmd_executor = await asyncio.to_thread(

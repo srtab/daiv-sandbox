@@ -1321,6 +1321,40 @@ def test_start_session_builds_triad_when_egress_enabled(client, monkeypatch, tmp
         cmd.install_ca_cert.assert_called_once()
 
 
+def test_start_session_egress_keeps_caller_environment(client, monkeypatch, tmp_path):
+    """Caller-supplied environment must survive an egress-enabled start: the proxy/CA vars are layered
+    on top (and win on collision), but the caller's own variables are never dropped. Egress augments the
+    environment, it does not replace it."""
+    cert = tmp_path / "ca.crt"
+    cert.write_text("CERT")
+    key = tmp_path / "ca.key"
+    key.write_text("KEY")
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(cert))
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(key))
+
+    with (
+        patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
+        mock_session_class.start.return_value = Mock(session_id="sbx-id")
+        mock_mgr_class.return_value.proxy_internal_ip.return_value = "10.7.0.2"
+
+        resp = client.post(
+            "/session/",
+            json={
+                "base_image": "python:3.12",
+                "network_enabled": True,
+                # Includes a benign var (kept) and a proxy var (must be overridden by the real proxy).
+                "environment": {"FOO": "bar", "HTTPS_PROXY": "http://caller-would-bypass"},
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        env = mock_session_class.start.call_args.kwargs["environment"]
+        assert env["FOO"] == "bar"  # caller var preserved alongside egress
+        assert env["HTTPS_PROXY"] == "http://10.7.0.2:8080"  # proxy wins on collision
+
+
 def test_start_session_egress_500_when_ca_file_unreadable(client, monkeypatch, tmp_path):
     """If the configured CA files exist as settings but cannot be read (e.g. missing on disk), the
     endpoint returns 500 with a distinct 'could not be read' message (NOT 'not configured', which would
