@@ -123,13 +123,13 @@ The response will be a JSON object with the following structure containing the s
 
 The following table describes the parameters for the `session/` endpoint:
 
-| Parameter         | Description                                      | Required | Valid Values                         |
-| ----------------- | ------------------------------------------------ | -------- | ------------------------------------ |
-| `base_image`      | The base image to use for the container.         | Yes      | Any valid Docker image               |
-| `network_enabled` | Enable network access inside the container.      | No       | `true` or `false` (default: `false`) |
-| `environment`     | Environment variables to set at container start. | No       | Object of string pairs               |
-| `memory_bytes`    | Memory limit for the container (bytes).          | No       | Integer (bytes)                      |
-| `cpus`            | CPU quota for the container.                     | No       | Float (e.g. `0.5`, `1.0`)            |
+| Parameter      | Description                                                                                                                                                              | Required | Valid Values                                                             |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------- | ------------------------------------------------------------------------ |
+| `base_image`   | The base image to use for the container.                                                                                                                                 | Yes      | Any valid Docker image                                                   |
+| `egress`       | Egress policy block. When present, the session is routed through the per-session egress proxy with the given policy; omit for an isolated sandbox (`network_mode=none`). | No       | Egress policy object (see [Network Egress Proxy](#network-egress-proxy)) |
+| `environment`  | Environment variables to set at container start.                                                                                                                         | No       | Object of string pairs                                                   |
+| `memory_bytes` | Memory limit for the container (bytes).                                                                                                                                  | No       | Integer (bytes)                                                          |
+| `cpus`         | CPU quota for the container.                                                                                                                                             | No       | Float (e.g. `0.5`, `1.0`)                                                |
 
 > [!NOTE]
 > For security reasons, building images from arbitrary Dockerfiles is not supported by this service. Provide a `base_image`.
@@ -345,7 +345,7 @@ The response will be an empty body with a status code of 204.
 
 ### Network Egress Proxy
 
-Network-enabled sessions are built as a **triad**. Egress is enabled by configuring the shared CA (`DAIV_SANDBOX_EGRESS_CA_CERT_FILE` + `DAIV_SANDBOX_EGRESS_CA_KEY_FILE`); without it, a `network_enabled=true` request is rejected with `400`. There is no direct-network attach that bypasses the proxy.
+Sessions that carry an `egress` block on `POST /session/` are built as a **triad**. Egress is enabled by configuring the shared CA (`DAIV_SANDBOX_EGRESS_CA_CERT_FILE` + `DAIV_SANDBOX_EGRESS_CA_KEY_FILE`); without it, a `POST /session/` carrying an `egress` block is rejected with `400`. There is no direct-network attach that bypasses the proxy.
 
 1. An `internal` Docker network with no gateway (the sandbox can only talk to the sidecar).
 2. A `mitmproxy` sidecar dual-homed on the internal network and an egress-side network — it is the sole gateway to the internet.
@@ -353,29 +353,32 @@ Network-enabled sessions are built as a **triad**. Egress is enabled by configur
 
 Credentials (API tokens, bearer headers) live in the sidecar and **never enter the sandbox container**.
 
-#### Configuring egress per session
+#### Configuring egress at session create time
 
-After creating a session, call `POST /session/{session_id}/egress/` with a JSON body of the form:
+Pass an `egress` block in the `POST /session/` body to provision a network-enabled session. Example:
 
 ```json
 {
-  "policy": {
-    "default": "deny",
-    "intercept": "credentialed",
-    "rules": [
-      {
-        "host": "*.github.com",
-        "methods": ["GET", "POST"],
-        "inject": "github-token"
-      },
-      {
-        "host": "pypi.org",
-        "methods": ["*"]
-      }
-    ]
-  },
-  "secrets": {
-    "github-token": { "header": "Authorization", "value": "Bearer ghp_…" }
+  "base_image": "python:3.12",
+  "egress": {
+    "policy": {
+      "default": "deny",
+      "intercept": "credentialed",
+      "rules": [
+        {
+          "host": "*.github.com",
+          "methods": ["GET", "POST"],
+          "inject": "github-token"
+        },
+        {
+          "host": "pypi.org",
+          "methods": ["*"]
+        }
+      ]
+    },
+    "secrets": {
+      "github-token": { "header": "Authorization", "value": "Bearer ghp_…" }
+    }
   }
 }
 ```
@@ -387,8 +390,6 @@ After creating a session, call `POST /session/{session_id}/egress/` with a JSON 
 
 > [!NOTE]
 > A rule with `methods` set to anything other than `["*"]` causes that host to be intercepted (MITM'd) regardless of the `intercept` mode, so the method can be enforced after TLS termination. Such hosts require the shared CA, which is installed into every egress sandbox automatically.
-
-This endpoint returns `404` when egress is not configured (no shared CA) and is idempotent — re-calling it replaces the sidecar's policy.
 
 #### CA generation (operator one-time step)
 
