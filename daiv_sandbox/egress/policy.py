@@ -12,8 +12,31 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from typing import Final, Literal
 
 logger = logging.getLogger("daiv_sandbox.egress")
+
+# Stable, greppable block-reason codes carried on a deny Decision (see BlockReason). `Final` makes mypy
+# infer their literal type so they satisfy BlockReason.code's Literal[...] at the construction sites.
+REASON_HOST_NOT_LISTED: Final = "host-not-listed"
+REASON_METHOD_NOT_ALLOWED: Final = "method-not-allowed"
+
+
+@dataclass(frozen=True)
+class BlockReason:
+    """Why a request was denied, plus the data needed to transpose the block into a rule.
+
+    ``method-not-allowed``: the request matched a rule's host but not its methods, so ``host``/``methods``
+    echo that rule's host glob and the methods it currently permits — what an operator would extend.
+    ``host-not-listed``: no rule host matched at all (the deny came from ``default=deny``), so there is no
+    rule to point at and both are None.
+    """
+
+    # The two literals are the REASON_* constants above; kept as literals here because Literal[] cannot
+    # reference the names. mypy then checks both construction sites and narrows the code at the consumer.
+    code: Literal["host-not-listed", "method-not-allowed"]
+    host: str | None = None
+    methods: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -21,6 +44,7 @@ class Decision:
     allow: bool
     intercept: bool
     inject: tuple[str, str] | None  # (header_name, header_value) or None
+    block: BlockReason | None = None  # why it was denied; None when allowed
 
 
 @dataclass(frozen=True)
@@ -71,30 +95,31 @@ class PolicyEvaluator:
             intercept = "all"
         return cls(default, intercept, rules, secrets)
 
-    def _match(self, host: str, method: str) -> tuple[_Rule | None, bool]:
-        """Return (rule allowing host+method, whether any rule's host matched at all).
+    def _match(self, host: str, method: str) -> tuple[_Rule | None, _Rule | None]:
+        """Return (rule allowing host+method, first rule whose host matched at all).
 
         `host` is already lower-cased and `method` already upper-cased by evaluate(); rule hosts are
         lower-cased in from_config, so fnmatchcase (which skips the redundant os.path.normcase that
-        fnmatch.fnmatch does on both args) is the case-insensitive match. The host_listed flag lets
-        evaluate() distinguish 'host not listed' from 'host listed but this method isn't permitted'
-        in a single pass over the rules.
+        fnmatch.fnmatch does on both args) is the case-insensitive match. The second element lets
+        evaluate() distinguish 'host not listed' from 'host listed but this method isn't permitted' in a
+        single pass over the rules — and, in the latter case, report which rule's host+methods matched.
         """
-        host_listed = False
+        host_match: _Rule | None = None
         for rule in self._rules:
             if fnmatch.fnmatchcase(host, rule.host):
-                host_listed = True
+                if host_match is None:
+                    host_match = rule  # first host glob that matched — the rule to cite on a method deny
                 # CONNECT is a host-reachability check: the TLS tunnel hasn't been established yet, so
                 # the real HTTP method is unknown. Match any host-listed rule; the specific method
                 # restriction is enforced later at the request (post-interception) phase.
                 if method == "CONNECT" or "*" in rule.methods or method in rule.methods:
-                    return rule, True
-        return None, host_listed
+                    return rule, host_match
+        return None, host_match
 
     def evaluate(self, host: str, method: str) -> Decision:
         host = host.lower()  # case-insensitive host matching; rule hosts are lower-cased in from_config
         method = method.upper()
-        rule, host_listed = self._match(host, method)
+        rule, host_match = self._match(host, method)
         if rule is not None:
             inject = self._secrets.get(rule.inject) if rule.inject else None
             method_restricted = "*" not in rule.methods
@@ -105,11 +130,12 @@ class PolicyEvaluator:
         # (otherwise a per-host method limit would silently no-op under default="allow"). CONNECT
         # stays a reachability-only check, so the TLS tunnel still opens and the method is enforced
         # at the request phase.
-        if method != "CONNECT" and host_listed:
-            return Decision(allow=False, intercept=False, inject=None)
+        if method != "CONNECT" and host_match is not None:
+            block = BlockReason(REASON_METHOD_NOT_ALLOWED, host=host_match.host, methods=host_match.methods)
+            return Decision(allow=False, intercept=False, inject=None, block=block)
         if self._default == "allow":
             return Decision(allow=True, intercept=self._intercept == "all", inject=None)
-        return Decision(allow=False, intercept=False, inject=None)
+        return Decision(allow=False, intercept=False, inject=None, block=BlockReason(REASON_HOST_NOT_LISTED))
 
 
 _DENY_ALL = PolicyEvaluator("deny", "all", [], {})

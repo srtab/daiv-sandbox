@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from daiv_sandbox.egress.policy import PolicyEvaluator, PolicyStore
+from daiv_sandbox.egress.policy import REASON_HOST_NOT_LISTED, REASON_METHOD_NOT_ALLOWED, PolicyEvaluator, PolicyStore
 
 
 def _cfg(default="deny", intercept="all", rules=None, secrets=None):
@@ -199,6 +199,66 @@ def test_from_config_rejects_empty_methods():
     PolicyStore collapses the whole config to deny-all (fail closed) rather than serving the footgun."""
     with pytest.raises(ValueError, match="methods"):
         PolicyEvaluator.from_config(_cfg(rules=[{"host": "api.github.com", "methods": []}]))
+
+
+def test_allowed_decision_carries_no_block_reason():
+    """An allowed request has nothing to transpose into a rule — block must be None."""
+    p = PolicyEvaluator.from_config(_cfg(rules=[{"host": "github.com", "methods": ["*"]}]))
+    assert p.evaluate("github.com", "GET").block is None
+
+
+def test_unlisted_host_block_reason_is_host_not_listed():
+    """A host that matches no rule (caught by default=deny) reports host-not-listed with no rule detail."""
+    p = PolicyEvaluator.from_config(_cfg())
+    block = p.evaluate("evil.example", "GET").block
+    assert block is not None
+    assert block.code == REASON_HOST_NOT_LISTED
+    assert block.host is None and block.methods is None
+
+
+def test_connect_to_unlisted_host_block_reason_is_host_not_listed():
+    """A blocked CONNECT to an unlisted host reports host-not-listed. (A CONNECT can never be
+    method-not-allowed: evaluate() guards that branch with `method != "CONNECT"`, so once a host is listed
+    CONNECT is reachability-only — that invariant lives in evaluate(), not this test.)"""
+    p = PolicyEvaluator.from_config(_cfg(rules=[{"host": "api.github.com", "methods": ["GET"]}]))
+    block = p.evaluate("evil.example", "CONNECT").block
+    assert block is not None and block.code == REASON_HOST_NOT_LISTED
+
+
+def test_method_mismatch_block_reason_carries_matched_rule():
+    """A method blocked on a listed host reports method-not-allowed AND the matched rule's host glob
+    and currently-allowed methods, so an operator can see whether to extend that rule."""
+    p = PolicyEvaluator.from_config(_cfg(rules=[{"host": "api.github.com", "methods": ["GET", "POST"]}]))
+    block = p.evaluate("api.github.com", "DELETE").block
+    assert block is not None
+    assert block.code == REASON_METHOD_NOT_ALLOWED
+    assert block.host == "api.github.com"
+    assert block.methods == ("GET", "POST")
+
+
+def test_method_mismatch_block_reason_reports_glob_host():
+    """The matched-rule detail echoes the rule's glob host (not the concrete requested host), since that
+    is the value an operator would edit in the policy."""
+    p = PolicyEvaluator.from_config(_cfg(rules=[{"host": "*.githubusercontent.com", "methods": ["GET"]}]))
+    block = p.evaluate("raw.githubusercontent.com", "POST").block
+    assert block is not None
+    assert block.code == REASON_METHOD_NOT_ALLOWED
+    assert block.host == "*.githubusercontent.com"
+    assert block.methods == ("GET",)
+
+
+def test_method_mismatch_reports_first_matching_rule_when_multiple_match():
+    """When several rules match the same host and none permits the method, the block cites the FIRST
+    host-matching rule's glob + methods (deterministic first-match in _match). Pins that operator-facing
+    choice so a future _match refactor can't silently change which rule operators are told to edit."""
+    p = PolicyEvaluator.from_config(
+        _cfg(rules=[{"host": "*.github.com", "methods": ["GET"]}, {"host": "api.github.com", "methods": ["POST"]}])
+    )
+    block = p.evaluate("api.github.com", "DELETE").block
+    assert block is not None
+    assert block.code == REASON_METHOD_NOT_ALLOWED
+    assert block.host == "*.github.com"  # the first matching rule, not the more specific second
+    assert block.methods == ("GET",)
 
 
 def test_policy_store_empty_methods_config_is_deny_all(tmp_path):

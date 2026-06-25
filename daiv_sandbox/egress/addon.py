@@ -12,10 +12,10 @@ import os
 
 try:  # works both as `daiv_sandbox.egress.policy` (tests) and flat `policy` (sidecar image, see Dockerfile)
     from daiv_sandbox.egress.constants import CONFIG_PATH, CONFIG_PATH_ENV
-    from daiv_sandbox.egress.policy import PolicyStore
+    from daiv_sandbox.egress.policy import REASON_HOST_NOT_LISTED, REASON_METHOD_NOT_ALLOWED, PolicyStore
 except ImportError:  # pragma: no cover - exercised only inside the sidecar image
     from constants import CONFIG_PATH, CONFIG_PATH_ENV  # type: ignore[no-redef]
-    from policy import PolicyStore  # type: ignore[no-redef]
+    from policy import REASON_HOST_NOT_LISTED, REASON_METHOD_NOT_ALLOWED, PolicyStore  # type: ignore[no-redef]
 
 logger = logging.getLogger("daiv_sandbox.egress")
 
@@ -24,6 +24,31 @@ def _forbidden(flow) -> None:  # pragma: no cover - thin mitmproxy glue, stubbed
     from mitmproxy.http import Response
 
     flow.response = Response.make(403, b"egress: destination not allowed\n", {"Content-Type": "text/plain"})
+
+
+def _describe_block(block) -> str:
+    """Render a deny Decision's BlockReason into a single, greppable log suffix.
+
+    Carries the data an operator needs to transpose the block into a rule: for method-not-allowed, the
+    matched rule's host glob and the methods it currently permits (so they can see whether to extend it).
+    """
+    if block is None:  # defensive: a deny should always carry a reason
+        return "reason=blocked"
+    if block.code == REASON_METHOD_NOT_ALLOWED:
+        methods = ", ".join(block.methods or ())
+        return f"reason=method-not-allowed (matched rule host={block.host!r}, allows methods=[{methods}])"
+    if block.code == REASON_HOST_NOT_LISTED:
+        return "reason=host-not-listed (no rule matched; default=deny)"
+    return f"reason={block.code}"
+
+
+def _deny(flow, log_prefix: str, block) -> None:
+    """Deny a flow fail-closed: commit the 403 BEFORE formatting the reason. mitmproxy fails OPEN on an
+    un-denied hook, so _forbidden must run before any code (reason formatting) that could conceivably
+    raise. Both the CONNECT and request deny paths route through here, so that ordering lives in one place.
+    """
+    _forbidden(flow)
+    logger.warning("egress: blocked %s — %s", log_prefix, _describe_block(block))
 
 
 class EgressAddon:
@@ -38,14 +63,13 @@ class EgressAddon:
         """
         host = flow.request.host
         try:
-            allowed = self._store.current().evaluate(host, "CONNECT").allow
+            decision = self._store.current().evaluate(host, "CONNECT")
         except Exception:
             logger.exception("egress: error evaluating CONNECT to %s; failing closed (deny)", host)
             _forbidden(flow)
             return
-        if not allowed:
-            logger.warning("egress: blocked CONNECT to %s", host)
-            _forbidden(flow)
+        if not decision.allow:
+            _deny(flow, f"CONNECT {host}", decision.block)
 
     def tls_clienthello(self, data) -> None:
         """For allowed-but-not-intercepted hosts, tunnel TLS untouched (no MITM).
@@ -78,8 +102,7 @@ class EgressAddon:
             _forbidden(flow)
             return
         if not decision.allow:
-            logger.warning("egress: blocked %s %s", flow.request.method, host)
-            _forbidden(flow)
+            _deny(flow, f"{flow.request.method} {host}", decision.block)
             return
         if decision.inject is not None:
             name, value = decision.inject
