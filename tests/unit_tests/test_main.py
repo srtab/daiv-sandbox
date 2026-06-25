@@ -1322,6 +1322,7 @@ def test_start_session_builds_triad_when_egress_enabled(client, monkeypatch, tmp
         assert "daiv.sandbox.egress" in start_kwargs["labels"]
         assert start_kwargs["environment"]["HTTPS_PROXY"] == "http://10.7.0.2:8080"
         cmd.install_ca_cert.assert_called_once()
+        mgr.provision.assert_called_once()
 
 
 def test_start_session_egress_keeps_caller_environment(client, monkeypatch, tmp_path):
@@ -1505,6 +1506,50 @@ def test_start_session_provisions_policy_at_create(client, monkeypatch, tmp_path
         mgr.provision.assert_called_once()
         token_arg, config_arg = mgr.provision.call_args.args
         assert b'"github.com"' in config_arg  # the policy JSON reached the sidecar
+
+
+def test_start_session_provisions_policy_with_secret_at_create(client, monkeypatch, tmp_path):
+    """Secrets in the egress block must be unwrapped to their PLAINTEXT values in the bytes sent to the
+    sidecar — the redaction mask must NOT appear. This is the canonical test for to_sidecar_config()
+    secret serialisation at create time."""
+    _egress_ca_settings(monkeypatch, tmp_path)
+    with (
+        patch("daiv_sandbox.main.SandboxDockerSession") as cls,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
+        mgr = mock_mgr_class.return_value
+        mgr.proxy_internal_ip.return_value = "172.20.0.2"
+        cls.start.return_value = Mock(session_id="sess123")
+        resp = client.post(
+            "/session/",
+            json={
+                "base_image": "python:3.12",
+                "egress": {
+                    "policy": {"default": "deny", "rules": [{"host": "github.com", "inject": "gh"}]},
+                    "secrets": {"gh": {"header": "Authorization", "value": "Bearer t"}},
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        mgr.provision.assert_called_once()
+        _token_arg, config_arg = mgr.provision.call_args.args
+        assert b"Bearer t" in config_arg  # the resolved secret value reaches the sidecar config
+        assert b"**********" not in config_arg  # the redaction mask must NOT be present
+
+
+def test_start_session_egress_tears_down_when_provision_fails(monkeypatch, tmp_path):
+    """If mgr.provision raises after the sandbox is up and CA is installed, the sandbox must be removed
+    and the triad torn down — returning 500. A half-provisioned sidecar must never be left running."""
+    with _egress_start_harness(monkeypatch, tmp_path) as (test_client, mock_session_class, mgr):
+        cmd = Mock(session_id="sbx-id")
+        mock_session_class.start.return_value = cmd
+        mgr.provision.side_effect = RuntimeError("sidecar rejected policy")
+
+        resp = test_client.post("/session/", json={"base_image": "python:3.12", "egress": _EGRESS_PAYLOAD})
+
+        assert resp.status_code == 500, resp.text
+        cmd.remove_container.assert_called_once()
+        mgr.teardown.assert_called_once()
 
 
 def test_start_session_422_when_egress_permits_nothing(client, monkeypatch, tmp_path):
