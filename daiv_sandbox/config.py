@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     # Egress proxy (per-session MITM sidecar). Egress is enabled by configuring the shared CA
     # (EGRESS_CA_CERT_FILE + EGRESS_CA_KEY_FILE); when configured, a network-enabled session is
     # built as a triad (internal network + mitmdump sidecar + sandbox) and the sandbox reaches the
-    # internet only through the sidecar. A network_enabled request without the CA is rejected (400).
+    # internet only through the sidecar. A POST /session/ carrying an egress block without the CA is rejected (400).
     # See the "Network Egress Proxy" section of the README.
     EGRESS_PROXY_IMAGE: str = "ghcr.io/srtab/daiv-sandbox-egress:latest"
     EGRESS_PROXY_PORT: int = Field(default=8080, gt=0)
