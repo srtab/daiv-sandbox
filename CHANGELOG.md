@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Patch extraction. Removed the patch-extractor side-car container, the `extract_patch` parameter from the start-session request, the `patch` field from the run-commands response, and the `DAIV_SANDBOX_GIT_IMAGE` setting. Recover changes by running git (e.g. `git diff`, `git status`) inside `/workspace/repo` through the run-commands endpoint. **Breaking change**
 - `RunRequest.archive`; initial session state is now established via `POST /session/{id}/seed/`. **Breaking change**
 - `StartSessionRequest.ephemeral` and the `DAIV_SANDBOX_EPHEMERAL_SESSION_LABEL` mechanism. **Breaking change**
+- `POST /session/{id}/egress/` endpoint removed. Egress policy is now provisioned at session create time via the `egress` block on `POST /session/`. **Breaking change**
+- `StartSessionRequest.network_enabled` removed; pass an `egress` block instead for network access, or omit `egress` for an isolated sandbox. **Breaking change**
+- `EgressConfigResponse` schema removed (was `{"ok": true}` — no longer needed). **Breaking change**
 
 ### Fixed
 

@@ -24,8 +24,6 @@ from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, 
 from daiv_sandbox.logs import LOGGING_CONFIG
 from daiv_sandbox.reaper import start_reaper
 from daiv_sandbox.schemas import (
-    EgressConfigRequest,
-    EgressConfigResponse,
     ErrorMessage,
     FsDeleteRequest,
     FsDeleteResponse,
@@ -237,28 +235,24 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     if request.environment:
         cmd_executor_kwargs["environment"] = dict(request.environment)
 
-    use_egress = request.network_enabled
+    use_egress = request.egress is not None
 
-    if not request.network_enabled:
+    if request.egress is None:
         cmd_executor_kwargs["network_mode"] = "none"
     else:
-        # Network-enabled sessions reach the internet only through the per-session egress proxy
-        # (internal network + sidecar). Egress is mandatory — there is no direct-network attach.
-        # If the proxy isn't configured (no shared CA), reject rather than silently attaching a
-        # network that would bypass the proxy's allow/deny policy and credential isolation.
+        # Network access exists only through the per-session egress proxy (internal network + sidecar).
+        # Egress is mandatory — there is no direct-network attach. Reject up front if the proxy isn't
+        # configured (no shared CA) rather than silently attaching a policy-less network.
         if not settings.egress_enabled:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="network_enabled requires the egress proxy, which is not configured on this deployment",
+                detail="egress requires the egress proxy, which is not configured on this deployment",
             )
         token = uuid.uuid4().hex[:12]
         try:
             ca_cert = Path(settings.EGRESS_CA_CERT_FILE).read_bytes()
             ca_combined = Path(settings.EGRESS_CA_KEY_FILE).read_bytes() + b"\n" + ca_cert
         except OSError as exc:
-            # The CA files ARE configured (egress_enabled) but can't be read (missing on disk,
-            # permission denied, mid-rotation). Distinct from the 400 above; log the errno so the
-            # real cause reaches Sentry/logs and keep the client message path-free.
             logger.error("Egress proxy: cannot read EGRESS CA files: %s", exc)
             raise HTTPException(
                 status_code=500, detail="Egress proxy configured but EGRESS CA files could not be read"
@@ -270,18 +264,11 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
             proxy_ip = await asyncio.to_thread(manager.proxy_internal_ip, token)
             cmd_executor_labels[EGRESS_SESSION_LABEL] = token
             cmd_executor_kwargs["network"] = network_name
-            # Layer the proxy/CA env on top of the caller's environment (set above). These keys win on
-            # collision so the sandbox always routes through the proxy and trusts its CA.
             cmd_executor_kwargs["environment"] = {
                 **cmd_executor_kwargs.get("environment", {}),
                 **exec_proxy_env(proxy_ip, settings.EGRESS_PROXY_PORT),
             }
         except Exception as exc:
-            # A triad that failed to come up (network/sidecar create, or the proxy never getting an IP
-            # on its internal NIC) is a retryable infrastructure fault, not a 500. Tear down whatever was
-            # partially created and surface 503, consistent with the SessionUnavailableError contract.
-            # Log first: HTTPException is a handled response, so the root cause (a bad EGRESS_PROXY_IMAGE,
-            # a Docker APIError) would otherwise reach neither the logs nor Sentry.
             logger.exception("Egress proxy: triad failed to start for token %s", token)
             await asyncio.to_thread(manager.teardown, token)
             raise HTTPException(
@@ -296,9 +283,9 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
             raise RuntimeError("Started session is missing a session ID")
         return StartSessionResponse(session_id=cmd_executor.session_id)
 
-    # The triad (internal network + sidecar) already exists. Every step from here on — starting the
-    # sandbox, validating it, installing the CA — must tear the triad down on failure: nothing else
-    # reclaims it, since the reaper only removes a triad via its surviving cmd-executor container.
+    # The triad already exists. Every step from here — start the sandbox, install the CA, provision the
+    # policy — must tear the triad down on failure: nothing else reclaims it (the reaper only removes a
+    # triad via its surviving cmd-executor container).
     cmd_executor = None
     try:
         cmd_executor = await asyncio.to_thread(
@@ -309,15 +296,18 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         try:
             await asyncio.to_thread(cmd_executor.install_ca_cert, ca_cert)
         except Exception as exc:
-            # Log + preserve the cause (the failing CA step and its output): HTTPException won't reach
-            # Sentry, and `from None` would discard the RuntimeError install_ca_cert raised.
             logger.exception("Egress proxy: failed to install CA into sandbox %s", cmd_executor.session_id)
             raise HTTPException(status_code=500, detail="Egress proxy: failed to install CA into the sandbox") from exc
+        # Write the policy to the sidecar at create time (folds in the old POST /session/{id}/egress/).
+        try:
+            config_bytes = json.dumps(request.egress.to_sidecar_config()).encode("utf-8")
+            await asyncio.to_thread(manager.provision, token, config_bytes)
+        except Exception as exc:
+            logger.exception("Egress proxy: failed to provision policy into sidecar for %s", cmd_executor.session_id)
+            raise HTTPException(
+                status_code=500, detail="Egress proxy: failed to provision policy into the sidecar"
+            ) from exc
     except Exception:
-        # Remove the sandbox if it was created (SandboxDockerSession.start cleans up its own container
-        # when it raises, so cmd_executor may be None / id-less), then tear down the triad. remove_container
-        # only swallows NotFound, so guard its APIError here — a removal fault must NOT skip the triad
-        # teardown and leak the network + sidecar; the original error is still re-raised below.
         if cmd_executor is not None and cmd_executor.session_id is not None:
             try:
                 await asyncio.to_thread(cmd_executor.remove_container)
@@ -434,30 +424,6 @@ async def run_on_session(
                 break
 
         return RunResponse(results=results)
-
-
-@app.post("/session/{session_id}/egress/", responses=common_responses, name="Configure session egress")
-async def configure_egress(
-    http_request: Request,
-    session_id: Annotated[str, FastAPIPath(title="The ID of the session to configure egress for.")],
-    request: EgressConfigRequest,
-    api_key: str = Depends(get_api_key),
-) -> EgressConfigResponse:
-    """Provision (or replace) the egress policy + credentials for a session's sidecar proxy.
-
-    Idempotent: called once after start and again on warm reuse with refreshed tokens. The secrets
-    reach only the sidecar — never the sandbox.
-    """
-    if not settings.egress_enabled:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Egress proxy not configured")
-    async with _workspace_executor(http_request, session_id) as cmd:
-        token = egress_token(cmd.container)
-        if not token:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session has no egress proxy")
-        manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
-        config_bytes = json.dumps(request.to_sidecar_config()).encode("utf-8")
-        await asyncio.to_thread(manager.provision, token, config_bytes)
-        return EgressConfigResponse()
 
 
 @app.delete("/session/{session_id}/", responses=common_responses, name="Close a session")

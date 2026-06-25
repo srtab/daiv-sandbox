@@ -300,8 +300,4 @@ class EgressConfigRequest(BaseModel):
         }
 
 
-class EgressConfigResponse(BaseModel):
-    ok: bool = Field(default=True, description="True when the policy was provisioned to the sidecar.")
-
-
 StartSessionRequest.model_rebuild()
