@@ -298,7 +298,8 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         except Exception as exc:
             logger.exception("Egress proxy: failed to install CA into sandbox %s", cmd_executor.session_id)
             raise HTTPException(status_code=500, detail="Egress proxy: failed to install CA into the sandbox") from exc
-        # Write the policy to the sidecar at create time (folds in the old POST /session/{id}/egress/).
+        # Write the policy to the sidecar at create time (replaces the former standalone egress-provisioning
+        # endpoint, now removed — provisioning is create-time only).
         try:
             config_bytes = json.dumps(request.egress.to_sidecar_config()).encode("utf-8")
             await asyncio.to_thread(manager.provision, token, config_bytes)

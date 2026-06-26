@@ -39,11 +39,11 @@ class Settings(BaseSettings):
     RUN_GID: int = 1000
     COMMAND_TIMEOUT: int = Field(default=0, ge=0)  # per-command timeout in seconds; 0 = no timeout
     # Upstream network for the egress sidecar's second NIC (its route to the internet). The sandbox
-    # is never attached to this network directly — network-enabled sessions reach the internet only
-    # through the proxy. None -> EGRESS_PROXY_NETWORK falls back here, then to Docker's default bridge.
+    # is never attached to this network directly — a session that carries an egress block reaches the
+    # internet only through the proxy. None -> EGRESS_PROXY_NETWORK falls back here, then to Docker's default bridge.
     NETWORK: str | None = None
     # Egress proxy (per-session MITM sidecar). Egress is enabled by configuring the shared CA
-    # (EGRESS_CA_CERT_FILE + EGRESS_CA_KEY_FILE); when configured, a network-enabled session is
+    # (EGRESS_CA_CERT_FILE + EGRESS_CA_KEY_FILE); when configured, a session created with an egress block is
     # built as a triad (internal network + mitmdump sidecar + sandbox) and the sandbox reaches the
     # internet only through the sidecar. A POST /session/ carrying an egress block without the CA is rejected (400).
     # See the "Network Egress Proxy" section of the README.
