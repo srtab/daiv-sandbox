@@ -53,7 +53,8 @@ running git inside `/workspace/repo`. The one-shot seed guard marker lives in `S
 `/workspace`, so it's unreachable through `fs/*`).
 
 **Endpoints** (`main.py`, all under `root_path=/api/v1`, all require the `X-API-Key` header):
-`POST /session/` → `POST /session/{id}/seed/` (multipart, one-shot, 409 if re-seeded) →
+`POST /session/` (include an `egress` block to attach the per-session egress proxy at create time) →
+`POST /session/{id}/seed/` (multipart, one-shot, 409 if re-seeded) →
 `POST /session/{id}/fs/{op}` (`ls`/`read`/`grep`/`glob`/`write`/`edit`/`delete`) and
 `POST /session/{id}/` (run commands) → `GET /session/{id}/` (204 exists/warms, 404 missing) →
 `DELETE /session/{id}/`. Plus `GET /-/health/` and `GET /-/version/`.
@@ -72,8 +73,9 @@ container that has been warmed again — closing a TOCTOU race against in-flight
 **Error-status contract (deliberate — keep these distinct).** Missing session → `404`. A Docker fault
 while restarting/stopping an existing container → `SessionUnavailableError` → `503` (retryable infra
 fault, **not** masked as 404). Lock contention → `SessionBusyError` → `409`. Missing/invalid API key →
-`403`. A `network_enabled=true` request on a deployment without the egress CA configured → `400` (egress
-is mandatory for network access; there is no direct-network attach).
+`403`. A `POST /session/` carrying an `egress` block on a deployment without the egress CA configured →
+`400` (egress is mandatory for network access; there is no direct-network attach). A permits-nothing
+egress policy (deny-default, no rules) → `422`.
 
 **`fs/*` is Python-free and defends a container boundary, not a path prefix.** File content moves via
 the Docker archive API; search/listing shells out to POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work

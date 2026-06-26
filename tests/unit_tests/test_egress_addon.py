@@ -1,10 +1,13 @@
+import contextlib
 import json
+import logging
 import types
 
 import pytest
 
 from daiv_sandbox.egress import addon as addon_mod
 from daiv_sandbox.egress.addon import EgressAddon
+from daiv_sandbox.egress.policy import REASON_METHOD_NOT_ALLOWED, BlockReason
 
 
 def _write_cfg(tmp_path, **kw):
@@ -79,6 +82,42 @@ def test_request_denies_disallowed_method_on_method_restricted_host(tmp_path):
     assert flow.response == "FORBIDDEN"
 
 
+def test_blocked_connect_logs_host_not_listed_reason(tmp_path, caplog):
+    """A blocked CONNECT logs the host plus a host-not-listed reason, so an operator sees why and what
+    host to add a rule for."""
+    a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "github.com"}]))
+    with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
+        a.http_connect(_flow(host="evil.example"))
+    msg = caplog.text
+    assert "evil.example" in msg
+    assert "host-not-listed" in msg
+
+
+def test_blocked_request_logs_method_not_allowed_with_matched_rule(tmp_path, caplog):
+    """A method blocked on a listed host logs method-not-allowed plus the matched rule's host glob and
+    its currently-allowed methods — the data needed to extend that rule."""
+    a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "*.github.com", "methods": ["GET", "POST"]}]))
+    with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
+        a.request(_flow(host="api.github.com", method="DELETE"))
+    msg = caplog.text
+    assert "DELETE" in msg and "api.github.com" in msg
+    assert "method-not-allowed" in msg
+    assert "*.github.com" in msg  # matched rule host glob
+    assert "GET" in msg and "POST" in msg  # currently-allowed methods
+
+
+def test_blocked_request_on_unlisted_host_logs_host_not_listed(tmp_path, caplog):
+    """A request to a wholly unlisted host (default-deny) logs the host-not-listed reason. The method and
+    host come from the log line's prefix, not the reason payload — host-not-listed carries no rule detail
+    (there is no rule to cite), so _describe_block emits only the static reason string."""
+    a = EgressAddon(_write_cfg(tmp_path))
+    with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
+        a.request(_flow(host="evil.example", method="POST"))
+    msg = caplog.text
+    assert "POST" in msg and "evil.example" in msg
+    assert "host-not-listed" in msg
+
+
 def test_request_allows_permitted_method_on_method_restricted_host(tmp_path):
     a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "api.github.com", "methods": ["GET"]}]))
     flow = _flow(host="api.github.com", method="GET")
@@ -125,6 +164,35 @@ def test_request_fails_closed_when_evaluation_raises(tmp_path, monkeypatch):
     a.request(flow)
     assert flow.response == "FORBIDDEN"
     assert "Authorization" not in flow.request.headers  # credential never injected on the error path
+
+
+@pytest.mark.parametrize("hook", [EgressAddon.request, EgressAddon.http_connect], ids=["request", "http_connect"])
+def test_hooks_commit_deny_before_formatting_reason(tmp_path, monkeypatch, hook):
+    """Hardening: both deny paths route through _deny, which attaches the 403 BEFORE formatting the reason,
+    so a formatting bug can never leave the flow un-denied. mitmproxy fails OPEN on an un-denied hook, so
+    deny order matters even though _describe_block is total today."""
+    a = EgressAddon(_write_cfg(tmp_path))  # default-deny
+    monkeypatch.setattr(addon_mod, "_describe_block", _raise)
+    flow = _flow(host="evil.example", method="POST")
+    with contextlib.suppress(RuntimeError):
+        hook(a, flow)
+    assert flow.response == "FORBIDDEN"
+
+
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [
+        (None, "reason=blocked"),
+        (BlockReason("future-code"), "reason=future-code"),
+        (BlockReason(REASON_METHOD_NOT_ALLOWED, host="x", methods=None), "methods=[]"),
+    ],
+    ids=["missing-reason", "unknown-code", "method-not-allowed-no-methods"],
+)
+def test_describe_block_is_total(block, expected):
+    """_describe_block never raises inside the fail-open hook: a missing reason renders a static string, an
+    unknown code degrades to a bare reason= line, and a method-not-allowed reason with no methods still
+    formats. None of these arise via evaluate() — the guards are belt-and-suspenders for the fail-open hook."""
+    assert expected in addon_mod._describe_block(block)
 
 
 def test_tls_clienthello_fails_closed_when_evaluation_raises(tmp_path, monkeypatch):

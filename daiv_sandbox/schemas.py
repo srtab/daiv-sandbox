@@ -9,7 +9,14 @@ from pydantic import Base64Bytes, BaseModel, Field, SecretStr, computed_field, f
 
 class StartSessionRequest(BaseModel):
     base_image: str = Field(description="Docker image to be used as the base image for the sandbox.")
-    network_enabled: bool = Field(default=False, description="Whether to enable network for the sandbox.")
+    egress: EgressConfigRequest | None = Field(
+        default=None,
+        description=(
+            "Egress policy + secrets. Omit for a network-isolated sandbox (network_mode=none); provide to "
+            "route the sandbox through the per-session egress proxy with this policy. Immutable for the "
+            "session's life."
+        ),
+    )
     environment: dict[str, str] | None = Field(
         default=None, description="Environment variables to set in the container at startup."
     )
@@ -263,6 +270,18 @@ class EgressConfigRequest(BaseModel):
     secrets: dict[str, EgressSecret] = Field(default_factory=dict)
 
     @model_validator(mode="after")
+    def _permits_something(self) -> EgressConfigRequest:
+        # An egress block must be able to permit *something*; a deny-default with no rules is the old
+        # "enabled but deny-all" degenerate state. Omit `egress` entirely for no-network, or use
+        # default="allow". Rejecting it here yields a 422 at the /session/ boundary automatically.
+        if self.policy.default == "deny" and not self.policy.rules:
+            raise ValueError(
+                "egress policy permits nothing: a deny-default policy needs at least one rule "
+                "(omit `egress` for a network-isolated sandbox, or set policy.default='allow')"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _injects_resolve(self) -> EgressConfigRequest:
         for rule in self.policy.rules:
             if rule.inject is not None and rule.inject not in self.secrets:
@@ -281,5 +300,4 @@ class EgressConfigRequest(BaseModel):
         }
 
 
-class EgressConfigResponse(BaseModel):
-    ok: bool = Field(default=True, description="True when the policy was provisioned to the sidecar.")
+StartSessionRequest.model_rebuild()
