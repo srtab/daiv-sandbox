@@ -8,7 +8,7 @@ if TYPE_CHECKING:
 
 def test_network_disabled(client: TestClient, sandbox_session: Callable[..., str]):
     """Test that the command fails when network is disabled and the command requires network."""
-    session_id = sandbox_session(base_image="alpine:latest", network_enabled=False)
+    session_id = sandbox_session(base_image="alpine:latest")
 
     run = client.post(f"/session/{session_id}/", json={"commands": ["ping -c 1 google.com"]})
     assert run.status_code == 200, run.text
