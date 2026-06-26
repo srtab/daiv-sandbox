@@ -12,7 +12,6 @@ import json
 
 from daiv_sandbox.schemas import (
     EgressConfigRequest,
-    EgressConfigResponse,
     EgressPolicy,
     EgressRule,
     EgressSecret,
@@ -65,7 +64,6 @@ _TYPES = [
     EgressSecret,
     EgressPolicy,
     EgressConfigRequest,
-    EgressConfigResponse,
 ]
 
 
