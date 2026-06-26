@@ -1553,20 +1553,28 @@ def test_start_session_egress_tears_down_when_provision_fails(monkeypatch, tmp_p
 
 
 def test_start_session_422_when_egress_permits_nothing(client, monkeypatch, tmp_path):
-    """A deny-default egress block with no rules is rejected at the boundary (422); no container."""
+    """A deny-default egress block with no rules is rejected at the boundary (422); no container, and
+    crucially no triad resources either. Patching EgressProxyManager and asserting create_network was
+    never called pins that the rejection stays at the request boundary (Pydantic), so a future refactor
+    that moved the check into the handler body — after triad bring-up — would leak a network + sidecar
+    and fail this test rather than pass silently."""
     _egress_ca_settings(monkeypatch, tmp_path)
-    with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
+    with (
+        patch("daiv_sandbox.main.SandboxDockerSession") as cls,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
         resp = client.post(
             "/session/", json={"base_image": "python:3.12", "egress": {"policy": {"default": "deny", "rules": []}}}
         )
         assert resp.status_code == 422, resp.text
         cls.start.assert_not_called()
+        mock_mgr_class.return_value.create_network.assert_not_called()
 
 
 def test_configure_egress_endpoint_is_gone(client):
-    """The separate egress provisioning endpoint no longer exists."""
+    """The separate egress provisioning endpoint no longer exists; the path is unmatched (404)."""
     resp = client.post("/session/anything/egress/", json={"policy": {"default": "allow"}})
-    assert resp.status_code in (404, 405), resp.text
+    assert resp.status_code == 404, resp.text
 
 
 def test_fs_glob_forwards_default_plus_request_excludes(mock_session, client, monkeypatch):

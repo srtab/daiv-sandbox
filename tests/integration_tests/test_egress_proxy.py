@@ -31,13 +31,9 @@ def _image_present(client, ref) -> bool:
         return False
 
 
-def _self_signed_ca() -> tuple[bytes, bytes]:
-    """Return (combined_key_cert_pem, cert_pem).
-
-    ``combined_key_cert_pem`` is the format mitmproxy loads from its confdir. ``cert_pem`` (the public
-    cert alone) is installed into the sandbox so a client can trust the MITM'd leaf certificates the
-    proxy mints from this CA — required whenever a flow is intercepted rather than tunnelled.
-    """
+def _gen_ca() -> tuple[bytes, bytes]:
+    """Generate a throwaway self-signed CA. Returns ``(cert_pem, key_pem)`` as two separate PEM blobs —
+    the shape the create endpoint stores on disk (EGRESS_CA_CERT_FILE + EGRESS_CA_KEY_FILE)."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "daiv-egress-test")])
     now = datetime.datetime.now(datetime.UTC)
@@ -57,6 +53,17 @@ def _self_signed_ca() -> tuple[bytes, bytes]:
         serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()
     )
     cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    return cert_pem, key_pem
+
+
+def _self_signed_ca() -> tuple[bytes, bytes]:
+    """Return (combined_key_cert_pem, cert_pem).
+
+    ``combined_key_cert_pem`` is the format mitmproxy loads from its confdir. ``cert_pem`` (the public
+    cert alone) is installed into the sandbox so a client can trust the MITM'd leaf certificates the
+    proxy mints from this CA — required whenever a flow is intercepted rather than tunnelled.
+    """
+    cert_pem, key_pem = _gen_ca()
     return key_pem + cert_pem, cert_pem
 
 
@@ -210,3 +217,67 @@ def test_triad_mitm_injects_credential_and_enforces_method(docker_client):
         if sandbox is not None:
             sandbox.remove(force=True)
         mgr.teardown(token)
+
+
+def test_create_endpoint_provisions_egress_and_enforces_policy(
+    client, sandbox_session, docker_client, monkeypatch, tmp_path
+):
+    """End-to-end through ``POST /session/``: an ``egress`` block on create must build the triad, install
+    the CA, and provision the policy so that subsequent ``run`` commands reach an allowed host but are
+    blocked (403) on an unlisted one. The other tests in this file drive ``EgressProxyManager`` directly;
+    this is the only check that the create endpoint wires request -> triad -> provisioned policy together.
+    """
+    if not _image_present(docker_client, settings.EGRESS_PROXY_IMAGE):
+        pytest.skip("egress proxy image not built; run `make build-egress-proxy`")
+
+    # The create endpoint reads the shared CA from these two files (the cert alone is installed into the
+    # sandbox; cert+key is what the sidecar's mitmdump loads). Point them at a throwaway CA.
+    cert_pem, key_pem = _gen_ca()
+    cert_file = tmp_path / "egress-ca.crt"
+    cert_file.write_bytes(cert_pem)
+    key_file = tmp_path / "egress-ca.key"
+    key_file.write_bytes(key_pem)
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(cert_file))
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(key_file))
+
+    # `intercept: credentialed` keeps the allowed host tunnelled (no MITM), so the assertion does not
+    # depend on the sandbox trusting MITM leaf certs — the deny is the addon's CONNECT-phase 403. The base
+    # image needs both `curl` AND `update-ca-certificates` (the create path runs the latter via
+    # install_ca_cert), so use a full Debian image rather than curlimages/curl (which lacks it).
+    session_id = sandbox_session(
+        base_image="python:3.12-bookworm",
+        egress={
+            "policy": {
+                "default": "deny",
+                "intercept": "credentialed",
+                "rules": [{"host": "example.com", "methods": ["*"]}],
+            }
+        },
+    )
+
+    # mitmproxy takes ~1s to start listening; retry the allowed host until the tunnel succeeds. An unready
+    # proxy refuses every CONNECT, so this also guards the deny assertion below against a false positive.
+    # Bound the retry by a 30s wall-clock deadline (matching the sibling manager-driven tests) and a short
+    # per-curl --max-time, so a curl that hangs at connect can't stall the run command for minutes (the
+    # test env leaves COMMAND_TIMEOUT=0, so nothing else caps it).
+    allow_cmd = (
+        "deadline=$(($(date +%s)+30)); "
+        'while [ "$(date +%s)" -lt "$deadline" ]; do '
+        "code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 https://example.com || true); "
+        'case "$code" in 2*|3*) echo "ALLOWED_OK code=$code"; exit 0;; esac; '
+        "sleep 1; done; "
+        'echo "ALLOWED_FAIL last=$code"; exit 1'
+    )
+    allow = client.post(f"/session/{session_id}/", json={"commands": [allow_cmd]})
+    assert allow.status_code == 200, allow.text
+    allow_result = allow.json()["results"][0]
+    assert allow_result["exit_code"] == 0, allow_result["output"]
+    assert "ALLOWED_OK" in allow_result["output"]
+
+    # Unlisted host: denied at CONNECT with the addon's 403 (not a bare connection failure). -sS surfaces
+    # curl's "Received HTTP code 403 from proxy after CONNECT" message; 2>&1 folds it into the run output.
+    deny_cmd = "curl -sS -o /dev/null --max-time 5 https://www.iana.org 2>&1"
+    deny = client.post(f"/session/{session_id}/", json={"commands": [deny_cmd]})
+    assert deny.status_code == 200, deny.text
+    deny_output = deny.json()["results"][0]["output"]
+    assert "403" in deny_output, deny_output
