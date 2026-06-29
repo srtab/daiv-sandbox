@@ -1,113 +1,57 @@
 # AGENTS.md
 
-This file provides guidance to agents (Claude Code and others) when working with code in this repository.
-
-## Overview
-
-`daiv-sandbox` is a FastAPI service that executes untrusted commands and file operations inside
-transient Docker containers, optionally hardened with the gVisor (`runsc`) runtime. It is the
-code/commands executor for [DAIV](https://github.com/srtab/daiv) agents. Stack: Python 3.14, FastAPI,
-the Docker SDK, Pydantic, and the `uv` package manager.
+This file provides guidance to agents when working with code in this repository.
 
 ## Commands
 
 ```bash
 make test          # uv run --all-extras pytest -s tests  (unit + integration, with coverage)
-make lint-fix      # check lint and auto-fix ruff + format + pyproject-fmt
-make lint-typing   # mypy on daiv_sandbox/
+make lint-fix      # ruff check --fix + ruff format + pyproject-fmt (auto-fix)
+make lint-typing   # mypy on daiv_sandbox/  (local only, not a CI gate)
 make run           # fastapi dev on port 8888 (reload)
 ```
 
 - **Single test:** `uv run --all-extras pytest -s tests/unit_tests/test_main.py -k "test_name"`
-- **Unit only (no Docker needed):** `uv run --all-extras pytest -s tests/unit_tests`
-- `tests/integration_tests/` spin up **real containers** and require a running Docker daemon; `make test`
-  runs them (CI runs `make test` on a Docker-enabled runner). Run the unit suite alone when no daemon is
-  available.
-- `pytest-env` sets `DAIV_SANDBOX_API_KEY=notsosecret` automatically — no `.env` needed for tests.
-- CI gate is `make lint` then `make test`; `make lint-typing` (mypy) is available locally but is not a CI gate.
+- **Unit only (no Docker):** `uv run --all-extras pytest -s tests/unit_tests`
+- `tests/integration_tests/` spin up **real containers** — need a running Docker daemon. Run the unit suite alone when no daemon is available.
+- `pytest-env` sets `DAIV_SANDBOX_API_KEY=notsosecret` — no `.env` needed for tests.
+- CI gate: `make lint` then `make test`.
 
 ## Architecture
 
-**Two distinct Docker contexts — do not conflate them.** The FastAPI app is itself one container
-(`Dockerfile`, runs as user `app`, talks to the host Docker socket). It manages a _separate_ sandbox
-container per session, in which untrusted code runs. `settings.RUN_UID/RUN_GID` and the gVisor runtime
-apply to the **sandbox** containers, not the service.
+**Two Docker contexts — do not conflate.** The FastAPI app is itself a container (`Dockerfile`, user `app`, talks to host Docker socket) that manages a _separate_ sandbox container per session. `settings.RUN_UID/RUN_GID` and the gVisor runtime apply to **sandbox** containers, not the service.
 
-**A session is one long-lived sandbox container.** `SandboxDockerSession` (`sessions.py`) wraps it:
+**A session is one long-lived sandbox container** (`SandboxDockerSession` in `sessions.py`):
+- `start()` runs `entrypoint=/bin/sh -lc "sleep infinity"` (PID 1 never exits), labeled `daiv.sandbox.type=cmd_executor`. The `session_id` returned to clients **is the container id**.
+- `_get_container()` **restarts a stopped container on access** (warm reuse).
+- `DELETE` _stops_ by default (preserves writable layer); `?force=true` removes it. The background **reaper** (`reaper.py`) later removes stopped containers (age + LRU), re-reading state **under the per-session lock** to skip re-warmed containers (TOCTOU fix).
+- All blocking Docker calls use `asyncio.to_thread`; one shared `DockerClient` (`_get_shared_client`).
 
-- `start()` pulls the image and runs a container with `entrypoint=/bin/sh -lc "sleep infinity"` (PID 1
-  never exits on its own), labeled `daiv.sandbox.type=cmd_executor`. The `session_id` returned to clients
-  **is the container id**.
-- On every later request, `SandboxDockerSession(session_id=...)` looks the container up via
-  `_get_container()`, which **restarts a stopped container on access** (warm reuse).
-- `DELETE` _stops_ the container by default (`stop_container`), preserving its writable layer; `?force=true`
-  removes it. The background **reaper** (`reaper.py`) later removes stopped containers.
-- All blocking Docker calls are wrapped in `asyncio.to_thread`, and a single `DockerClient` is shared
-  across the process (`_get_shared_client`).
+**`/workspace` is the single source of truth** (`/workspace/{repo,skills,tmp}` + `/home/daiv-sandbox`). `seed` extracts archives into `repo/`+`skills/`; `run` executes in `/workspace/repo`; `fs/*` operate anywhere under `/workspace`. No server-side patch/diff — recover changes via git inside `/workspace/repo`. The one-shot seed guard marker lives in `SANDBOX_HOME` (outside `/workspace`, unreachable via `fs/*`).
 
-**`/workspace` is the single source of truth.** The container layout is `/workspace/{repo,skills,tmp}`
-(constants `SANDBOX_ROOT`, `SKILLS_ROOT`, `SCRATCH_ROOT`) plus `/home/daiv-sandbox` (`SANDBOX_HOME`).
-`seed` extracts archives into `repo/` and `skills/`; `run` executes commands in `/workspace/repo`;
-`fs/*` operate anywhere under `/workspace`. There is no server-side patch/diff — recover changes by
-running git inside `/workspace/repo`. The one-shot seed guard marker lives in `SANDBOX_HOME` (outside
-`/workspace`, so it's unreachable through `fs/*`).
+**Endpoints** (`main.py`, `root_path=/api/v1`, all require `X-API-Key`): `POST /session/` → `POST /session/{id}/seed/` (multipart, one-shot, 409 if re-seeded) → `POST /session/{id}/fs/{op}` (`ls`/`read`/`grep`/`glob`/`write`/`edit`/`delete`) and `POST /session/{id}/` (run) → `GET /session/{id}/` (204 exists/warms, 404 missing) → `DELETE /session/{id}/`. Plus `GET /-/health/` and `GET /-/version/`.
 
-**Endpoints** (`main.py`, all under `root_path=/api/v1`, all require the `X-API-Key` header):
-`POST /session/` → `POST /session/{id}/seed/` (multipart, one-shot, 409 if re-seeded) →
-`POST /session/{id}/fs/{op}` (`ls`/`read`/`grep`/`glob`/`write`/`edit`/`delete`) and
-`POST /session/{id}/` (run commands) → `GET /session/{id}/` (204 exists/warms, 404 missing) →
-`DELETE /session/{id}/`. Plus `GET /-/health/` and `GET /-/version/`.
+**Locking.** Every session-scoped endpoint runs inside `app.state.session_lock_manager.acquire(session_id)` (`locks.py`): no-op without `REDIS_URL` (single replica); Redis lock serialises same-session requests across replicas (contention → `SessionBusyError`). The reaper uses a Redis _leader_ lock so only one replica sweeps per tick.
 
-**Concurrency & locking.** Every session-scoped endpoint runs inside
-`app.state.session_lock_manager.acquire(session_id)` (`locks.py`). Without `REDIS_URL` this is a no-op
-(single replica); with it, a Redis lock serialises requests for the same session across replicas, and a
-request that can't acquire it within the wait window raises `SessionBusyError`. The reaper uses a Redis
-_leader_ lock so only one replica sweeps per tick.
+**Error-status contract (deliberate — keep distinct).** Missing session → `404`. Docker fault restarting/stopping an existing container → `SessionUnavailableError` → `503` (retryable infra fault, **not** masked as 404). Lock contention → `409`. Bad API key → `403`.
 
-**The reaper** (`reaper.py`) sweeps on a fixed cadence: it lists non-running cmd-executor containers,
-removes those whose `State.FinishedAt` is older than `SESSION_GRACE_SECONDS`, then LRU-evicts any beyond
-`MAX_STOPPED_SESSIONS`. Removal re-reads container state **under the per-session lock** and skips a
-container that has been warmed again — closing a TOCTOU race against in-flight requests.
+**`fs/*` is Python-free and defends a container boundary, not a path prefix.** Content moves via the Docker archive API; search/listing shells out to POSIX `grep`/`find`/`ls`/`rm` (works on `alpine`, no Python). `_validate_sandbox_path` rejects `..`/NUL/newlines and confines to `/workspace`, but is **lexical** — the real trust boundary is the sandbox container (gVisor/non-root), not the prefix. `fs/read` caps at `READ_MAX_OUTPUT_BYTES` (512 KB); `fs/write` is create-only. Outcomes are reported in the 200 body via a structured `error` (`{code, message}`, codes from `FsErrorCode` in `schemas.py`): `not_found` (distinct from empty listing/no-match), `not_a_directory`/`is_a_directory`, `invalid_path`; `fs/delete` reports `removed`. HTTP codes stay reserved for session/transport concerns (404/409/503/403/500).
 
-**Error-status contract (deliberate — keep these distinct).** Missing session → `404`. A Docker fault
-while restarting/stopping an existing container → `SessionUnavailableError` → `503` (retryable infra
-fault, **not** masked as 404). Lock contention → `SessionBusyError` → `409`. Missing/invalid API key →
-`403`.
-
-**`fs/*` is Python-free and defends a container boundary, not a path prefix.** File content moves via
-the Docker archive API; search/listing shells out to POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work
-on minimal images (e.g. `alpine`) with no Python interpreter. `_validate_sandbox_path` rejects `..`, NUL,
-and newlines and confines paths to `/workspace`, but the check is **lexical** — it does not resolve
-symlinks. The real trust boundary is the sandbox container (gVisor / non-root), not the `/workspace`
-prefix. `fs/read` caps a single response at `READ_MAX_OUTPUT_BYTES` (512 KB); `fs/write` is create-only.
-`fs/*` outcomes are reported in the 200 body via a structured `error` object (`{code, message}`,
-codes from `FsErrorCode` in `schemas.py`): absence is `not_found` (distinct from an empty
-listing/no-match), a type mismatch is `not_a_directory`/`is_a_directory`, a malformed path is
-`invalid_path`, and `fs/delete` reports a `removed` boolean. HTTP status codes remain reserved for
-session/transport concerns (404 missing session, 409 lock, 503 infra, 403 auth, 500 unexpected).
-
-**Untrusted-input handling.** Uploaded archives are sanitised before extraction (`_sanitize_archive_stream`):
-symlinks/hardlinks/device nodes/FIFOs and absolute/`..` paths are rejected, ownership is normalised to
-`RUN_UID/RUN_GID`, and the stream spools through a `SpooledTemporaryFile` instead of being buffered whole.
-Run commands execute through a portable `pipefail` wrapper so pipeline exit codes aren't masked, with a
-per-command timeout enforced by `asyncio.wait_for` (timed-out command → exit code `124`, remaining
-commands skipped).
+**Untrusted-input handling.** Archives are sanitised before extraction (`_sanitize_archive_stream`): symlinks/hardlinks/device nodes/FIFOs and absolute/`..` paths rejected, ownership normalised to `RUN_UID/RUN_GID`, stream spooled via `SpooledTemporaryFile`. Run commands use a portable `pipefail` wrapper (pipeline exit codes not masked); per-command timeout via `asyncio.wait_for` (timed-out → exit `124`, remaining commands skipped).
 
 ## Module map (`daiv_sandbox/`)
 
-- `main.py` — FastAPI app, all endpoints, `lifespan` (wires the lock manager + reaper), Sentry init, exception handlers.
-- `sessions.py` — `SandboxDockerSession`: container lifecycle, archive copy/sanitisation, command exec, and the `fs/*` primitives; path constants and `_validate_sandbox_path`.
-- `reaper.py` — background loop that removes stopped session containers (age + LRU, leader-locked).
+- `main.py` — FastAPI app, all endpoints, `lifespan` (wires lock manager + reaper), Sentry init, exception handlers.
+- `sessions.py` — `SandboxDockerSession`: container lifecycle, archive copy/sanitisation, command exec, `fs/*` primitives; path constants and `_validate_sandbox_path`.
+- `reaper.py` — background loop removing stopped session containers (age + LRU, leader-locked).
 - `locks.py` — `NoopSessionLockManager` / `RedisSessionLockManager` and `SessionBusyError`.
 - `config.py` — `settings` singleton (pydantic-settings).
-- `schemas.py` — request/response models.
+- `schemas.py` — request/response models, `FsErrorCode`.
 - `logs.py` — logging configuration.
 
 ## Conventions
 
-- **Config:** all settings come from `DAIV_SANDBOX_`-prefixed env vars (or files in `/run/secrets`) via the
-  `settings` singleton in `config.py`. See the README table for the full list; `DAIV_SANDBOX_API_KEY` is required.
-- **Sandbox containers always run as a non-root user** (`RUN_UID:RUN_GID`); passing `user` to
-  `_start_container` is rejected on purpose.
-- **Ruff:** line length 120, target Python 3.14, `preview = true`. `make lint-fix` before committing.
-- **`CHANGELOG.md`** follows Keep a Changelog and must be updated for any user-facing/functional change.
+- All settings come from `DAIV_SANDBOX_`-prefixed env vars (or files in `/run/secrets`) via the `settings` singleton. `DAIV_SANDBOX_API_KEY` is required.
+- Sandbox containers always run as non-root (`RUN_UID:RUN_GID`); passing `user` to `_start_container` is rejected on purpose.
+- Ruff: line length 120, target Python 3.14, `preview = true`. `make lint-fix` before committing.
+- `CHANGELOG.md` follows Keep a Changelog — update for any user-facing/functional change.
