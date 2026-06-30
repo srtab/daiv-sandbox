@@ -1,12 +1,22 @@
+from __future__ import annotations
+
+import re
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import Base64Bytes, BaseModel, Field, computed_field, model_validator
+from pydantic import Base64Bytes, BaseModel, Field, SecretStr, computed_field, field_validator, model_validator
 
 
 class StartSessionRequest(BaseModel):
     base_image: str = Field(description="Docker image to be used as the base image for the sandbox.")
-    network_enabled: bool = Field(default=False, description="Whether to enable network for the sandbox.")
+    egress: EgressConfigRequest | None = Field(
+        default=None,
+        description=(
+            "Egress policy + secrets. Omit for a network-isolated sandbox (network_mode=none); provide to "
+            "route the sandbox through the per-session egress proxy with this policy. Immutable for the "
+            "session's life."
+        ),
+    )
     environment: dict[str, str] | None = Field(
         default=None, description="Environment variables to set in the container at startup."
     )
@@ -197,3 +207,107 @@ class FsDeleteResponse(BaseModel):
         if self.error is not None and self.removed:
             raise ValueError("removed must be False when an error is present")
         return self
+
+
+# --- Egress proxy wire schemas -----------------------------------------------
+
+
+class EgressRule(BaseModel):
+    host: str = Field(description="Destination host glob (e.g. 'github.com', '*.githubusercontent.com').")
+    methods: list[str] = Field(default_factory=lambda: ["*"], description="Allowed HTTP methods, or ['*'] for any.")
+    inject: str | None = Field(default=None, description="Name of the secret whose header is injected for this host.")
+
+    @field_validator("host", mode="after")
+    @classmethod
+    def _valid_host(cls, value: str) -> str:
+        # The host glob is matched verbatim (lower-cased) against request hosts in the sidecar, so an empty
+        # glob, or one carrying whitespace/control characters, can never match a real host and signals a
+        # malformed rule. Reject it here rather than letting it silently no-op (cf. EgressSecret's guards).
+        if not value or any(c.isspace() or ord(c) < 0x20 for c in value):
+            raise ValueError("host must be a non-empty glob without whitespace or control characters")
+        return value
+
+    @field_validator("methods", mode="after")
+    @classmethod
+    def _upper(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("methods must not be empty; use ['*'] to allow all methods")
+        return [m.upper() for m in value]
+
+
+# RFC 7230 token: the grammar for a header field-name. Used with fullmatch so the whole value must be
+# a token — rejects empty/whitespace names and CR/LF (note `$` would match before a trailing newline,
+# so fullmatch, not `$`), which would otherwise be injected verbatim into the request headers by the
+# sidecar addon and could smuggle additional headers.
+_HEADER_NAME_RE = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
+
+
+class EgressSecret(BaseModel):
+    header: str = Field(description="Header name to set (e.g. 'Authorization', 'PRIVATE-TOKEN').")
+    value: SecretStr = Field(description="Header value; redacted in logs/repr.")
+
+    @field_validator("header", mode="after")
+    @classmethod
+    def _valid_header(cls, value: str) -> str:
+        if not _HEADER_NAME_RE.fullmatch(value):
+            raise ValueError(f"{value!r} is not a valid HTTP header name (RFC 7230 token)")
+        return value
+
+    @field_validator("value", mode="after")
+    @classmethod
+    def _no_control_chars(cls, value: SecretStr) -> SecretStr:
+        # The value is injected verbatim into request headers by the sidecar addon; CR/LF would let an
+        # operator smuggle extra headers. A real credential never contains control characters.
+        if any(c in value.get_secret_value() for c in ("\r", "\n", "\x00")):
+            raise ValueError("header value must not contain control characters (CR, LF, NUL)")
+        return value
+
+
+class EgressPolicy(BaseModel):
+    default: Literal["deny", "allow"] = Field(default="deny", description="Reachability for unlisted hosts.")
+    intercept: Literal["all", "credentialed"] = Field(
+        default="all",
+        description=(
+            "'all' MITMs every reachable host; 'credentialed' MITMs only hosts that inject a credential "
+            "or carry a per-host methods restriction (others are tunnelled untouched)."
+        ),
+    )
+    rules: list[EgressRule] = Field(default_factory=list)
+
+
+class EgressConfigRequest(BaseModel):
+    policy: EgressPolicy = Field(default_factory=EgressPolicy)
+    secrets: dict[str, EgressSecret] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _permits_something(self) -> EgressConfigRequest:
+        # An egress block must be able to permit *something*; a deny-default with no rules is the old
+        # "enabled but deny-all" degenerate state. Omit `egress` entirely for no-network, or use
+        # default="allow". Rejecting it here yields a 422 at the /session/ boundary automatically.
+        if self.policy.default == "deny" and not self.policy.rules:
+            raise ValueError(
+                "egress policy permits nothing: a deny-default policy needs at least one rule "
+                "(omit `egress` for a network-isolated sandbox, or set policy.default='allow')"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _injects_resolve(self) -> EgressConfigRequest:
+        for rule in self.policy.rules:
+            if rule.inject is not None and rule.inject not in self.secrets:
+                raise ValueError(f"rule for host {rule.host!r} references unknown secret {rule.inject!r}")
+        return self
+
+    def to_sidecar_config(self) -> dict:
+        """Project the validated request into the ``{"policy": ..., "secrets": ...}`` dict the sidecar
+        parser (PolicyEvaluator.from_config) reads. Single authority for the wire->sidecar shape and
+        the only place SecretStr values are deliberately unwrapped — keep this in sync with from_config."""
+        return {
+            "policy": self.policy.model_dump(),
+            "secrets": {
+                name: {"header": s.header, "value": s.value.get_secret_value()} for name, s in self.secrets.items()
+            },
+        }
+
+
+StartSessionRequest.model_rebuild()

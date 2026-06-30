@@ -1,11 +1,18 @@
+import asyncio
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from docker.errors import APIError, NotFound
 
 from daiv_sandbox.locks import NoopSessionLockManager, SessionBusyError
-from daiv_sandbox.reaper import _list_stopped_sandbox_containers, _parse_docker_timestamp, _reap_once, _remove_guarded
-from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, TYPE_CMD_EXECUTOR
+from daiv_sandbox.reaper import (
+    _list_stopped_sandbox_containers,
+    _parse_docker_timestamp,
+    _reap_once,
+    _reap_orphan_triads,
+    _remove_guarded,
+)
+from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, EGRESS_SESSION_LABEL, TYPE_CMD_EXECUTOR, TYPE_EGRESS_PROXY
 
 
 def test_parse_nanosecond_timestamp_truncates_to_micros():
@@ -46,7 +53,7 @@ def test_list_stopped_filters_out_running():
 
 
 def _stopped_container(cid: str, finished_at: str):
-    return Mock(id=cid, status="exited", attrs={"State": {"FinishedAt": finished_at}}, remove=Mock())
+    return Mock(id=cid, status="exited", labels={}, attrs={"State": {"FinishedAt": finished_at}}, remove=Mock())
 
 
 class _BusyLockManager:
@@ -117,6 +124,7 @@ async def test_reap_once_removes_only_aged_out():
     fresh = _stopped_container("fresh", "2026-06-01T11:59:00Z")  # 1m before NOW
     client = Mock()
     client.containers.list.return_value = [old, fresh]
+    client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
     await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=50)
 
@@ -131,6 +139,7 @@ async def test_reap_once_lru_evicts_oldest_beyond_cap():
     c3 = _stopped_container("c3", "2026-06-01T11:50:00Z")
     client = Mock()
     client.containers.list.return_value = [c3, c1, c2]  # unsorted on purpose
+    client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
     await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=1)
 
@@ -145,6 +154,7 @@ async def test_reap_once_max_stopped_zero_evicts_all():
     c2 = _stopped_container("c2", "2026-06-01T11:30:00Z")  # within grace
     client = Mock()
     client.containers.list.return_value = [c1, c2]
+    client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
     await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=0)
 
@@ -152,14 +162,26 @@ async def test_reap_once_max_stopped_zero_evicts_all():
     c2.remove.assert_called_once_with(force=True)
 
 
+async def test_reap_once_always_runs_orphan_sweep():
+    """The orphan-triad sweep is wired into every _reap_once tick (no longer gated on egress being
+    configured), so a triad stranded after an operator disables egress is still reclaimed. The sweep's own
+    teardown behavior is covered by the test_reap_orphan_triads_* tests below."""
+    client = Mock()
+    client.containers.list.return_value = []
+    with patch("daiv_sandbox.reaper._reap_orphan_triads", new=AsyncMock()) as sweep:
+        await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=50)
+    sweep.assert_awaited_once_with(client, now=NOW, grace_seconds=43200)
+
+
 async def test_maybe_reap_runs_directly_without_redis():
     client = Mock()
     client.containers.list.return_value = []
+    client.networks.list.return_value = []
     # redis=None -> no leader lock, sweep runs inline (no exception, list consulted).
     from daiv_sandbox.reaper import _maybe_reap
 
     await _maybe_reap(client, None, NoopSessionLockManager(), grace_seconds=43200, max_stopped=50)
-    client.containers.list.assert_called_once()
+    client.containers.list.assert_called()
 
 
 async def test_maybe_reap_skips_when_not_leader():
@@ -185,3 +207,107 @@ def test_start_reaper_returns_none_when_disabled(monkeypatch):
     monkeypatch.setattr(cfg, "REAPER_ENABLED", False)
     app = Mock()
     assert reaper.start_reaper(app) is None
+
+
+class _Noop:
+    def acquire(self, _id):
+        class _Ctx:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *a):
+                return False
+
+        return _Ctx()
+
+
+def test_reaper_tears_down_triad_for_egress_sandbox():
+    """Reaper tears down the egress triad after force-removing an egress sandbox container."""
+    container = MagicMock(id="sbx", status="exited", labels={"daiv.sandbox.egress": "tok123"})
+    with patch("daiv_sandbox.reaper.EgressProxyManager") as mock_mgr_class:
+        asyncio.run(_remove_guarded(container, _Noop()))
+        mock_mgr_class.return_value.teardown.assert_called_once_with("tok123")
+        container.remove.assert_called_once_with(force=True)
+
+
+# --- Orphan egress triad sweep ------------------------------------------------
+
+_OLD = "2026-05-31T00:00:00Z"  # >12h before NOW
+_FRESH = "2026-06-01T11:59:00Z"  # 1m before NOW
+
+
+def _egress_client(*, proxies=(), cmd_execs=(), networks=()):
+    """A Mock client that routes containers.list by its label filter (egress proxies vs cmd-executors)."""
+
+    def _containers_list(all=True, filters=None):  # noqa: A002 - mirrors docker SDK kwarg name
+        label = (filters or {}).get("label")
+        if label == f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_EGRESS_PROXY}":
+            return list(proxies)
+        if label == f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}":
+            return list(cmd_execs)
+        return []
+
+    client = MagicMock()
+    client.containers.list.side_effect = _containers_list
+    client.networks.list.return_value = list(networks)
+    return client
+
+
+def _proxy(token, created):
+    return MagicMock(labels={EGRESS_SESSION_LABEL: token}, attrs={"Created": created})
+
+
+def _cmd(token):
+    return MagicMock(labels={EGRESS_SESSION_LABEL: token} if token else {})
+
+
+def _net(token, created):
+    return MagicMock(attrs={"Created": created, "Labels": {EGRESS_SESSION_LABEL: token}})
+
+
+async def test_reap_orphan_triads_tears_down_unreferenced_token():
+    """An egress proxy whose token no cmd-executor carries is an orphan and must be torn down."""
+    client = _egress_client(proxies=[_proxy("orphan", _OLD)])
+    with patch("daiv_sandbox.reaper.EgressProxyManager") as mgr_cls:
+        await _reap_orphan_triads(client, now=NOW, grace_seconds=43200)
+    mgr_cls.return_value.teardown.assert_called_once_with("orphan")
+
+
+async def test_reap_orphan_triads_keeps_referenced_token():
+    """A triad whose token is carried by a (stopped or running) cmd-executor is in use — keep it."""
+    client = _egress_client(proxies=[_proxy("live", _OLD)], cmd_execs=[_cmd("live")])
+    with patch("daiv_sandbox.reaper.EgressProxyManager") as mgr_cls:
+        await _reap_orphan_triads(client, now=NOW, grace_seconds=43200)
+    mgr_cls.return_value.teardown.assert_not_called()
+
+
+async def test_reap_orphan_triads_skips_recent_token():
+    """A triad built during an in-flight start (cmd-executor not yet created/labelled) must not be
+    reaped: only resources older than the grace window are swept, closing the mid-start TOCTOU."""
+    client = _egress_client(proxies=[_proxy("starting", _FRESH)])
+    with patch("daiv_sandbox.reaper.EgressProxyManager") as mgr_cls:
+        await _reap_orphan_triads(client, now=NOW, grace_seconds=43200)
+    mgr_cls.return_value.teardown.assert_not_called()
+
+
+async def test_reap_orphan_triads_reaps_network_only_orphan():
+    """A lingering internal network whose proxy is already gone is also reclaimed by token."""
+    client = _egress_client(networks=[_net("netonly", _OLD)])
+    with patch("daiv_sandbox.reaper.EgressProxyManager") as mgr_cls:
+        await _reap_orphan_triads(client, now=NOW, grace_seconds=43200)
+    mgr_cls.return_value.teardown.assert_called_once_with("netonly")
+
+
+async def test_reap_orphan_triads_continues_when_one_teardown_fails():
+    """A teardown that faults for one orphan must not abort the sweep — the others are still reclaimed
+    (the reaper is the resilient backstop; one wedged orphan can't starve the rest every tick)."""
+    client = _egress_client(proxies=[_proxy("bad", _OLD), _proxy("good", _OLD)])
+
+    def _teardown(tok):
+        if tok == "bad":
+            raise APIError("daemon busy")
+
+    with patch("daiv_sandbox.reaper.EgressProxyManager") as mgr_cls:
+        mgr_cls.return_value.teardown.side_effect = _teardown
+        await _reap_orphan_triads(client, now=NOW, grace_seconds=43200)
+    assert mgr_cls.return_value.teardown.call_count == 2  # both attempted despite "bad" raising

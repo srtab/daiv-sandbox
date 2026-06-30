@@ -1,7 +1,7 @@
 import warnings
 from typing import Annotated, Literal
 
-from pydantic import Field, HttpUrl, SecretStr, field_validator  # noqa: TC002
+from pydantic import Field, HttpUrl, SecretStr, field_validator, model_validator  # noqa: TC002
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 warnings.filterwarnings(
@@ -38,20 +38,29 @@ class Settings(BaseSettings):
     RUN_UID: int = 1000
     RUN_GID: int = 1000
     COMMAND_TIMEOUT: int = Field(default=0, ge=0)  # per-command timeout in seconds; 0 = no timeout
-    # Network attached to cmd-executor containers when a session is network-enabled. None -> Docker's
-    # default bridge (no compose-service DNS). Set to a compose/user-defined network (e.g.
-    # "daiv_default") so containers can resolve & reach sibling services like "gitlab:8929".
+    # Upstream network for the egress sidecar's second NIC (its route to the internet). The sandbox
+    # is never attached to this network directly — a session that carries an egress block reaches the
+    # internet only through the proxy. None -> EGRESS_PROXY_NETWORK falls back here, then to Docker's default bridge.
     NETWORK: str | None = None
-    # DNS resolvers written into a network-enabled cmd-executor's /etc/resolv.conf under the gVisor
-    # (runsc) runtime. gVisor's netstack can't reach the embedded Docker resolver (127.0.0.11) that a
-    # user-defined NETWORK injects, so name resolution is pointed at real upstreams instead. Ignored
-    # under runc (its embedded resolver works). Comma-separated env value, e.g. "1.1.1.1,8.8.8.8".
-    DNS: Annotated[list[str], NoDecode] = ["1.1.1.1", "8.8.8.8"]
-    # Sibling service hostnames (comma-separated, e.g. "gitlab") resolved at session start and injected
-    # as static /etc/hosts entries in network-enabled gVisor cmd-executors. This restores the
-    # compose-service name resolution that overriding resolv.conf (see DNS) would otherwise drop.
-    # Ignored under runc. Names that fail to resolve are skipped with a warning.
-    EXTRA_HOSTS: Annotated[list[str], NoDecode] = []
+    # Egress proxy (per-session MITM sidecar). Egress is enabled by configuring the shared CA
+    # (EGRESS_CA_CERT_FILE + EGRESS_CA_KEY_FILE); when configured, a session created with an egress block is
+    # built as a triad (internal network + mitmdump sidecar + sandbox) and the sandbox reaches the
+    # internet only through the sidecar. A POST /session/ carrying an egress block without the CA is rejected (400).
+    # See the "Network Egress Proxy" section of the README.
+    EGRESS_PROXY_IMAGE: str = "ghcr.io/srtab/daiv-sandbox-egress:latest"
+    EGRESS_PROXY_PORT: int = Field(default=8080, gt=0)
+    # The sidecar runs trusted code (not untrusted), so it stays on runc even when sandboxes use runsc;
+    # runc also avoids gVisor's embedded-DNS quirks for the proxy's own upstream resolution.
+    EGRESS_PROXY_RUNTIME: Literal["runc", "runsc"] = "runc"
+    # Egress-side network the sidecar's second NIC joins for upstream. None -> fall back to NETWORK,
+    # then Docker's default bridge.
+    EGRESS_PROXY_NETWORK: str | None = None
+    EGRESS_PROXY_MEMORY_BYTES: int | None = Field(default=None, gt=0)
+    EGRESS_PROXY_CPUS: float | None = Field(default=None, gt=0)
+    # Shared CA used for MITM: cert is installed into every sandbox; key is given to sidecars only.
+    # Paths are read at use time (typically files under /run/secrets).
+    EGRESS_CA_CERT_FILE: str | None = None
+    EGRESS_CA_KEY_FILE: str | None = None
     # Directory basenames/globs pruned by default from fs/glob and fs/grep traversals (comma-separated
     # env, e.g. ".git,__pycache__"). These are caches, IDE/VCS metadata, and build output that is never
     # hand-authored source and never dependency *source* — matching is basename-based via `find -name`,
@@ -94,13 +103,30 @@ class Settings(BaseSettings):
         "obj",
     ]
 
-    @field_validator("DNS", "EXTRA_HOSTS", "FS_PRUNE_DIRS", mode="before")
+    @field_validator("FS_PRUNE_DIRS", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:
-        """Accept comma-separated env strings (e.g. "1.1.1.1,8.8.8.8") for list settings."""
+        """Accept comma-separated env strings (e.g. ".git,node_modules,__pycache__") for list settings."""
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @model_validator(mode="after")
+    def _validate_egress_ca_pair(self) -> Settings:
+        """The shared egress CA is all-or-nothing: cert without key (or vice versa) can never
+        build a working sidecar, so reject the half-configured state loudly at startup instead
+        of silently disabling network egress."""
+        if bool(self.EGRESS_CA_CERT_FILE) != bool(self.EGRESS_CA_KEY_FILE):
+            raise ValueError(
+                "EGRESS_CA_CERT_FILE and EGRESS_CA_KEY_FILE must be set together (both to enable egress, or neither)."
+            )
+        return self
+
+    @property
+    def egress_enabled(self) -> bool:
+        """Egress is available iff the shared CA (cert + key) is configured. Network-enabled
+        sessions require it; there is no direct-network attach to a sandbox."""
+        return bool(self.EGRESS_CA_CERT_FILE and self.EGRESS_CA_KEY_FILE)
 
     # Session locking
     REDIS_URL: str | None = None

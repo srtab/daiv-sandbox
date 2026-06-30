@@ -1,0 +1,168 @@
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from docker.errors import NotFound
+
+from daiv_sandbox.config import settings
+from daiv_sandbox.egress.constants import CA_PATH, CONFIG_DIR
+from daiv_sandbox.sessions import (
+    DAIV_SANDBOX_TYPE_LABEL,
+    EGRESS_SESSION_LABEL,
+    SANDBOX_CA_BUNDLE,
+    TYPE_EGRESS_NETWORK,
+    TYPE_EGRESS_PROXY,
+    _build_single_file_tar_stream,
+)
+
+if TYPE_CHECKING:
+    from docker import DockerClient
+    from docker.models.containers import Container
+
+logger = logging.getLogger("daiv_sandbox.egress")
+
+
+def exec_proxy_env(proxy_ip: str, port: int) -> dict[str, str]:
+    """Env injected into sandbox execs so clients route through the proxy and trust the CA bundle."""
+    url = f"http://{proxy_ip}:{port}"
+    return {
+        "HTTP_PROXY": url,
+        "HTTPS_PROXY": url,
+        "http_proxy": url,
+        "https_proxy": url,
+        "ALL_PROXY": url,
+        "NODE_EXTRA_CA_CERTS": SANDBOX_CA_BUNDLE,
+        "GIT_SSL_CAINFO": SANDBOX_CA_BUNDLE,
+        "REQUESTS_CA_BUNDLE": SANDBOX_CA_BUNDLE,
+        "CURL_CA_BUNDLE": SANDBOX_CA_BUNDLE,
+        "SSL_CERT_FILE": SANDBOX_CA_BUNDLE,
+        "PIP_CERT": SANDBOX_CA_BUNDLE,
+    }
+
+
+def _egress_network_name() -> str:
+    return settings.EGRESS_PROXY_NETWORK or settings.NETWORK or "bridge"
+
+
+class EgressProxyManager:
+    def __init__(self, client: DockerClient):
+        self.client = client
+
+    @staticmethod
+    def _internal_network_name(token: str) -> str:
+        """The per-session internal network name. Single source of truth so callers that need to
+        resolve the proxy's IP on it (see proxy_internal_ip) can't drift from create_network."""
+        return f"daiv-egress-{token}"
+
+    def create_network(self, token: str) -> str:
+        name = self._internal_network_name(token)
+        self.client.networks.create(
+            name=name,
+            driver="bridge",
+            internal=True,  # no gateway: the sandbox's only route out is the proxy
+            labels={DAIV_SANDBOX_TYPE_LABEL: TYPE_EGRESS_NETWORK, EGRESS_SESSION_LABEL: token},
+        )
+        return name
+
+    def start_proxy(self, token: str, network_name: str, ca_pem: bytes) -> Container:
+        labels = {DAIV_SANDBOX_TYPE_LABEL: TYPE_EGRESS_PROXY, EGRESS_SESSION_LABEL: token}
+        # The mitmproxy image's docker-entrypoint.sh must start as root: it runs `usermod` to align the
+        # `mitmproxy` user to the confdir owner, then `gosu mitmproxy` to drop privileges. The proxy
+        # process therefore runs non-root as the image's `mitmproxy` user (uid 1000 = RUN_UID default).
+        # Pinning `user=RUN_UID:RUN_GID` here would defeat the entrypoint's own privilege drop (gosu
+        # needs root) and the container exits with "failed switching to mitmproxy: operation not
+        # permitted". The non-root guarantee is met by the entrypoint, not by a create-time `user=`.
+        create_kwargs: dict = {
+            "image": settings.EGRESS_PROXY_IMAGE,
+            "detach": True,
+            "labels": labels,
+            "network": network_name,  # internal NIC
+            "runtime": settings.EGRESS_PROXY_RUNTIME,
+        }
+        if settings.EGRESS_PROXY_MEMORY_BYTES:
+            create_kwargs["mem_limit"] = settings.EGRESS_PROXY_MEMORY_BYTES
+        if settings.EGRESS_PROXY_CPUS:
+            create_kwargs["nano_cpus"] = int(settings.EGRESS_PROXY_CPUS * 1e9)
+
+        proxy = self.client.containers.create(**create_kwargs)
+        # Self-cleaning: any failure between create and a successful start must remove the just-created
+        # container, so this never leaks even when a caller forgot to wrap it in teardown (the caller's
+        # teardown then becomes belt-and-suspenders rather than the only safety net).
+        try:
+            # Second NIC for upstream egress.
+            self.client.networks.get(_egress_network_name()).connect(proxy)
+            # Inject the combined CA PEM into the confdir before the process starts (created, not running,
+            # so this lands in the writable layer mitmdump reads at boot). The proxy runs as RUN_UID, so the
+            # member is owned by that user — otherwise a root-owned file would be unreadable to mitmdump.
+            parent, _, filename = CA_PATH.rpartition("/")
+            with _build_single_file_tar_stream(
+                filename, ca_pem, mode=0o600, uid=settings.RUN_UID, gid=settings.RUN_GID
+            ) as tar:
+                # put_archive returns False (it does not always raise) when the daemon rejects the copy.
+                # Fail closed: a proxy booted without the configured CA would silently fall back to its own
+                # self-generated CA, which the sandbox does not trust.
+                if not proxy.put_archive(parent, tar):
+                    raise RuntimeError(f"egress: failed to inject CA into sidecar confdir for {token}")
+            proxy.start()
+        except Exception:
+            try:
+                proxy.remove(force=True)
+            except NotFound:
+                pass
+            except Exception:
+                logger.exception("egress: failed to clean up partially-created proxy for token %s", token)
+            raise
+        logger.info("egress: started proxy %s for token %s", proxy.short_id, token)
+        return proxy
+
+    def proxy_internal_ip(self, token: str) -> str:
+        network_name = self._internal_network_name(token)
+        proxy = self._proxy(token)
+        proxy.reload()
+        nets = proxy.attrs["NetworkSettings"]["Networks"]
+        ip = nets.get(network_name, {}).get("IPAddress")
+        if not ip:
+            raise RuntimeError(f"egress: proxy for {token} has no IP on {network_name}")
+        return ip
+
+    def provision(self, token: str, config_bytes: bytes) -> None:
+        """Write the config JSON into the running proxy; the addon reloads it on mtime change."""
+        proxy = self._proxy(token)
+        # config.json holds secrets, so keep mode 0o600 and own it by the proxy user (RUN_UID) so the
+        # non-root mitmdump process can read it; a root-owned 0o600 file would deny-fail closed.
+        with _build_single_file_tar_stream(
+            "config.json", config_bytes, mode=0o600, uid=settings.RUN_UID, gid=settings.RUN_GID
+        ) as tar:
+            if not proxy.put_archive(CONFIG_DIR, tar):
+                raise RuntimeError(f"egress: failed to provision config for {token}")
+
+    def teardown(self, token: str) -> None:
+        # Best-effort: an already-gone resource (NotFound) is success; any other failure is logged and
+        # swallowed so one stuck resource never masks the caller's original error or skips the rest of
+        # the cleanup (the reaper retries on the next sweep).
+        for proxy in self._list(TYPE_EGRESS_PROXY, token):
+            try:
+                proxy.remove(force=True)
+            except NotFound:
+                pass
+            except Exception:
+                logger.exception("egress: failed to remove proxy %s", getattr(proxy, "short_id", "?"))
+        for net in self.client.networks.list(filters={"label": f"{EGRESS_SESSION_LABEL}={token}"}):
+            try:
+                net.remove()
+            except NotFound:
+                pass
+            except Exception:
+                logger.exception("egress: failed to remove network %s", getattr(net, "name", "?"))
+
+    def _list(self, type_label: str, token: str) -> list:
+        return self.client.containers.list(
+            all=True, filters={"label": [f"{DAIV_SANDBOX_TYPE_LABEL}={type_label}", f"{EGRESS_SESSION_LABEL}={token}"]}
+        )
+
+    def _proxy(self, token: str) -> Container:
+        proxies = self._list(TYPE_EGRESS_PROXY, token)
+        if not proxies:
+            raise NotFound(f"egress: no proxy for token {token}")
+        return proxies[0]

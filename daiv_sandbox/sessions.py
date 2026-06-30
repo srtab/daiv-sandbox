@@ -4,7 +4,6 @@ import fnmatch
 import io
 import logging
 import posixpath
-import socket
 import tarfile
 import tempfile
 import threading
@@ -32,6 +31,28 @@ SCRATCH_ROOT = "/workspace/tmp"
 # Container label identifying daiv-sandbox cmd-executor containers (used for discovery/reaping).
 DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
 TYPE_CMD_EXECUTOR = "cmd_executor"
+TYPE_EGRESS_PROXY = "egress_proxy"
+TYPE_EGRESS_NETWORK = "egress_network"
+# Links a sandbox to its egress proxy + network (all three carry the same token value).
+EGRESS_SESSION_LABEL = "daiv.sandbox.egress"
+
+
+def egress_token(resource: Container | None) -> str | None:
+    """The egress session token from a triad resource's labels, or None if it carries none.
+
+    Works for both containers (which expose ``.labels``) and Docker networks (which expose labels only
+    via ``attrs['Labels']``), so the reaper can read the token off any triad resource with one helper.
+    """
+    labels = getattr(resource, "labels", None)
+    if not isinstance(labels, dict):  # networks have no `.labels`; fall back to inspect output
+        labels = (getattr(resource, "attrs", None) or {}).get("Labels") or {}
+    return labels.get(EGRESS_SESSION_LABEL)
+
+
+# Where the shared egress CA cert is installed inside a sandbox, and the system bundle the language
+# runtime env vars point at after update-ca-certificates folds the cert in.
+SANDBOX_CA_PATH = "/usr/local/share/ca-certificates/daiv-egress.crt"
+SANDBOX_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 
 class SessionUnavailableError(RuntimeError):
@@ -172,13 +193,18 @@ _SINGLE_FILE_TAR_SPOOL_LIMIT = 1 << 20  # 1 MiB
 _SANITIZED_ARCHIVE_SPOOL_LIMIT = 8 << 20  # 8 MiB — sanitized seed archives spill past this
 
 
-def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int) -> IO[bytes]:
+def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int, uid: int = 0, gid: int = 0) -> IO[bytes]:
     """
     Build an uncompressed tar containing one regular-file member.
 
     Returns a seekable file-like object positioned at offset 0. Small archives stay
     in memory; larger ones spill to disk. Caller owns the stream and must close it
     (use as a context manager).
+
+    ``uid``/``gid`` set the member's ownership; they default to root (0/0) so existing
+    callers are unchanged. Callers extracting into a container that reads the file as a
+    non-root user (e.g. the egress proxy running as RUN_UID) must pass that uid/gid so the
+    extracted file is owned by — and readable by — that user.
     """
     stream = tempfile.SpooledTemporaryFile(max_size=_SINGLE_FILE_TAR_SPOOL_LIMIT)  # noqa: SIM115
     try:
@@ -187,6 +213,8 @@ def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int) -
             info.size = len(content)
             info.mode = mode & 0o7777
             info.type = tarfile.REGTYPE
+            info.uid = uid
+            info.gid = gid
             tf.addfile(info, io.BytesIO(content))
         stream.seek(0)
     except BaseException:
@@ -454,6 +482,7 @@ class SandboxDockerSession:
         self.session_id: str | None = session_id
         self.client: DockerClient = client or self._get_shared_client()
         self.container: Container | None = self._get_container(session_id) if session_id else None
+        self._egress_env_cache: dict[str, str] | None = None
 
     @classmethod
     def ping(cls, *, client: DockerClient | None = None) -> bool:
@@ -516,16 +545,6 @@ class SandboxDockerSession:
         if "user" in kwargs:
             raise ValueError("Sandbox containers always run as a non-root user; overriding `user` is not allowed.")
 
-        # gVisor's netstack can't reach Docker's embedded DNS resolver (127.0.0.11) that a user-defined
-        # network injects, so a cmd-executor attached to one resolves nothing. When that's the case,
-        # resolve sibling services ourselves and inject them as static /etc/hosts entries, then (after
-        # start) point resolv.conf at real upstreams. runc honours the embedded resolver, so it needs none
-        # of this; and without an explicit `network` (Docker's default bridge) resolv.conf already carries
-        # real upstreams, so the gVisor failure mode doesn't apply.
-        fix_gvisor_dns = bool(kwargs.get("network")) and settings.RUNTIME == "runsc"
-        if fix_gvisor_dns and settings.EXTRA_HOSTS:
-            kwargs.setdefault("extra_hosts", {}).update(self._resolve_extra_hosts(settings.EXTRA_HOSTS))
-
         container = self.client.containers.run(
             image,
             entrypoint="/bin/sh",
@@ -561,46 +580,12 @@ class SandboxDockerSession:
                     f"(exit_code: {chown_result.exit_code}) -> {chown_result.output}"
                 )
 
-            if fix_gvisor_dns:
-                self._override_resolv_conf(container, settings.DNS)
         except Exception:
             try:
                 container.remove(force=True)
             except Exception:
                 logger.warning("Failed to remove container %s after bootstrap failure", container.short_id)
             raise
-
-    def _resolve_extra_hosts(self, hostnames: list[str]) -> dict[str, str]:
-        """Resolve sibling-service names to IPs for injection as static cmd-executor /etc/hosts entries.
-
-        gVisor cmd-executors can't use Docker's embedded DNS (127.0.0.11), so compose-service names
-        (e.g. "gitlab") are pinned in /etc/hosts instead. The daiv-sandbox service container itself runs
-        under the default runtime on the same network, so its own resolver maps these names to the IPs
-        the executor will reach. Unresolvable names are skipped with a warning rather than failing the
-        whole session start.
-        """
-        resolved: dict[str, str] = {}
-        for name in hostnames:
-            try:
-                resolved[name] = socket.gethostbyname(name)
-            except OSError:
-                logger.warning("Could not resolve sibling host %r for cmd-executor /etc/hosts; skipping", name)
-        return resolved
-
-    def _override_resolv_conf(self, container: Container, nameservers: list[str]) -> None:
-        """Repoint a cmd-executor's DNS at real upstream resolvers.
-
-        gVisor's netstack can't reach the embedded Docker resolver (127.0.0.11) that user-defined
-        networks inject, so name resolution fails outright. Overwrite resolv.conf with real recursive
-        resolvers; sibling-service names are handled separately via static /etc/hosts entries.
-        """
-        content = "".join(f"nameserver {ns}\n" for ns in nameservers)
-        result = container.exec_run(["sh", "-c", f"printf '%s' {_sh_quote(content)} > /etc/resolv.conf"], user="root")
-        if result.exit_code != 0:
-            raise RuntimeError(
-                f"Failed to override resolv.conf in {container.short_id}: "
-                f"(exit_code: {result.exit_code}) -> {result.output}"
-            )
 
     def remove_container(self):
         """
@@ -704,6 +689,24 @@ class SandboxDockerSession:
         # used to walk the whole extracted tree — thousands of files for a large seed — were therefore
         # redundant and have been removed. (The archive also rejects symlinks/hardlinks, so nothing
         # in it can point outside the tree.)
+
+    def install_ca_cert(self, cert_pem: bytes) -> None:
+        """Install the egress CA cert into the sandbox trust store. Fail closed (raise) on any error.
+
+        Ships the cert as root via the archive API, then runs update-ca-certificates (Debian/Ubuntu/
+        Alpine). Used only for egress-enabled sessions; a failure must abort session start rather than
+        leave a sandbox whose every HTTPS call breaks.
+        """
+        parent, _, filename = SANDBOX_CA_PATH.rpartition("/")
+        mkdir = self.container.exec_run(["mkdir", "-p", "--", parent], user="root")
+        if mkdir.exit_code != 0:
+            raise RuntimeError(f"egress: failed to create CA dir {parent}: {mkdir.output!r}")
+        with _build_single_file_tar_stream(filename, cert_pem, mode=0o644) as tar:
+            if not self.container.put_archive(parent, tar):
+                raise RuntimeError(f"egress: failed to copy CA cert to {parent}")
+        result = self.container.exec_run(["update-ca-certificates"], user="root")
+        if result.exit_code != 0:
+            raise RuntimeError(f"egress: update-ca-certificates failed (exit {result.exit_code}): {result.output!r}")
 
     def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
         """
@@ -1065,13 +1068,46 @@ class SandboxDockerSession:
         This avoids failures when HOME is unset, set to '/', or non-writable.
         """
         home = SANDBOX_HOME
-        return {
+        base = {
             "HOME": home,
             "XDG_CACHE_HOME": f"{home}/.cache",
             "XDG_CONFIG_HOME": f"{home}/.config",
             "XDG_STATE_HOME": f"{home}/.local/state",
             "XDG_DATA_HOME": f"{home}/.local/share",
         }
+        return {**base, **self._egress_environment()}
+
+    def _egress_environment(self) -> dict[str, str]:
+        """Refresh the proxy + CA env for an egress-enabled session, or {} otherwise.
+
+        The *authoritative* proxy env (HTTP(S)_PROXY + CA paths) is baked into the container at create
+        time (see start_session) and is inherited by every exec; this method only refreshes it from the
+        running sidecar so a command sees a current proxy IP. The IP is stable across warm restarts (a
+        non-force DELETE stops only the sandbox and leaves the sidecar running), so the refresh normally
+        returns the same value the container already carries.
+
+        A *successful* resolution — and the stable "this session has no egress" case — is cached on the
+        instance. A failed resolution returns {} for this call, which leaves the baked create-time env in
+        force (egress is not lost) rather than overriding it with a half-set proxy; it is NOT cached, so a
+        later command in the same request retries the refresh instead of pinning an empty override.
+        """
+        if self._egress_env_cache is not None:
+            return self._egress_env_cache
+        token = egress_token(self.container)
+        if not (settings.egress_enabled and token):
+            self._egress_env_cache = {}  # no egress for this session: stable, safe to cache
+            return self._egress_env_cache
+        try:
+            from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
+
+            mgr = EgressProxyManager(self.client)
+            ip = mgr.proxy_internal_ip(token)
+            env = exec_proxy_env(ip, settings.EGRESS_PROXY_PORT)
+        except Exception:
+            logger.exception("egress: could not resolve proxy endpoint for session %s", self.session_id)
+            return {}  # transient: do not cache, so a later command retries
+        self._egress_env_cache = env
+        return env
 
     def _get_container(self, session_id: str) -> Container | None:
         """

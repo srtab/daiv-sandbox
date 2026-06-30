@@ -1,12 +1,16 @@
 import asyncio
 import base64
 import glob
+import json
 import logging
 import re
+import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import sentry_sdk
+from docker.errors import NotFound
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, UploadFile, status
 from fastapi import Path as FastAPIPath
 from fastapi.responses import JSONResponse
@@ -15,6 +19,7 @@ from redis.asyncio import Redis
 
 from daiv_sandbox import __version__
 from daiv_sandbox.config import settings
+from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, SessionBusyError
 from daiv_sandbox.logs import LOGGING_CONFIG
 from daiv_sandbox.reaper import start_reaper
@@ -46,6 +51,7 @@ from daiv_sandbox.schemas import (
 )
 from daiv_sandbox.sessions import (
     DAIV_SANDBOX_TYPE_LABEL,
+    EGRESS_SESSION_LABEL,
     SANDBOX_HOME,
     SANDBOX_ROOT,
     SKILLS_ROOT,
@@ -55,6 +61,7 @@ from daiv_sandbox.sessions import (
     SandboxDockerSession,
     SessionUnavailableError,
     _validate_sandbox_path,
+    egress_token,
 )
 
 if TYPE_CHECKING:
@@ -214,28 +221,102 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
     This session ID ensures a consistent execution environment for the commands, including files and directories.
     """
     cmd_executor_labels = {DAIV_SANDBOX_TYPE_LABEL: TYPE_CMD_EXECUTOR}
-
-    cmd_executor_kwargs = {}
-
-    if not request.network_enabled:
-        cmd_executor_kwargs["network_mode"] = "none"
-    elif settings.NETWORK:
-        cmd_executor_kwargs["network"] = settings.NETWORK
-
-    if request.environment:
-        cmd_executor_kwargs["environment"] = request.environment
+    cmd_executor_kwargs: dict = {}
 
     if request.memory_bytes:
         cmd_executor_kwargs["mem_limit"] = request.memory_bytes
-
     if request.cpus:
         cmd_executor_kwargs["cpus"] = request.cpus
 
-    cmd_executor = await asyncio.to_thread(
-        SandboxDockerSession.start, image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
-    )
-    if cmd_executor.session_id is None:
-        raise RuntimeError("Started session is missing a session ID")
+    # Caller-supplied environment is ALWAYS applied to the sandbox, egress or not. When egress is
+    # enabled the proxy/CA vars are layered on top (below) and win on collision — so a caller can't
+    # redirect the proxy — but the caller's own variables are never dropped: egress augments the
+    # environment, it does not replace it.
+    if request.environment:
+        cmd_executor_kwargs["environment"] = dict(request.environment)
+
+    use_egress = request.egress is not None
+
+    if request.egress is None:
+        cmd_executor_kwargs["network_mode"] = "none"
+    else:
+        # Network access exists only through the per-session egress proxy (internal network + sidecar).
+        # Egress is mandatory — there is no direct-network attach. Reject up front if the proxy isn't
+        # configured (no shared CA) rather than silently attaching a policy-less network.
+        if not settings.egress_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="egress requires the egress proxy, which is not configured on this deployment",
+            )
+        token = uuid.uuid4().hex[:12]
+        try:
+            ca_cert = Path(settings.EGRESS_CA_CERT_FILE).read_bytes()
+            ca_combined = Path(settings.EGRESS_CA_KEY_FILE).read_bytes() + b"\n" + ca_cert
+        except OSError as exc:
+            logger.error("Egress proxy: cannot read EGRESS CA files: %s", exc)
+            raise HTTPException(
+                status_code=500, detail="Egress proxy configured but EGRESS CA files could not be read"
+            ) from exc
+        manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
+        try:
+            network_name = await asyncio.to_thread(manager.create_network, token)
+            await asyncio.to_thread(manager.start_proxy, token, network_name, ca_combined)
+            proxy_ip = await asyncio.to_thread(manager.proxy_internal_ip, token)
+            cmd_executor_labels[EGRESS_SESSION_LABEL] = token
+            cmd_executor_kwargs["network"] = network_name
+            cmd_executor_kwargs["environment"] = {
+                **cmd_executor_kwargs.get("environment", {}),
+                **exec_proxy_env(proxy_ip, settings.EGRESS_PROXY_PORT),
+            }
+        except Exception as exc:
+            logger.exception("Egress proxy: triad failed to start for token %s", token)
+            await asyncio.to_thread(manager.teardown, token)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Egress proxy failed to start"
+            ) from exc
+
+    if not use_egress:
+        cmd_executor = await asyncio.to_thread(
+            SandboxDockerSession.start, image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
+        )
+        if cmd_executor.session_id is None:
+            raise RuntimeError("Started session is missing a session ID")
+        return StartSessionResponse(session_id=cmd_executor.session_id)
+
+    # The triad already exists. Every step from here — start the sandbox, install the CA, provision the
+    # policy — must tear the triad down on failure: nothing else reclaims it (the reaper only removes a
+    # triad via its surviving cmd-executor container).
+    cmd_executor = None
+    try:
+        cmd_executor = await asyncio.to_thread(
+            SandboxDockerSession.start, image=request.base_image, labels=cmd_executor_labels, **cmd_executor_kwargs
+        )
+        if cmd_executor.session_id is None:
+            raise RuntimeError("Started session is missing a session ID")
+        try:
+            await asyncio.to_thread(cmd_executor.install_ca_cert, ca_cert)
+        except Exception as exc:
+            logger.exception("Egress proxy: failed to install CA into sandbox %s", cmd_executor.session_id)
+            raise HTTPException(status_code=500, detail="Egress proxy: failed to install CA into the sandbox") from exc
+        # Write the policy to the sidecar at create time (replaces the former standalone egress-provisioning
+        # endpoint, now removed — provisioning is create-time only).
+        try:
+            config_bytes = json.dumps(request.egress.to_sidecar_config()).encode("utf-8")
+            await asyncio.to_thread(manager.provision, token, config_bytes)
+        except Exception as exc:
+            logger.exception("Egress proxy: failed to provision policy into sidecar for %s", cmd_executor.session_id)
+            raise HTTPException(
+                status_code=500, detail="Egress proxy: failed to provision policy into the sidecar"
+            ) from exc
+    except Exception:
+        if cmd_executor is not None and cmd_executor.session_id is not None:
+            try:
+                await asyncio.to_thread(cmd_executor.remove_container)
+            except Exception:
+                logger.exception("Egress proxy: failed to remove sandbox %s during cleanup", cmd_executor.session_id)
+        await asyncio.to_thread(manager.teardown, token)
+        raise
+
     return StartSessionResponse(session_id=cmd_executor.session_id)
 
 
@@ -360,9 +441,21 @@ async def close_session(
     async with request.app.state.session_lock_manager.acquire(session_id):
         cmd_executor = SandboxDockerSession()
         cmd_executor.session_id = session_id
+        # Read the egress token from the container labels WITHOUT warming a stopped container.
+        # _get_container restarts a stopped container on access, but DELETE only stops/removes it — a
+        # raw lookup avoids the pointless restart (and a spurious 503 on force-remove) and tolerates a
+        # missing container (nothing to tear down). stop_container/remove_container do their own lookup.
+        try:
+            container = await asyncio.to_thread(cmd_executor.client.containers.get, session_id)
+        except NotFound:
+            container = None
+        token = egress_token(container)
 
         if force:
             await asyncio.to_thread(cmd_executor.remove_container)
+            if token:
+                manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
+                await asyncio.to_thread(manager.teardown, token)
         else:
             await asyncio.to_thread(cmd_executor.stop_container)
 

@@ -11,6 +11,10 @@ the two sides. To refresh the dump:
 import json
 
 from daiv_sandbox.schemas import (
+    EgressConfigRequest,
+    EgressPolicy,
+    EgressRule,
+    EgressSecret,
     FsDeleteRequest,
     FsDeleteResponse,
     FsEditRequest,
@@ -56,6 +60,10 @@ _TYPES = [
     FsReadResponse,
     FsWriteRequest,
     FsWriteResponse,
+    EgressRule,
+    EgressSecret,
+    EgressPolicy,
+    EgressConfigRequest,
 ]
 
 

@@ -13,19 +13,29 @@ on:
   pull_request:
     paths:
       - "Dockerfile"
+      - "egress_proxy/Dockerfile"
+      - "daiv_sandbox/egress/**"
       - "uv.lock"
       - ".github/workflows/docker.yml"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ghcr.io/srtab/daiv-sandbox
+            file: Dockerfile
+          - image: ghcr.io/srtab/daiv-sandbox-egress
+            file: egress_proxy/Dockerfile
     steps:
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: |
-            ghcr.io/srtab/daiv-sandbox
+            ${{ matrix.image }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -47,6 +57,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
+          file: ${{ matrix.file }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

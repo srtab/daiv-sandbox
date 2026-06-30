@@ -23,7 +23,6 @@ from daiv_sandbox.sessions import (
     SessionUnavailableError,
     _build_single_file_tar_stream,
     _sanitize_archive_stream,
-    _sh_quote,
     _validate_sandbox_path,
 )
 
@@ -142,116 +141,6 @@ def test_start_container_force_removes_on_bootstrap_failure(mock_docker_client):
     mock_container.remove.assert_called_once_with(force=True)
 
 
-def _resolv_exec_cmd(nameservers):
-    """Mirror _override_resolv_conf's exec command so assertions don't hardcode shell quoting."""
-    content = "".join(f"nameserver {ns}\n" for ns in nameservers)
-    return ["sh", "-c", f"printf '%s' {_sh_quote(content)} > /etc/resolv.conf"]
-
-
-def test_start_container_fixes_gvisor_dns_on_custom_network(mock_docker_client, monkeypatch):
-    """Under runsc on a user-defined network, gVisor can't reach Docker's embedded resolver
-    (127.0.0.11): inject EXTRA_HOSTS as static /etc/hosts entries and repoint resolv.conf at DNS."""
-    monkeypatch.setattr(settings, "RUNTIME", "runsc")
-    monkeypatch.setattr(settings, "DNS", ["1.1.1.1", "8.8.8.8"])
-    monkeypatch.setattr(settings, "EXTRA_HOSTS", ["gitlab"])
-    monkeypatch.setattr("daiv_sandbox.sessions.socket.gethostbyname", lambda name: "172.19.0.3")
-
-    session = SandboxDockerSession()
-    mock_container = mock_docker_client.containers.run.return_value
-    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
-
-    session._start_container("img", network="daiv-net")
-
-    run_kwargs = mock_docker_client.containers.run.call_args.kwargs
-    assert run_kwargs["network"] == "daiv-net"
-    assert run_kwargs["extra_hosts"] == {"gitlab": "172.19.0.3"}
-    mock_container.exec_run.assert_any_call(_resolv_exec_cmd(["1.1.1.1", "8.8.8.8"]), user="root")
-
-
-def test_start_container_overrides_resolv_conf_without_extra_hosts(mock_docker_client, monkeypatch):
-    """resolv.conf is repointed even when EXTRA_HOSTS is empty; no extra_hosts kwarg is added."""
-    monkeypatch.setattr(settings, "RUNTIME", "runsc")
-    monkeypatch.setattr(settings, "DNS", ["9.9.9.9"])
-    monkeypatch.setattr(settings, "EXTRA_HOSTS", [])
-
-    session = SandboxDockerSession()
-    mock_container = mock_docker_client.containers.run.return_value
-    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
-
-    session._start_container("img", network="daiv-net")
-
-    assert "extra_hosts" not in mock_docker_client.containers.run.call_args.kwargs
-    mock_container.exec_run.assert_any_call(_resolv_exec_cmd(["9.9.9.9"]), user="root")
-
-
-def test_start_container_skips_dns_fix_under_runc(mock_docker_client, monkeypatch):
-    """runc honours Docker's embedded resolver, so the gVisor workaround must not fire (no
-    resolv.conf rewrite, no extra_hosts) — otherwise we'd break working service-name DNS."""
-    monkeypatch.setattr(settings, "RUNTIME", "runc")
-    monkeypatch.setattr(settings, "EXTRA_HOSTS", ["gitlab"])
-
-    session = SandboxDockerSession()
-    mock_container = mock_docker_client.containers.run.return_value
-    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
-
-    session._start_container("img", network="daiv-net")
-
-    assert "extra_hosts" not in mock_docker_client.containers.run.call_args.kwargs
-    assert not any("resolv.conf" in str(call) for call in mock_container.exec_run.call_args_list)
-
-
-def test_start_container_skips_dns_fix_without_custom_network(mock_docker_client, monkeypatch):
-    """Without an explicit network (Docker's default bridge) resolv.conf already carries real
-    upstreams under gVisor, so the workaround must not fire."""
-    monkeypatch.setattr(settings, "RUNTIME", "runsc")
-    monkeypatch.setattr(settings, "EXTRA_HOSTS", ["gitlab"])
-
-    session = SandboxDockerSession()
-    mock_container = mock_docker_client.containers.run.return_value
-    mock_container.exec_run.return_value = ExecResult(exit_code=0, output=b"")
-
-    session._start_container("img")
-
-    assert "extra_hosts" not in mock_docker_client.containers.run.call_args.kwargs
-    assert not any("resolv.conf" in str(call) for call in mock_container.exec_run.call_args_list)
-
-
-def test_start_container_force_removes_when_resolv_conf_override_fails(mock_docker_client, monkeypatch):
-    """A failed resolv.conf rewrite is a bootstrap failure: surface it and leak no container."""
-    monkeypatch.setattr(settings, "RUNTIME", "runsc")
-    monkeypatch.setattr(settings, "DNS", ["1.1.1.1"])
-    monkeypatch.setattr(settings, "EXTRA_HOSTS", [])
-
-    session = SandboxDockerSession()
-    mock_container = mock_docker_client.containers.run.return_value
-
-    def exec_run(cmd, **_):
-        if "resolv.conf" in cmd[-1]:
-            return ExecResult(exit_code=1, output=b"boom")
-        return ExecResult(exit_code=0, output=b"")
-
-    mock_container.exec_run.side_effect = exec_run
-
-    with pytest.raises(RuntimeError, match="resolv.conf"):
-        session._start_container("img", network="daiv-net")
-
-    mock_container.remove.assert_called_once_with(force=True)
-
-
-def test_resolve_extra_hosts_skips_unresolvable(mock_docker_client, monkeypatch):
-    """Sibling names that don't resolve are dropped (and logged), not fatal to session start."""
-
-    def gethostbyname(name):
-        if name == "gitlab":
-            return "172.19.0.3"
-        raise OSError("name or service not known")
-
-    monkeypatch.setattr("daiv_sandbox.sessions.socket.gethostbyname", gethostbyname)
-    session = SandboxDockerSession()
-
-    assert session._resolve_extra_hosts(["gitlab", "ghost"]) == {"gitlab": "172.19.0.3"}
-
-
 def test_remove_container(mock_docker_client):
     session = SandboxDockerSession(session_id="test-session-id")
     session.remove_container()
@@ -312,6 +201,13 @@ def _bare_session(client):
     s.client = client
     s.session_id = "sid"
     s.container = None
+    return s
+
+
+def _session_with_container():
+    """A fully-constructed session (mock_docker_client patches from_env) with a mock container."""
+    s = SandboxDockerSession()
+    s.container = MagicMock()
     return s
 
 
@@ -399,6 +295,53 @@ def test_copy_to_runtime_creates_directory(mock_docker_client):
     assert session.container.put_archive.called
     verbs = [c.args[0][0] for c in session.container.exec_run.call_args_list if c.args and c.args[0]]
     assert "chmod" not in verbs and "chown" not in verbs
+
+
+def test_install_ca_cert_ships_cert_and_updates_store(mock_docker_client):
+    from daiv_sandbox.sessions import SANDBOX_CA_PATH
+
+    s = _session_with_container()
+    s.container.put_archive = Mock(return_value=True)
+    s.container.exec_run = Mock(return_value=ExecResult(exit_code=0, output=b""))
+
+    s.install_ca_cert(b"-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n")
+
+    # cert shipped to /usr/local/share/ca-certificates as root
+    parent = SANDBOX_CA_PATH.rsplit("/", 1)[0]
+    assert s.container.put_archive.call_args.args[0] == parent
+    # update-ca-certificates run as root
+    assert any(
+        c.args[0][:1] == ["update-ca-certificates"] and c.kwargs.get("user") == "root"
+        for c in s.container.exec_run.call_args_list
+    )
+
+
+def test_install_ca_cert_fails_closed_when_mkdir_fails(mock_docker_client):
+    s = _session_with_container()
+    s.container.exec_run = Mock(return_value=ExecResult(exit_code=1, output=b"mkdir: permission denied"))
+    with pytest.raises(RuntimeError, match="CA dir"):
+        s.install_ca_cert(b"cert")
+
+
+def test_install_ca_cert_fails_closed_when_put_archive_fails(mock_docker_client):
+    s = _session_with_container()
+    s.container.put_archive = Mock(return_value=False)
+    s.container.exec_run = Mock(return_value=ExecResult(exit_code=0, output=b""))
+    with pytest.raises(RuntimeError, match="copy CA cert"):
+        s.install_ca_cert(b"cert")
+
+
+def test_install_ca_cert_fails_closed_when_update_fails(mock_docker_client):
+    s = _session_with_container()
+    s.container.put_archive = Mock(return_value=True)
+    s.container.exec_run = Mock(
+        side_effect=[
+            ExecResult(exit_code=0, output=b""),  # mkdir succeeds
+            ExecResult(exit_code=1, output=b"update-ca-certificates: not found"),  # update fails
+        ]
+    )
+    with pytest.raises(RuntimeError, match="update-ca-certificates"):
+        s.install_ca_cert(b"cert")
 
 
 def test_execute_command(mock_docker_client):
@@ -492,6 +435,73 @@ def test_execute_command_with_absolute_workdir(mock_docker_client):
 def test_get_exec_environment(mock_docker_client):
     session = SandboxDockerSession()
     assert session._get_exec_environment() == EXPECTED_EXEC_ENV
+
+
+def test_exec_env_includes_proxy_when_egress_enabled(mock_docker_client, monkeypatch):
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", "/run/secrets/ca.crt")
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", "/run/secrets/ca.key")
+    s = SandboxDockerSession()
+    s.session_id = "sid"
+    s.container = MagicMock()
+    # Container carries the egress token label; manager resolves the proxy IP.
+    s.container.labels = {"daiv.sandbox.egress": "tok123"}
+    monkeypatch.setattr(
+        "daiv_sandbox.egress.manager.EgressProxyManager.proxy_internal_ip", lambda self, token: "10.7.0.2"
+    )
+    env = s._get_exec_environment()
+    assert env["HTTPS_PROXY"] == "http://10.7.0.2:8080"
+    assert env["HOME"]  # base env still present
+
+
+def test_exec_env_has_no_proxy_when_disabled(mock_docker_client):
+    s = SandboxDockerSession()
+    s.session_id = "sid"
+    s.container = MagicMock()
+    s.container.labels = {}
+    assert s._get_exec_environment() == EXPECTED_EXEC_ENV
+
+
+def test_exec_env_degrades_to_base_on_proxy_error(mock_docker_client, monkeypatch):
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", "/run/secrets/ca.crt")
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", "/run/secrets/ca.key")
+    s = SandboxDockerSession()
+    s.container = MagicMock()
+    s.container.labels = {"daiv.sandbox.egress": "tok123"}
+    monkeypatch.setattr(
+        "daiv_sandbox.egress.manager.EgressProxyManager.proxy_internal_ip",
+        lambda self, token: (_ for _ in ()).throw(RuntimeError("unreachable")),
+    )
+    assert s._get_exec_environment() == EXPECTED_EXEC_ENV
+
+
+def test_exec_env_retries_after_transient_proxy_error(mock_docker_client, monkeypatch):
+    """A transient proxy-IP resolution failure must not be cached: a later command in the same request
+    retries instead of silently running egress-less for the rest of the request."""
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", "/run/secrets/ca.crt")
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", "/run/secrets/ca.key")
+    s = SandboxDockerSession()
+    s.session_id = "sid"
+    s.container = MagicMock()
+    s.container.labels = {"daiv.sandbox.egress": "tok123"}
+
+    calls = {"n": 0}
+
+    def _flaky(self, token):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("unreachable")
+        return "10.7.0.2"
+
+    monkeypatch.setattr("daiv_sandbox.egress.manager.EgressProxyManager.proxy_internal_ip", _flaky)
+
+    assert s._get_exec_environment() == EXPECTED_EXEC_ENV  # 1st call fails -> base env, NOT cached
+    assert s._get_exec_environment()["HTTPS_PROXY"] == "http://10.7.0.2:8080"  # 2nd call retries, succeeds
 
 
 def _sanitize_tar(build) -> tuple[tarfile.TarFile, int]:

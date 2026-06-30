@@ -25,6 +25,8 @@ make run           # fastapi dev on port 8888 (reload)
   available.
 - `pytest-env` sets `DAIV_SANDBOX_API_KEY=notsosecret` automatically — no `.env` needed for tests.
 - CI gate is `make lint` then `make test`; `make lint-typing` (mypy) is available locally but is not a CI gate.
+  `make lint` also runs `make lint-egress-sidecar`, which byte-compiles the sidecar-shared `egress/` modules
+  under Python 3.13 (see the Module map note on the dual runtime — a 3.14-only construct there fails open).
 
 ## Architecture
 
@@ -53,7 +55,8 @@ running git inside `/workspace/repo`. The one-shot seed guard marker lives in `S
 `/workspace`, so it's unreachable through `fs/*`).
 
 **Endpoints** (`main.py`, all under `root_path=/api/v1`, all require the `X-API-Key` header):
-`POST /session/` → `POST /session/{id}/seed/` (multipart, one-shot, 409 if re-seeded) →
+`POST /session/` (include an `egress` block to attach the per-session egress proxy at create time) →
+`POST /session/{id}/seed/` (multipart, one-shot, 409 if re-seeded) →
 `POST /session/{id}/fs/{op}` (`ls`/`read`/`grep`/`glob`/`write`/`edit`/`delete`) and
 `POST /session/{id}/` (run commands) → `GET /session/{id}/` (204 exists/warms, 404 missing) →
 `DELETE /session/{id}/`. Plus `GET /-/health/` and `GET /-/version/`.
@@ -72,7 +75,9 @@ container that has been warmed again — closing a TOCTOU race against in-flight
 **Error-status contract (deliberate — keep these distinct).** Missing session → `404`. A Docker fault
 while restarting/stopping an existing container → `SessionUnavailableError` → `503` (retryable infra
 fault, **not** masked as 404). Lock contention → `SessionBusyError` → `409`. Missing/invalid API key →
-`403`.
+`403`. A `POST /session/` carrying an `egress` block on a deployment without the egress CA configured →
+`400` (egress is mandatory for network access; there is no direct-network attach). A permits-nothing
+egress policy (deny-default, no rules) → `422`.
 
 **`fs/*` is Python-free and defends a container boundary, not a path prefix.** File content moves via
 the Docker archive API; search/listing shells out to POSIX `grep`/`find`/`ls`/`rm`, so the endpoints work
@@ -84,7 +89,7 @@ prefix. `fs/read` caps a single response at `READ_MAX_OUTPUT_BYTES` (512 KB); `f
 codes from `FsErrorCode` in `schemas.py`): absence is `not_found` (distinct from an empty
 listing/no-match), a type mismatch is `not_a_directory`/`is_a_directory`, a malformed path is
 `invalid_path`, and `fs/delete` reports a `removed` boolean. HTTP status codes remain reserved for
-session/transport concerns (404 missing session, 409 lock, 503 infra, 403 auth, 500 unexpected).
+session/transport concerns (404 missing session, 409 lock, 503 infra, 403 auth, 400 network-without-egress, 500 unexpected).
 
 **Untrusted-input handling.** Uploaded archives are sanitised before extraction (`_sanitize_archive_stream`):
 symlinks/hardlinks/device nodes/FIFOs and absolute/`..` paths are rejected, ownership is normalised to
@@ -97,11 +102,16 @@ commands skipped).
 
 - `main.py` — FastAPI app, all endpoints, `lifespan` (wires the lock manager + reaper), Sentry init, exception handlers.
 - `sessions.py` — `SandboxDockerSession`: container lifecycle, archive copy/sanitisation, command exec, and the `fs/*` primitives; path constants and `_validate_sandbox_path`.
-- `reaper.py` — background loop that removes stopped session containers (age + LRU, leader-locked).
+- `reaper.py` — background loop that removes stopped session containers (age + LRU, leader-locked) and reclaims orphaned egress triads (every tick, ungated).
 - `locks.py` — `NoopSessionLockManager` / `RedisSessionLockManager` and `SessionBusyError`.
 - `config.py` — `settings` singleton (pydantic-settings).
 - `schemas.py` — request/response models.
 - `logs.py` — logging configuration.
+- `egress/manager.py` — `EgressProxyManager`: triad lifecycle (internal network + sidecar create / discover / provision / idempotent teardown).
+- `egress/policy.py` — sidecar-side `PolicyEvaluator` (allow/deny, intercept mode, per-host method limits, credential injection) and the mtime-reloading, fail-closed `PolicyStore`.
+- `egress/addon.py` — the mitmproxy addon: enforces reachability at `CONNECT`, passthrough at `tls_clienthello`, blocks/injects at `request`; fail-closed against mitmproxy's fail-open hook behavior.
+- `egress/constants.py` — shared paths/labels for the triad.
+- **Dual runtime:** `egress/{policy,addon,constants}.py` are copied verbatim into the **Python 3.13** mitmproxy sidecar while the repo targets 3.14. They must stay stdlib-only and free of 3.14-only syntax — a 3.14-only construct is a `SyntaxError` under 3.13 that makes the addon **fail open**. `make lint-egress-sidecar` (folded into `make lint`) byte-compiles them under 3.13 to catch this.
 
 ## Conventions
 
