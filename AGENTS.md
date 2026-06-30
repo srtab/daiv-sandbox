@@ -25,6 +25,8 @@ make run           # fastapi dev on port 8888 (reload)
   available.
 - `pytest-env` sets `DAIV_SANDBOX_API_KEY=notsosecret` automatically — no `.env` needed for tests.
 - CI gate is `make lint` then `make test`; `make lint-typing` (mypy) is available locally but is not a CI gate.
+  `make lint` also runs `make lint-egress-sidecar`, which byte-compiles the sidecar-shared `egress/` modules
+  under Python 3.13 (see the Module map note on the dual runtime — a 3.14-only construct there fails open).
 
 ## Architecture
 
@@ -100,11 +102,16 @@ commands skipped).
 
 - `main.py` — FastAPI app, all endpoints, `lifespan` (wires the lock manager + reaper), Sentry init, exception handlers.
 - `sessions.py` — `SandboxDockerSession`: container lifecycle, archive copy/sanitisation, command exec, and the `fs/*` primitives; path constants and `_validate_sandbox_path`.
-- `reaper.py` — background loop that removes stopped session containers (age + LRU, leader-locked).
+- `reaper.py` — background loop that removes stopped session containers (age + LRU, leader-locked) and reclaims orphaned egress triads (every tick, ungated).
 - `locks.py` — `NoopSessionLockManager` / `RedisSessionLockManager` and `SessionBusyError`.
 - `config.py` — `settings` singleton (pydantic-settings).
 - `schemas.py` — request/response models.
 - `logs.py` — logging configuration.
+- `egress/manager.py` — `EgressProxyManager`: triad lifecycle (internal network + sidecar create / discover / provision / idempotent teardown).
+- `egress/policy.py` — sidecar-side `PolicyEvaluator` (allow/deny, intercept mode, per-host method limits, credential injection) and the mtime-reloading, fail-closed `PolicyStore`.
+- `egress/addon.py` — the mitmproxy addon: enforces reachability at `CONNECT`, passthrough at `tls_clienthello`, blocks/injects at `request`; fail-closed against mitmproxy's fail-open hook behavior.
+- `egress/constants.py` — shared paths/labels for the triad.
+- **Dual runtime:** `egress/{policy,addon,constants}.py` are copied verbatim into the **Python 3.13** mitmproxy sidecar while the repo targets 3.14. They must stay stdlib-only and free of 3.14-only syntax — a 3.14-only construct is a `SyntaxError` under 3.13 that makes the addon **fail open**. `make lint-egress-sidecar` (folded into `make lint`) byte-compiles them under 3.13 to catch this.
 
 ## Conventions
 

@@ -517,6 +517,24 @@ def test_force_close_tears_down_triad(client):
         mock_mgr_class.return_value.teardown.assert_called_once_with("tok123")
 
 
+def test_non_force_close_preserves_triad(client):
+    """A non-force DELETE of an egress session stops the sandbox but must NOT tear down the triad: the
+    sidecar survives so the session can warm-restart with the same proxy endpoint (the warm-reuse
+    invariant the egress design rests on)."""
+    with (
+        patch("daiv_sandbox.main.SandboxDockerSession") as cls,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
+        cmd = cls.return_value
+        cmd.session_id = "sbx"
+        cls.return_value.client.containers.get.return_value = Mock(labels={"daiv.sandbox.egress": "tok123"})
+        resp = client.delete("/session/sbx/")
+        assert resp.status_code == 204
+        cls.return_value.stop_container.assert_called_once()
+        cls.return_value.remove_container.assert_not_called()
+        mock_mgr_class.return_value.teardown.assert_not_called()
+
+
 def test_get_session_returns_204_when_present(client):
     with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
         instance = mock_session_class.return_value

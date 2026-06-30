@@ -217,6 +217,16 @@ class EgressRule(BaseModel):
     methods: list[str] = Field(default_factory=lambda: ["*"], description="Allowed HTTP methods, or ['*'] for any.")
     inject: str | None = Field(default=None, description="Name of the secret whose header is injected for this host.")
 
+    @field_validator("host", mode="after")
+    @classmethod
+    def _valid_host(cls, value: str) -> str:
+        # The host glob is matched verbatim (lower-cased) against request hosts in the sidecar, so an empty
+        # glob, or one carrying whitespace/control characters, can never match a real host and signals a
+        # malformed rule. Reject it here rather than letting it silently no-op (cf. EgressSecret's guards).
+        if not value or any(c.isspace() or ord(c) < 0x20 for c in value):
+            raise ValueError("host must be a non-empty glob without whitespace or control characters")
+        return value
+
     @field_validator("methods", mode="after")
     @classmethod
     def _upper(cls, value: list[str]) -> list[str]:

@@ -201,6 +201,15 @@ def test_from_config_rejects_empty_methods():
         PolicyEvaluator.from_config(_cfg(rules=[{"host": "api.github.com", "methods": []}]))
 
 
+def test_from_config_rejects_dangling_inject():
+    """The sidecar parser must re-enforce EgressConfigRequest._injects_resolve independently: a rule whose
+    `inject` names a secret that isn't present would allow the host but inject nothing (evaluate's
+    _secrets.get returns None silently). from_config raises so PolicyStore collapses to deny-all rather
+    than letting a request meant to carry a credential go out unauthenticated."""
+    with pytest.raises(ValueError, match="unknown secret"):
+        PolicyEvaluator.from_config(_cfg(rules=[{"host": "github.com", "methods": ["*"], "inject": "ghx"}]))
+
+
 def test_allowed_decision_carries_no_block_reason():
     """An allowed request has nothing to transpose into a rule — block must be None."""
     p = PolicyEvaluator.from_config(_cfg(rules=[{"host": "github.com", "methods": ["*"]}]))
@@ -269,4 +278,14 @@ def test_policy_store_empty_methods_config_is_deny_all(tmp_path):
     path.write_text(json.dumps(_cfg(default="allow", rules=[{"host": "api.github.com", "methods": []}])))
     store = PolicyStore(str(path))
     assert store.current().evaluate("api.github.com", "CONNECT").allow is False
+
+
+def test_policy_store_dangling_inject_config_is_deny_all(tmp_path):
+    """A config whose rule references a missing secret can only reach the sidecar if it bypassed wire
+    validation (hand-edited / corrupt file). It must fail closed to deny-all — including denying CONNECT —
+    rather than allowing the host without the intended credential."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_cfg(rules=[{"host": "github.com", "methods": ["*"], "inject": "ghx"}])))
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("github.com", "CONNECT").allow is False
     assert store.current().evaluate("unlisted.example", "GET").allow is False  # default-allow also gone

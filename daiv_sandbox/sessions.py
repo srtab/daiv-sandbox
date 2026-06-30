@@ -1078,14 +1078,18 @@ class SandboxDockerSession:
         return {**base, **self._egress_environment()}
 
     def _egress_environment(self) -> dict[str, str]:
-        """Proxy + CA env for an egress-enabled session, or {} otherwise.
+        """Refresh the proxy + CA env for an egress-enabled session, or {} otherwise.
 
-        The proxy IP is resolved from the running sidecar (correct across warm restarts: a non-force
-        DELETE stops only the sandbox and leaves the sidecar running, so its endpoint is unchanged).
+        The *authoritative* proxy env (HTTP(S)_PROXY + CA paths) is baked into the container at create
+        time (see start_session) and is inherited by every exec; this method only refreshes it from the
+        running sidecar so a command sees a current proxy IP. The IP is stable across warm restarts (a
+        non-force DELETE stops only the sandbox and leaves the sidecar running), so the refresh normally
+        returns the same value the container already carries.
+
         A *successful* resolution — and the stable "this session has no egress" case — is cached on the
-        instance. A failed resolution degrades to {} for this call (fail closed: no usable egress rather
-        than a half-set proxy) but is NOT cached, so a later command in the same request retries instead
-        of silently running egress-less once a transient Docker hiccup pinned an empty env.
+        instance. A failed resolution returns {} for this call, which leaves the baked create-time env in
+        force (egress is not lost) rather than overriding it with a half-set proxy; it is NOT cached, so a
+        later command in the same request retries the refresh instead of pinning an empty override.
         """
         if self._egress_env_cache is not None:
             return self._egress_env_cache

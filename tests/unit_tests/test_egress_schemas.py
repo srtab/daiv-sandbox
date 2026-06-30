@@ -17,6 +17,15 @@ def test_empty_methods_raises_validation_error():
         EgressRule(host="x", methods=[])
 
 
+@pytest.mark.parametrize("host", ["", "   ", "git hub.com", "github.com\n", "bad\x00host"])
+def test_invalid_host_raises_validation_error(host):
+    """The host glob is matched verbatim (lower-cased) in the sidecar; an empty glob or one carrying
+    whitespace/control characters can never match a real host and signals a malformed rule — reject it
+    at validation time rather than letting it silently no-op."""
+    with pytest.raises(ValidationError, match="host must be"):
+        EgressRule(host=host)
+
+
 def test_policy_defaults_are_deny_and_intercept_all():
     p = EgressPolicy()
     assert p.default == "deny"

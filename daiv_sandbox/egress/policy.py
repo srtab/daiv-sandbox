@@ -61,7 +61,15 @@ class PolicyEvaluator:
     runtime evaluator that lives inside the sidecar; that one is the operator-facing request model.
     """
 
-    def __init__(self, default: str, intercept: str, rules: list[_Rule], secrets: dict[str, tuple[str, str]]):
+    def __init__(
+        self,
+        default: Literal["deny", "allow"],
+        intercept: Literal["all", "credentialed"],
+        rules: list[_Rule],
+        secrets: dict[str, tuple[str, str]],
+    ):
+        # from_config normalises unknown default/intercept values to the fail-closed default before
+        # constructing the evaluator; the Literal types just document the accepted set for direct callers.
         self._default = default
         self._intercept = intercept
         self._rules = rules
@@ -82,7 +90,15 @@ class PolicyEvaluator:
             # parser must fail closed on its own — raising here makes PolicyStore collapse to deny-all.
             if not methods:
                 raise ValueError(f"egress: rule for host {r.get('host')!r} has empty methods; use ['*'] for any")
-            rules.append(_Rule(host=r["host"].lower(), methods=methods, inject=r.get("inject")))
+            # Re-enforce EgressConfigRequest._injects_resolve independently: a rule naming a secret that
+            # isn't present would otherwise allow the host but inject nothing (evaluate's self._secrets.get
+            # returns None silently). The config file is the trust boundary the sidecar actually reads, so
+            # fail closed here rather than letting a request that was meant to carry a credential go out
+            # unauthenticated.
+            inject = r.get("inject")
+            if inject is not None and inject not in secrets:
+                raise ValueError(f"egress: rule for host {r.get('host')!r} references unknown secret {inject!r}")
+            rules.append(_Rule(host=r["host"].lower(), methods=methods, inject=inject))
         # Unknown default/intercept values are a misconfiguration: fail closed (deny / full MITM) and warn
         # rather than relying on `== "allow"`/`== "all"` to accidentally do the safe thing for a typo.
         default = policy.get("default", "deny")

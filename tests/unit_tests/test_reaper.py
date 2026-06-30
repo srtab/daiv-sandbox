@@ -124,6 +124,7 @@ async def test_reap_once_removes_only_aged_out():
     fresh = _stopped_container("fresh", "2026-06-01T11:59:00Z")  # 1m before NOW
     client = Mock()
     client.containers.list.return_value = [old, fresh]
+    client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
     await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=50)
 
@@ -138,6 +139,7 @@ async def test_reap_once_lru_evicts_oldest_beyond_cap():
     c3 = _stopped_container("c3", "2026-06-01T11:50:00Z")
     client = Mock()
     client.containers.list.return_value = [c3, c1, c2]  # unsorted on purpose
+    client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
     await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=1)
 
@@ -152,6 +154,7 @@ async def test_reap_once_max_stopped_zero_evicts_all():
     c2 = _stopped_container("c2", "2026-06-01T11:30:00Z")  # within grace
     client = Mock()
     client.containers.list.return_value = [c1, c2]
+    client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
     await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=0)
 
@@ -159,14 +162,26 @@ async def test_reap_once_max_stopped_zero_evicts_all():
     c2.remove.assert_called_once_with(force=True)
 
 
+async def test_reap_once_always_runs_orphan_sweep():
+    """The orphan-triad sweep is wired into every _reap_once tick (no longer gated on egress being
+    configured), so a triad stranded after an operator disables egress is still reclaimed. The sweep's own
+    teardown behavior is covered by the test_reap_orphan_triads_* tests below."""
+    client = Mock()
+    client.containers.list.return_value = []
+    with patch("daiv_sandbox.reaper._reap_orphan_triads", new=AsyncMock()) as sweep:
+        await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=50)
+    sweep.assert_awaited_once_with(client, now=NOW, grace_seconds=43200)
+
+
 async def test_maybe_reap_runs_directly_without_redis():
     client = Mock()
     client.containers.list.return_value = []
+    client.networks.list.return_value = []
     # redis=None -> no leader lock, sweep runs inline (no exception, list consulted).
     from daiv_sandbox.reaper import _maybe_reap
 
     await _maybe_reap(client, None, NoopSessionLockManager(), grace_seconds=43200, max_stopped=50)
-    client.containers.list.assert_called_once()
+    client.containers.list.assert_called()
 
 
 async def test_maybe_reap_skips_when_not_leader():

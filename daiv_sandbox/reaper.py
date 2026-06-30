@@ -110,8 +110,10 @@ async def _reap_once(client, lock_manager, *, now, grace_seconds: int, max_stopp
         for container, _finished in survivors[: len(survivors) - max_stopped]:
             await _remove_guarded(container, lock_manager)
 
-    if settings.egress_enabled:
-        await _reap_orphan_triads(client, now=now, grace_seconds=grace_seconds)
+    # Sweep orphan triads unconditionally, NOT gated on settings.egress_enabled: an operator who disables
+    # egress (removes the CA files) while triads from earlier sessions still exist would otherwise strand
+    # those proxy containers + internal networks forever. It is a cheap no-op when nothing is labelled.
+    await _reap_orphan_triads(client, now=now, grace_seconds=grace_seconds)
 
 
 async def _reap_orphan_triads(client, *, now, grace_seconds: int) -> None:
