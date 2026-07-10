@@ -16,7 +16,7 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-  "docker==7.1.0",
+  "docker==7.2.0",
   "fastapi[standard]==0.139.0",
   "ipython==9.15.0",
   "pydantic==2.13.4",
