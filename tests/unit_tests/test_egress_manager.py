@@ -1,10 +1,10 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from docker.errors import APIError, NotFound
 
 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
-from daiv_sandbox.sessions import EGRESS_SESSION_LABEL, TYPE_EGRESS_NETWORK, TYPE_EGRESS_PROXY
+from daiv_sandbox.sessions import EGRESS_SESSION_LABEL, TYPE_EGRESS_NETWORK, TYPE_EGRESS_PROXY, SessionUnavailableError
 
 
 def test_create_network_is_internal_and_labeled():
@@ -116,3 +116,85 @@ def test_teardown_logs_and_continues_when_proxy_remove_errors():
     client.networks.list.return_value = [net]
     EgressProxyManager(client).teardown("tok123")  # must not raise
     net.remove.assert_called_once()  # network still cleaned up despite the proxy failure
+
+
+def _running_proxy_mgr(monkeypatch):
+    """An EgressProxyManager whose _proxy() returns a running proxy wired for a successful provision.
+
+    Tests override a single attribute (put_archive/exec_run) to exercise one specific failure path.
+    """
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "running"
+    proxy.put_archive.return_value = True
+    proxy.exec_run.return_value = Mock(exit_code=0, output=b"")
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    return mgr, proxy
+
+
+def test_provision_stages_to_temp_then_renames_atomically(monkeypatch):
+    """provision must put_archive a temp file, then rename it over config.json (atomic swap)."""
+    mgr, proxy = _running_proxy_mgr(monkeypatch)
+
+    mgr.provision("tok123", b'{"policy": {"default": "allow"}, "secrets": {}}')
+
+    proxy.put_archive.assert_called_once()
+    assert proxy.put_archive.call_args.args[0] == "/run/egress"
+    proxy.exec_run.assert_called_once_with(
+        ["mv", "-f", "/run/egress/config.json.tmp", "/run/egress/config.json"], user="root"
+    )
+    proxy.reload.assert_called_once()
+
+
+def test_provision_raises_when_rename_fails(monkeypatch):
+    """A non-zero rename exit must fail loud so a half-applied config never goes unnoticed."""
+    mgr, proxy = _running_proxy_mgr(monkeypatch)
+    proxy.exec_run.return_value = Mock(exit_code=1, output=b"mv: cannot move")
+
+    with pytest.raises(RuntimeError, match="failed to install config"):
+        mgr.provision("tok123", b"{}")
+
+
+def test_provision_raises_session_unavailable_when_proxy_not_running(monkeypatch):
+    """A stopped proxy (e.g. after a daemon restart) must fail as a retryable 503, not a torn write."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "exited"
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    with pytest.raises(SessionUnavailableError):
+        mgr.provision("tok123", b"{}")
+
+    proxy.put_archive.assert_not_called()
+    proxy.exec_run.assert_not_called()
+
+
+def test_provision_translates_apierror_during_mv_to_session_unavailable(monkeypatch):
+    """A proxy that stops between the status check and the mv must surface as retryable 503, not 500."""
+    mgr, proxy = _running_proxy_mgr(monkeypatch)
+    proxy.exec_run.side_effect = APIError("Container abc is not running")
+
+    with pytest.raises(SessionUnavailableError):
+        mgr.provision("tok123", b"{}")
+
+    proxy.put_archive.assert_called_once()  # staging happened; the race is on the rename
+
+
+def test_provision_translates_notfound_proxy_to_session_unavailable(monkeypatch):
+    """A reaped/removed proxy (NotFound, an APIError subclass) must surface as retryable 503."""
+    mgr = EgressProxyManager(Mock())
+    monkeypatch.setattr(mgr, "_proxy", Mock(side_effect=NotFound("no proxy")))
+
+    with pytest.raises(SessionUnavailableError):
+        mgr.provision("tok123", b"{}")
+
+
+def test_provision_raises_when_put_archive_fails(monkeypatch):
+    """A daemon-rejected staging copy (put_archive False) must fail loud, not silently skip the write."""
+    mgr, proxy = _running_proxy_mgr(monkeypatch)
+    proxy.put_archive.return_value = False
+
+    with pytest.raises(RuntimeError, match="failed to stage config"):
+        mgr.provision("tok123", b"{}")
+
+    proxy.exec_run.assert_not_called()  # never attempt the rename if staging failed

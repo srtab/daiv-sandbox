@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from docker.errors import NotFound
+from docker.errors import APIError, NotFound
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.egress.constants import CA_PATH, CONFIG_DIR
@@ -13,6 +13,7 @@ from daiv_sandbox.sessions import (
     SANDBOX_CA_BUNDLE,
     TYPE_EGRESS_NETWORK,
     TYPE_EGRESS_PROXY,
+    SessionUnavailableError,
     _build_single_file_tar_stream,
 )
 
@@ -127,15 +128,51 @@ class EgressProxyManager:
         return ip
 
     def provision(self, token: str, config_bytes: bytes) -> None:
-        """Write the config JSON into the running proxy; the addon reloads it on mtime change."""
-        proxy = self._proxy(token)
-        # config.json holds secrets, so keep mode 0o600 and own it by the proxy user (RUN_UID) so the
-        # non-root mitmdump process can read it; a root-owned 0o600 file would deny-fail closed.
-        with _build_single_file_tar_stream(
-            "config.json", config_bytes, mode=0o600, uid=settings.RUN_UID, gid=settings.RUN_GID
-        ) as tar:
-            if not proxy.put_archive(CONFIG_DIR, tar):
-                raise RuntimeError(f"egress: failed to provision config for {token}")
+        """Write the config JSON into the running proxy ATOMICALLY; the addon reloads on mtime change.
+
+        put_archive extracts in place and is not atomic: a request landing mid-write could read a
+        truncated config.json, and PolicyStore caches that failed parse against the new mtime (deny-all
+        until the next write) — and since mtime only advances when the file is replaced, a re-write with
+        identical bytes would not clear that cached deny-all. So stage to a temp file, then rename it
+        over config.json (atomic on the same filesystem): a reader sees the old or new file whole and
+        the mtime flips exactly once.
+
+        The rename uses exec_run, which requires the proxy container to be RUNNING (unlike put_archive,
+        which the daemon also accepts against a stopped container). A proxy can be stopped or gone while
+        its session's sandbox still exists — e.g. after a daemon restart (neither sets a restart_policy,
+        and only the sandbox warm-restarts on access) or a reaper sweep. We check status up front, and
+        also translate any Docker APIError/NotFound raised during the operation (the proxy stopping
+        between the check and the mv, or having been removed) into SessionUnavailableError, so the caller
+        reports 503 (retryable) rather than an opaque 500. A failed rename leaves a benign
+        config.json.tmp behind (PolicyStore watches only config.json); the next provision overwrites it.
+        """
+        try:
+            proxy = self._proxy(token)
+            proxy.reload()
+            if proxy.status != "running":
+                raise SessionUnavailableError(token, f"refreshed: egress proxy is {proxy.status}")
+            # config.json holds secrets, so keep mode 0o600 and own it by the proxy user (RUN_UID) so the
+            # non-root mitmdump process can read it; a root-owned 0o600 file would deny-fail closed.
+            with _build_single_file_tar_stream(
+                "config.json.tmp", config_bytes, mode=0o600, uid=settings.RUN_UID, gid=settings.RUN_GID
+            ) as tar:
+                if not proxy.put_archive(CONFIG_DIR, tar):
+                    raise RuntimeError(f"egress: failed to stage config for {token}")
+            # rename() is atomic within a filesystem: config.json flips content+mtime in one step, so a
+            # concurrent PolicyStore read never observes a partial file. rename() keeps the temp file's
+            # inode (incl. RUN_UID ownership) — no chown needed. Run as root to avoid any confdir
+            # permission edge case.
+            result = proxy.exec_run(
+                ["mv", "-f", f"{CONFIG_DIR}/config.json.tmp", f"{CONFIG_DIR}/config.json"], user="root"
+            )
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"egress: failed to install config for {token}: [{result.exit_code}] {result.output!r}"
+                )
+        except APIError as exc:
+            # The proxy stopped between the status check and the mv, or was removed (NotFound is an
+            # APIError subclass): a retryable infra fault, not a config bug — map to 503, not 500.
+            raise SessionUnavailableError(token, f"refreshed: egress proxy unavailable ({exc})") from exc
 
     def teardown(self, token: str) -> None:
         # Best-effort: an already-gone resource (NotFound) is success; any other failure is logged and

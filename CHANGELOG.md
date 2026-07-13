@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `PUT /session/{id}/egress/` refreshes a live session's egress policy and secrets (e.g. a rotated git token) without recreating the container. The sidecar hot-reloads its config; the CA is unaffected.
 - `POST /session/{id}/seed/` — one-shot per session (409 if re-seeded), accepts archives as `multipart/form-data` fields (`repo_archive`, `skills_archive`). At least one field must be provided; `repo_archive` extracts into `/workspace/repo` and `skills_archive` into `/workspace/skills`. Replaces the former `RunRequest.archive` flow for establishing initial session state. **Breaking change**
 - `POST /session/{id}/fs/{op}` — Python-free workspace file operations (`ls`, `read`, `grep`, `glob`, `write`, `edit`, `delete`) that act anywhere under `/workspace`. `read` paginates text with `offset`/`limit` and returns binary as base64; `grep` searches with a regular expression (POSIX extended / ERE), reports an invalid pattern via the `invalid_pattern` error code, and caps results at 200 matches (setting `truncated` when more were found); `glob` supports `*`, `**`, `?`, and `[abc]`.
 - `GET /session/{id}/` — returns `204` if the session's container exists (restarting it if stopped, warming it for reuse) or `404` if it does not.

@@ -24,6 +24,7 @@ from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, 
 from daiv_sandbox.logs import LOGGING_CONFIG
 from daiv_sandbox.reaper import start_reaper
 from daiv_sandbox.schemas import (
+    EgressConfigRequest,
     ErrorMessage,
     FsDeleteRequest,
     FsDeleteResponse,
@@ -473,6 +474,55 @@ async def get_session(
     reuse), or 404 if it does not. Lock-guarded so it can't race the reaper.
     """
     async with _workspace_executor(request, session_id):
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.put("/session/{session_id}/egress/", responses=common_responses, name="Refresh session egress policy")
+async def update_egress(
+    request: Request,
+    session_id: Annotated[str, FastAPIPath(title="The ID of the session whose egress policy to refresh")],
+    egress: EgressConfigRequest,
+    api_key: str = Depends(get_api_key),
+) -> Response:
+    """
+    Refresh a live session's egress policy + secrets (e.g. a fresh git token) without recreating the
+    container. Rewrites the sidecar's config.json; the proxy hot-reloads it on the next request — no
+    restart. Returns 204; 404 if the session is gone; 409 if the session has no egress proxy; 503 if the proxy
+    sidecar is not running (retryable). Lock-guarded so it can't race the reaper.
+    """
+    async with request.app.state.session_lock_manager.acquire(session_id):
+        cmd_executor = SandboxDockerSession()
+        cmd_executor.session_id = session_id
+        # Raw lookup (like DELETE): read the egress label WITHOUT warming a stopped container — the
+        # proxy sidecar runs independently of the sandbox's run state, so provisioning does not need
+        # the sandbox running.
+        try:
+            container = await asyncio.to_thread(cmd_executor.client.containers.get, session_id)
+        except NotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+
+        token = egress_token(container)
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="Session has no egress proxy; nothing to refresh"
+            )
+
+        manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
+        config_bytes = json.dumps(egress.to_sidecar_config()).encode("utf-8")
+        try:
+            await asyncio.to_thread(manager.provision, token, config_bytes)
+        except SessionUnavailableError:
+            # Proxy sidecar is stopped (e.g. after a daemon restart): a retryable infra fault, not a
+            # bug. Let the SessionUnavailableError handler map it to 503, consistent with the contract.
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Egress proxy: failed to refresh policy for session %s (egress token %s)", session_id, token
+            )
+            raise HTTPException(
+                status_code=500, detail="Egress proxy: failed to refresh policy into the sidecar"
+            ) from exc
+
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
