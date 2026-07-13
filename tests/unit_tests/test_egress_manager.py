@@ -118,14 +118,23 @@ def test_teardown_logs_and_continues_when_proxy_remove_errors():
     net.remove.assert_called_once()  # network still cleaned up despite the proxy failure
 
 
-def test_provision_stages_to_temp_then_renames_atomically(monkeypatch):
-    """provision must put_archive a temp file, then rename it over config.json (atomic swap)."""
+def _running_proxy_mgr(monkeypatch):
+    """An EgressProxyManager whose _proxy() returns a running proxy wired for a successful provision.
+
+    Tests override a single attribute (put_archive/exec_run) to exercise one specific failure path.
+    """
     mgr = EgressProxyManager(Mock())
     proxy = Mock()
     proxy.status = "running"
     proxy.put_archive.return_value = True
     proxy.exec_run.return_value = Mock(exit_code=0, output=b"")
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    return mgr, proxy
+
+
+def test_provision_stages_to_temp_then_renames_atomically(monkeypatch):
+    """provision must put_archive a temp file, then rename it over config.json (atomic swap)."""
+    mgr, proxy = _running_proxy_mgr(monkeypatch)
 
     mgr.provision("tok123", b'{"policy": {"default": "allow"}, "secrets": {}}')
 
@@ -139,12 +148,8 @@ def test_provision_stages_to_temp_then_renames_atomically(monkeypatch):
 
 def test_provision_raises_when_rename_fails(monkeypatch):
     """A non-zero rename exit must fail loud so a half-applied config never goes unnoticed."""
-    mgr = EgressProxyManager(Mock())
-    proxy = Mock()
-    proxy.status = "running"
-    proxy.put_archive.return_value = True
+    mgr, proxy = _running_proxy_mgr(monkeypatch)
     proxy.exec_run.return_value = Mock(exit_code=1, output=b"mv: cannot move")
-    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
 
     with pytest.raises(RuntimeError, match="failed to install config"):
         mgr.provision("tok123", b"{}")
@@ -166,12 +171,8 @@ def test_provision_raises_session_unavailable_when_proxy_not_running(monkeypatch
 
 def test_provision_translates_apierror_during_mv_to_session_unavailable(monkeypatch):
     """A proxy that stops between the status check and the mv must surface as retryable 503, not 500."""
-    mgr = EgressProxyManager(Mock())
-    proxy = Mock()
-    proxy.status = "running"
-    proxy.put_archive.return_value = True
+    mgr, proxy = _running_proxy_mgr(monkeypatch)
     proxy.exec_run.side_effect = APIError("Container abc is not running")
-    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
 
     with pytest.raises(SessionUnavailableError):
         mgr.provision("tok123", b"{}")
@@ -190,11 +191,8 @@ def test_provision_translates_notfound_proxy_to_session_unavailable(monkeypatch)
 
 def test_provision_raises_when_put_archive_fails(monkeypatch):
     """A daemon-rejected staging copy (put_archive False) must fail loud, not silently skip the write."""
-    mgr = EgressProxyManager(Mock())
-    proxy = Mock()
-    proxy.status = "running"
+    mgr, proxy = _running_proxy_mgr(monkeypatch)
     proxy.put_archive.return_value = False
-    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
 
     with pytest.raises(RuntimeError, match="failed to stage config"):
         mgr.provision("tok123", b"{}")
