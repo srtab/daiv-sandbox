@@ -516,7 +516,9 @@ async def update_egress(
             # bug. Let the SessionUnavailableError handler map it to 503, consistent with the contract.
             raise
         except Exception as exc:
-            logger.exception("Egress proxy: failed to refresh policy for session %s", session_id)
+            logger.exception(
+                "Egress proxy: failed to refresh policy for session %s (egress token %s)", session_id, token
+            )
             raise HTTPException(
                 status_code=500, detail="Egress proxy: failed to refresh policy into the sidecar"
             ) from exc

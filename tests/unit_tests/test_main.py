@@ -1645,6 +1645,7 @@ def test_update_egress_refreshes_running_session(client):
         assert resp.status_code == 204
         mock_mgr_class.return_value.provision.assert_called_once()
         assert mock_mgr_class.return_value.provision.call_args.args[0] == "tok123"
+        assert b"github.com" in mock_mgr_class.return_value.provision.call_args.args[1]
 
 
 def test_update_egress_404_when_session_missing(client):
@@ -1685,3 +1686,26 @@ def test_update_egress_503_when_proxy_not_running(client):
         resp = client.put("/session/sbx/egress/", json=_EGRESS_PAYLOAD)
 
         assert resp.status_code == 503
+
+
+def test_update_egress_500_on_unexpected_provision_error(client):
+    """A genuine provision fault (e.g. a non-zero mv) is an internal error, not a retryable 503."""
+    with (
+        patch("daiv_sandbox.main.SandboxDockerSession") as cls,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
+        cls.return_value.client.containers.get.return_value = Mock(labels={"daiv.sandbox.egress": "tok123"})
+        mock_mgr_class.return_value.provision.side_effect = RuntimeError("egress: failed to install config")
+
+        resp = client.put("/session/sbx/egress/", json=_EGRESS_PAYLOAD)
+
+        assert resp.status_code == 500
+
+
+def test_update_egress_returns_conflict_when_session_is_locked(client, monkeypatch):
+    monkeypatch.setattr(app.state, "session_lock_manager", BusySessionLockManager())
+
+    resp = client.put("/session/sbx/egress/", json=_EGRESS_PAYLOAD)
+
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": "Session is busy"}

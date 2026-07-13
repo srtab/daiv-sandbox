@@ -394,7 +394,7 @@ Pass an `egress` block in the `POST /session/` body to route the session through
 
 #### Refreshing egress policy on a live session
 
-`PUT /session/{id}/egress/` accepts the same body as the `egress` field on `POST /session/` and rewrites the sidecar's `config.json` atomically; the proxy hot-reloads it on the next request — no container restart needed. Returns `204` on success, `404` if the session is gone, or `409` if the session has no egress proxy (a network-isolated session has nothing to refresh). Use this to rotate credentials (e.g. a short-lived git token) without rebuilding the session.
+`PUT /session/{id}/egress/` accepts the same body as the `egress` field on `POST /session/` and rewrites the sidecar's `config.json` atomically; the proxy hot-reloads it on the next request — no container restart needed. Returns `204` on success, `404` if the session is gone, `409` if the session has no egress proxy (a network-isolated session has nothing to refresh), `422` if the policy body is invalid, or `503` if the proxy sidecar is not running (retryable — the sidecar may have been stopped by a daemon restart and the session can be retried). Use this to rotate credentials (e.g. a short-lived git token) without rebuilding the session.
 
 #### CA generation (operator one-time step)
 

@@ -134,6 +134,7 @@ def test_provision_stages_to_temp_then_renames_atomically(monkeypatch):
     proxy.exec_run.assert_called_once_with(
         ["mv", "-f", "/run/egress/config.json.tmp", "/run/egress/config.json"], user="root"
     )
+    proxy.reload.assert_called_once()
 
 
 def test_provision_raises_when_rename_fails(monkeypatch):
@@ -161,3 +162,41 @@ def test_provision_raises_session_unavailable_when_proxy_not_running(monkeypatch
 
     proxy.put_archive.assert_not_called()
     proxy.exec_run.assert_not_called()
+
+
+def test_provision_translates_apierror_during_mv_to_session_unavailable(monkeypatch):
+    """A proxy that stops between the status check and the mv must surface as retryable 503, not 500."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "running"
+    proxy.put_archive.return_value = True
+    proxy.exec_run.side_effect = APIError("Container abc is not running")
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    with pytest.raises(SessionUnavailableError):
+        mgr.provision("tok123", b"{}")
+
+    proxy.put_archive.assert_called_once()  # staging happened; the race is on the rename
+
+
+def test_provision_translates_notfound_proxy_to_session_unavailable(monkeypatch):
+    """A reaped/removed proxy (NotFound, an APIError subclass) must surface as retryable 503."""
+    mgr = EgressProxyManager(Mock())
+    monkeypatch.setattr(mgr, "_proxy", Mock(side_effect=NotFound("no proxy")))
+
+    with pytest.raises(SessionUnavailableError):
+        mgr.provision("tok123", b"{}")
+
+
+def test_provision_raises_when_put_archive_fails(monkeypatch):
+    """A daemon-rejected staging copy (put_archive False) must fail loud, not silently skip the write."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "running"
+    proxy.put_archive.return_value = False
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    with pytest.raises(RuntimeError, match="failed to stage config"):
+        mgr.provision("tok123", b"{}")
+
+    proxy.exec_run.assert_not_called()  # never attempt the rename if staging failed
