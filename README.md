@@ -94,6 +94,7 @@ All settings are configurable via environment variables. The available settings 
 - `POST /session/{session_id}/`: Run commands on the sandbox session.
 - `GET /session/{session_id}/`: Check session status — `204` if it exists (restarting it if stopped), else `404`.
 - `DELETE /session/{session_id}/`: Close the sandbox session (stops the container by default; `?force=true` removes it).
+- `PUT /session/{session_id}/egress/`: Refresh an egress session's policy and secrets without recreating the container (`204` success / `404` no session / `409` session has no egress proxy).
 - `GET /-/health/`: Healthcheck endpoint.
 - `GET /-/version/`: Current application version.
 
@@ -390,6 +391,10 @@ Pass an `egress` block in the `POST /session/` body to route the session through
 
 > [!NOTE]
 > A rule with `methods` set to anything other than `["*"]` causes that host to be intercepted (MITM'd) regardless of the `intercept` mode, so the method can be enforced after TLS termination. Such hosts require the shared CA, which is installed into every egress sandbox automatically.
+
+#### Refreshing egress policy on a live session
+
+`PUT /session/{id}/egress/` accepts the same body as the `egress` field on `POST /session/` and rewrites the sidecar's `config.json` atomically; the proxy hot-reloads it on the next request — no container restart needed. Returns `204` on success, `404` if the session is gone, or `409` if the session has no egress proxy (a network-isolated session has nothing to refresh). Use this to rotate credentials (e.g. a short-lived git token) without rebuilding the session.
 
 #### CA generation (operator one-time step)
 
