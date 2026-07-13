@@ -13,6 +13,7 @@ from daiv_sandbox.sessions import (
     SANDBOX_CA_BUNDLE,
     TYPE_EGRESS_NETWORK,
     TYPE_EGRESS_PROXY,
+    SessionUnavailableError,
     _build_single_file_tar_stream,
 )
 
@@ -133,8 +134,17 @@ class EgressProxyManager:
         truncated config.json, and PolicyStore caches that failed parse against the new mtime
         (deny-all until the next write). So stage to a temp file, then rename it over config.json
         (atomic on the same filesystem) — a reader sees the old or new file whole.
+
+        The rename uses exec_run, which requires the proxy container to be RUNNING (unlike put_archive,
+        which the daemon also accepts against a stopped container). A proxy can be stopped while its
+        session's sandbox still exists — e.g. after a daemon restart, since neither sets a restart_policy
+        and only the sandbox warm-restarts on access. Detect that and raise SessionUnavailableError so
+        the caller reports 503 (retryable) rather than an opaque 500.
         """
         proxy = self._proxy(token)
+        proxy.reload()
+        if proxy.status != "running":
+            raise SessionUnavailableError(token, f"refreshed: egress proxy is {proxy.status}")
         # config.json holds secrets, so keep mode 0o600 and own it by the proxy user (RUN_UID) so the
         # non-root mitmdump process can read it; a root-owned 0o600 file would deny-fail closed.
         with _build_single_file_tar_stream(

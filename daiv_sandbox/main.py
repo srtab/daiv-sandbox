@@ -487,8 +487,8 @@ async def update_egress(
     """
     Refresh a live session's egress policy + secrets (e.g. a fresh git token) without recreating the
     container. Rewrites the sidecar's config.json; the proxy hot-reloads it on the next request — no
-    restart. Returns 204; 404 if the session is gone; 409 if the session has no egress proxy (a
-    network-isolated session — nothing to refresh). Lock-guarded so it can't race the reaper.
+    restart. Returns 204; 404 if the session is gone; 409 if the session has no egress proxy; 503 if the proxy
+    sidecar is not running (retryable). Lock-guarded so it can't race the reaper.
     """
     async with request.app.state.session_lock_manager.acquire(session_id):
         cmd_executor = SandboxDockerSession()
@@ -511,6 +511,10 @@ async def update_egress(
         config_bytes = json.dumps(egress.to_sidecar_config()).encode("utf-8")
         try:
             await asyncio.to_thread(manager.provision, token, config_bytes)
+        except SessionUnavailableError:
+            # Proxy sidecar is stopped (e.g. after a daemon restart): a retryable infra fault, not a
+            # bug. Let the SessionUnavailableError handler map it to 503, consistent with the contract.
+            raise
         except Exception as exc:
             logger.exception("Egress proxy: failed to refresh policy for session %s", session_id)
             raise HTTPException(

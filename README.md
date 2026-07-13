@@ -94,7 +94,7 @@ All settings are configurable via environment variables. The available settings 
 - `POST /session/{session_id}/`: Run commands on the sandbox session.
 - `GET /session/{session_id}/`: Check session status — `204` if it exists (restarting it if stopped), else `404`.
 - `DELETE /session/{session_id}/`: Close the sandbox session (stops the container by default; `?force=true` removes it).
-- `PUT /session/{session_id}/egress/`: Refresh an egress session's policy and secrets without recreating the container (`204` success / `404` no session / `409` session has no egress proxy).
+- `PUT /session/{session_id}/egress/`: Refresh an egress session's policy and secrets without recreating the container (`204` success / `404` no session / `409` session has no egress proxy / `422` invalid policy body / `503` proxy sidecar not running, retryable).
 - `GET /-/health/`: Healthcheck endpoint.
 - `GET /-/version/`: Current application version.
 

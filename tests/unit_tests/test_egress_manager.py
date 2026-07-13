@@ -4,7 +4,7 @@ import pytest
 from docker.errors import APIError, NotFound
 
 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
-from daiv_sandbox.sessions import EGRESS_SESSION_LABEL, TYPE_EGRESS_NETWORK, TYPE_EGRESS_PROXY
+from daiv_sandbox.sessions import EGRESS_SESSION_LABEL, TYPE_EGRESS_NETWORK, TYPE_EGRESS_PROXY, SessionUnavailableError
 
 
 def test_create_network_is_internal_and_labeled():
@@ -122,6 +122,7 @@ def test_provision_stages_to_temp_then_renames_atomically(monkeypatch):
     """provision must put_archive a temp file, then rename it over config.json (atomic swap)."""
     mgr = EgressProxyManager(Mock())
     proxy = Mock()
+    proxy.status = "running"
     proxy.put_archive.return_value = True
     proxy.exec_run.return_value = Mock(exit_code=0, output=b"")
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
@@ -139,9 +140,24 @@ def test_provision_raises_when_rename_fails(monkeypatch):
     """A non-zero rename exit must fail loud so a half-applied config never goes unnoticed."""
     mgr = EgressProxyManager(Mock())
     proxy = Mock()
+    proxy.status = "running"
     proxy.put_archive.return_value = True
     proxy.exec_run.return_value = Mock(exit_code=1, output=b"mv: cannot move")
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
 
     with pytest.raises(RuntimeError, match="failed to install config"):
         mgr.provision("tok123", b"{}")
+
+
+def test_provision_raises_session_unavailable_when_proxy_not_running(monkeypatch):
+    """A stopped proxy (e.g. after a daemon restart) must fail as a retryable 503, not a torn write."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "exited"
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    with pytest.raises(SessionUnavailableError):
+        mgr.provision("tok123", b"{}")
+
+    proxy.put_archive.assert_not_called()
+    proxy.exec_run.assert_not_called()

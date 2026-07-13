@@ -13,6 +13,7 @@ from daiv_sandbox.config import settings
 from daiv_sandbox.locks import SessionBusyError
 from daiv_sandbox.main import app
 from daiv_sandbox.schemas import RunResult
+from daiv_sandbox.sessions import SessionUnavailableError
 
 # Minimal egress payload used across egress-enabled start_session tests.
 _EGRESS_PAYLOAD = {"policy": {"default": "deny", "rules": [{"host": "github.com", "methods": ["*"]}]}}
@@ -1670,3 +1671,17 @@ def test_update_egress_missing_api_key(client):
     client.headers = {}
     resp = client.put("/session/sbx/egress/", json=_EGRESS_PAYLOAD)
     assert resp.status_code == 403
+
+
+def test_update_egress_503_when_proxy_not_running(client):
+    """A stopped proxy sidecar surfaces as a retryable 503, not an opaque 500."""
+    with (
+        patch("daiv_sandbox.main.SandboxDockerSession") as cls,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
+        cls.return_value.client.containers.get.return_value = Mock(labels={"daiv.sandbox.egress": "tok123"})
+        mock_mgr_class.return_value.provision.side_effect = SessionUnavailableError("tok123", "refreshed")
+
+        resp = client.put("/session/sbx/egress/", json=_EGRESS_PAYLOAD)
+
+        assert resp.status_code == 503
