@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from docker.errors import APIError, NotFound
@@ -116,3 +116,32 @@ def test_teardown_logs_and_continues_when_proxy_remove_errors():
     client.networks.list.return_value = [net]
     EgressProxyManager(client).teardown("tok123")  # must not raise
     net.remove.assert_called_once()  # network still cleaned up despite the proxy failure
+
+
+def test_provision_stages_to_temp_then_renames_atomically(monkeypatch):
+    """provision must put_archive a temp file, then rename it over config.json (atomic swap)."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.put_archive.return_value = True
+    proxy.exec_run.return_value = Mock(exit_code=0, output=b"")
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    mgr.provision("tok123", b'{"policy": {"default": "allow"}, "secrets": {}}')
+
+    proxy.put_archive.assert_called_once()
+    assert proxy.put_archive.call_args.args[0] == "/run/egress"
+    proxy.exec_run.assert_called_once_with(
+        ["mv", "-f", "/run/egress/config.json.tmp", "/run/egress/config.json"], user="root"
+    )
+
+
+def test_provision_raises_when_rename_fails(monkeypatch):
+    """A non-zero rename exit must fail loud so a half-applied config never goes unnoticed."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.put_archive.return_value = True
+    proxy.exec_run.return_value = Mock(exit_code=1, output=b"mv: cannot move")
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    with pytest.raises(RuntimeError, match="failed to install config"):
+        mgr.provision("tok123", b"{}")

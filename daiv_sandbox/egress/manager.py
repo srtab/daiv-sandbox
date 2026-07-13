@@ -127,15 +127,27 @@ class EgressProxyManager:
         return ip
 
     def provision(self, token: str, config_bytes: bytes) -> None:
-        """Write the config JSON into the running proxy; the addon reloads it on mtime change."""
+        """Write the config JSON into the running proxy ATOMICALLY; the addon reloads on mtime change.
+
+        put_archive extracts in place and is not atomic: a request landing mid-write could read a
+        truncated config.json, and PolicyStore caches that failed parse against the new mtime
+        (deny-all until the next write). So stage to a temp file, then rename it over config.json
+        (atomic on the same filesystem) — a reader sees the old or new file whole.
+        """
         proxy = self._proxy(token)
         # config.json holds secrets, so keep mode 0o600 and own it by the proxy user (RUN_UID) so the
         # non-root mitmdump process can read it; a root-owned 0o600 file would deny-fail closed.
         with _build_single_file_tar_stream(
-            "config.json", config_bytes, mode=0o600, uid=settings.RUN_UID, gid=settings.RUN_GID
+            "config.json.tmp", config_bytes, mode=0o600, uid=settings.RUN_UID, gid=settings.RUN_GID
         ) as tar:
             if not proxy.put_archive(CONFIG_DIR, tar):
-                raise RuntimeError(f"egress: failed to provision config for {token}")
+                raise RuntimeError(f"egress: failed to stage config for {token}")
+        # rename() is atomic within a filesystem: config.json flips content+mtime in one step, so a
+        # concurrent PolicyStore read never observes a partial file. `mv` preserves the temp file's
+        # RUN_UID ownership. Run as root to avoid any confdir permission edge case.
+        result = proxy.exec_run(["mv", "-f", f"{CONFIG_DIR}/config.json.tmp", f"{CONFIG_DIR}/config.json"], user="root")
+        if result.exit_code != 0:
+            raise RuntimeError(f"egress: failed to install config for {token}: [{result.exit_code}] {result.output!r}")
 
     def teardown(self, token: str) -> None:
         # Best-effort: an already-gone resource (NotFound) is success; any other failure is logged and
