@@ -22,7 +22,7 @@ dependencies = [
   "pydantic==2.13.4",
   "pydantic-settings==2.14.2",
   "redis>=8.0.1",
-  "sentry-sdk==2.64.0",
+  "sentry-sdk==2.65.0",
 ]
 urls.changelog = "https://github.com/srtab/daiv-sandbox/blob/main/CHANGELOG.md"
 urls.issues = "https://github.com/srtab/daiv-sandbox/issues"
@@ -30,10 +30,10 @@ urls.source = "https://github.com/srtab/daiv-sandbox"
 
 [dependency-groups]
 dev = [
-  "mypy==2.2.0",
+  "mypy==2.3.0",
   "prek>=0.4.9",
   "pyopenssl==26.3.0",
-  "pyproject-fmt==2.25.2",
+  "pyproject-fmt==2.25.3",
   "pytest-asyncio==1.4.0",
   "pytest-cov==7.1.0",
   "pytest-env==1.6.0",
