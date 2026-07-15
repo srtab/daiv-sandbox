@@ -518,10 +518,11 @@ def test_force_close_tears_down_triad(client):
         mock_mgr_class.return_value.teardown.assert_called_once_with("tok123")
 
 
-def test_non_force_close_preserves_triad(client):
-    """A non-force DELETE of an egress session stops the sandbox but must NOT tear down the triad: the
-    sidecar survives so the session can warm-restart with the same proxy endpoint (the warm-reuse
-    invariant the egress design rests on)."""
+def test_non_force_close_stops_sidecar_but_preserves_triad(client):
+    """A non-force DELETE of an egress session stops BOTH the sandbox and its proxy sidecar — freeing
+    the idle sidecar's memory — but must NOT tear the triad down: the proxy container and internal
+    network survive so the session warm-restarts the proxy on its next turn (via proxy_internal_ip).
+    stop, not teardown, is the warm-reuse-preserving close."""
     with (
         patch("daiv_sandbox.main.SandboxDockerSession") as cls,
         patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
@@ -533,7 +534,24 @@ def test_non_force_close_preserves_triad(client):
         assert resp.status_code == 204
         cls.return_value.stop_container.assert_called_once()
         cls.return_value.remove_container.assert_not_called()
+        mock_mgr_class.return_value.stop_proxy.assert_called_once_with("tok123")
         mock_mgr_class.return_value.teardown.assert_not_called()
+
+
+def test_non_force_close_of_non_egress_session_does_not_touch_egress_manager(client):
+    """A non-force DELETE of a session with no egress token stops the sandbox and never instantiates
+    the egress manager (nothing to stop)."""
+    with (
+        patch("daiv_sandbox.main.SandboxDockerSession") as cls,
+        patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
+    ):
+        cmd = cls.return_value
+        cmd.session_id = "sbx"
+        cls.return_value.client.containers.get.return_value = Mock(labels={})
+        resp = client.delete("/session/sbx/")
+        assert resp.status_code == 204
+        cls.return_value.stop_container.assert_called_once()
+        mock_mgr_class.assert_not_called()
 
 
 def test_get_session_returns_204_when_present(client):
@@ -1674,8 +1692,10 @@ def test_update_egress_missing_api_key(client):
     assert resp.status_code == 403
 
 
-def test_update_egress_503_when_proxy_not_running(client):
-    """A stopped proxy sidecar surfaces as a retryable 503, not an opaque 500."""
+def test_update_egress_503_when_proxy_cannot_be_readied(client):
+    """provision warm-restarts a stopped sidecar; if it cannot ready the proxy (restart fault) or the
+    proxy stops mid-write, it raises SessionUnavailableError, which surfaces as a retryable 503 rather
+    than an opaque 500."""
     with (
         patch("daiv_sandbox.main.SandboxDockerSession") as cls,
         patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,

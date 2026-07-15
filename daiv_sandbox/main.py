@@ -299,8 +299,9 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         except Exception as exc:
             logger.exception("Egress proxy: failed to install CA into sandbox %s", cmd_executor.session_id)
             raise HTTPException(status_code=500, detail="Egress proxy: failed to install CA into the sandbox") from exc
-        # Write the policy to the sidecar at create time (replaces the former standalone egress-provisioning
-        # endpoint, now removed — provisioning is create-time only).
+        # Write the policy to the sidecar at create time (the former standalone egress-provisioning
+        # endpoint was removed). The same manager.provision is reused by PUT /session/{id}/egress/ to
+        # refresh a live session's policy, so provisioning is no longer create-time only.
         try:
             config_bytes = json.dumps(request.egress.to_sidecar_config()).encode("utf-8")
             await asyncio.to_thread(manager.provision, token, config_bytes)
@@ -437,7 +438,10 @@ async def close_session(
 ) -> Response:
     """
     Close a session. By default the container is *stopped* (preserved for warm reuse and reclaimed
-    later by the reaper). Pass ``?force=true`` to remove it immediately.
+    later by the reaper), and its egress proxy sidecar (if any) is stopped alongside it — freeing the
+    idle sidecar's memory while keeping the proxy container and internal network for warm restart on
+    the next turn. Pass ``?force=true`` to remove the container and tear the egress triad down
+    immediately.
     """
     async with request.app.state.session_lock_manager.acquire(session_id):
         cmd_executor = SandboxDockerSession()
@@ -454,11 +458,18 @@ async def close_session(
 
         if force:
             await asyncio.to_thread(cmd_executor.remove_container)
-            if token:
-                manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
-                await asyncio.to_thread(manager.teardown, token)
         else:
             await asyncio.to_thread(cmd_executor.stop_container)
+
+        # Clean up the egress sidecar to match the container op (this runs after it, so a failed
+        # sandbox stop leaves the still-running sandbox's proxy alone). Force close tears the whole
+        # triad down; a non-force (warm) close only STOPS the idle mitmproxy — leaving it running for
+        # the whole reaper grace window (default 12h) is pure memory waste, since a stopped sandbox
+        # can't route traffic. The proxy container + network survive, so provision / a run command
+        # warm-restart it on resume; teardown (force close / reaper) still owns final removal.
+        if token:
+            manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
+            await asyncio.to_thread(manager.teardown if force else manager.stop_proxy, token)
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -486,16 +497,17 @@ async def update_egress(
 ) -> Response:
     """
     Refresh a live session's egress policy + secrets (e.g. a fresh git token) without recreating the
-    container. Rewrites the sidecar's config.json; the proxy hot-reloads it on the next request — no
-    restart. Returns 204; 404 if the session is gone; 409 if the session has no egress proxy; 503 if the proxy
-    sidecar is not running (retryable). Lock-guarded so it can't race the reaper.
+    container. Warm-restarts the sidecar if it was stopped (a warm-stopped session's proxy is stopped
+    to free memory — see close_session), then rewrites its config.json; the proxy hot-reloads on the
+    next request. Returns 204; 404 if the session is gone; 409 if the session has no egress proxy; 503
+    if the proxy sidecar cannot be readied (retryable). Lock-guarded so it can't race the reaper.
     """
     async with request.app.state.session_lock_manager.acquire(session_id):
         cmd_executor = SandboxDockerSession()
         cmd_executor.session_id = session_id
-        # Raw lookup (like DELETE): read the egress label WITHOUT warming a stopped container — the
-        # proxy sidecar runs independently of the sandbox's run state, so provisioning does not need
-        # the sandbox running.
+        # Raw lookup (like DELETE): read the egress label WITHOUT warming a stopped SANDBOX container —
+        # provisioning execs into the proxy sidecar, not the sandbox, so the sandbox's run state is
+        # irrelevant here. (The proxy itself is warm-restarted below if stopped.)
         try:
             container = await asyncio.to_thread(cmd_executor.client.containers.get, session_id)
         except NotFound as exc:
@@ -510,10 +522,13 @@ async def update_egress(
         manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
         config_bytes = json.dumps(egress.to_sidecar_config()).encode("utf-8")
         try:
+            # provision warm-restarts the sidecar if it was stopped (a warm-stopped session's proxy is
+            # stopped to free memory) before writing the config, so a credential refresh on warm reuse
+            # succeeds instead of 503-ing and forcing the daiv caller to discard the warm session.
             await asyncio.to_thread(manager.provision, token, config_bytes)
         except SessionUnavailableError:
-            # Proxy sidecar is stopped (e.g. after a daemon restart): a retryable infra fault, not a
-            # bug. Let the SessionUnavailableError handler map it to 503, consistent with the contract.
+            # provision could not ready the proxy (restart fault), or it stopped/vanished mid-write: a
+            # retryable infra fault, not a bug. Let the SessionUnavailableError handler map it to 503.
             raise
         except Exception as exc:
             logger.exception(

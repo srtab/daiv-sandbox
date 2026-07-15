@@ -126,27 +126,40 @@ class EgressProxyManager:
         logger.info("egress: started proxy %s for token %s", proxy.short_id, token)
         return proxy
 
-    def proxy_internal_ip(self, token: str) -> str:
-        network_name = self._internal_network_name(token)
-        # A sidecar can die (OOM, crash) while its session's sandbox stays warm — Docker then releases
-        # its endpoint IP, so a stopped proxy reads back with no IPAddress. The restart policy (see
-        # start_proxy) recovers a crash/OOM, but a request can arrive before it fires, its retries can be
-        # exhausted, or a daemon restart may have left the proxy down. Warm-restart it here too — the
-        # same restart-on-access idea as SandboxDockerSession._get_container — so the session self-heals
-        # instead of losing egress until it is explicitly recreated. Safe because the confdir
-        # (/run/egress: the injected CA, plus config.json once provisioned) is on the container's
-        # writable layer, so a restarted proxy comes back with its CA intact. Like provision(), any
-        # Docker APIError (missing proxy, or one stopping/vanishing mid-restart; NotFound is a subclass)
-        # becomes a retryable SessionUnavailableError (503) rather than an opaque 500.
+    def ensure_proxy_running(self, token: str) -> Container:
+        """Return the session's proxy, warm-restarting it if it is not running.
+
+        A sidecar can be stopped while its session's sandbox stays warm: a non-force close stops it to
+        free the idle proxy's memory (see close_session), and an OOM/crash or daemon restart can too.
+        The on-failure restart policy (see start_proxy) recovers a crash/OOM, but a request can arrive
+        before it fires, its retries can be exhausted, or a manual stop / daemon restart may have left
+        the proxy down. Warm-restart it on access — the same restart-on-access idea as
+        SandboxDockerSession._get_container — so the session self-heals instead of losing egress until
+        it is explicitly recreated. Safe because the confdir (/run/egress: the injected CA, plus
+        config.json once provisioned) is on the container's writable layer, so a restarted proxy comes
+        back fully configured. Any Docker APIError (missing proxy, or one stopping/vanishing
+        mid-restart; NotFound is a subclass) becomes a retryable SessionUnavailableError (503) rather
+        than an opaque 500.
+        """
         try:
             proxy = self._proxy(token)
             proxy.reload()
             if proxy.status != "running":
                 logger.warning("egress: proxy for %s is %s; restarting", token, proxy.status)
                 proxy.restart()
-                proxy.reload()  # restart() does not refresh attrs; reload() surfaces the fresh IP
+                proxy.reload()  # restart() does not refresh attrs; reload() surfaces the fresh IP/state
         except APIError as exc:
             raise SessionUnavailableError(token, f"egress proxy unavailable ({exc})") from exc
+        return proxy
+
+    def proxy_internal_ip(self, token: str) -> str:
+        """Resolve the proxy's IP on the session's internal network, warm-restarting it if stopped.
+
+        The IP is read after ensure_proxy_running, so a just-restarted proxy reports its fresh endpoint
+        IP (Docker releases the endpoint IP while stopped). A running proxy that somehow holds no IP is
+        a genuine anomaly → explicit RuntimeError (not a retryable 503)."""
+        network_name = self._internal_network_name(token)
+        proxy = self.ensure_proxy_running(token)
         nets = proxy.attrs["NetworkSettings"]["Networks"]
         ip = nets.get(network_name, {}).get("IPAddress")
         if not ip:
@@ -154,7 +167,8 @@ class EgressProxyManager:
         return ip
 
     def provision(self, token: str, config_bytes: bytes) -> None:
-        """Write the config JSON into the running proxy ATOMICALLY; the addon reloads on mtime change.
+        """Warm-restart the proxy if needed, then write the config JSON into it ATOMICALLY; the addon
+        reloads on mtime change.
 
         put_archive extracts in place and is not atomic: a request landing mid-write could read a
         truncated config.json, and PolicyStore caches that failed parse against the new mtime (deny-all
@@ -164,21 +178,18 @@ class EgressProxyManager:
         the mtime flips exactly once.
 
         The rename uses exec_run, which requires the proxy container to be RUNNING (unlike put_archive,
-        which the daemon also accepts against a stopped container). A proxy can be stopped or gone while
-        its session's sandbox still exists — e.g. after a daemon restart or a reaper sweep. (The proxy
-        carries an on-failure restart_policy and proxy_internal_ip warm-restarts it on access, but
-        provision deliberately does NOT restart: it only stages+renames config into an already-running
-        proxy, so it fails 503 here and leaves recovery to those paths.) We check status up front, and
-        also translate any Docker APIError/NotFound raised during the operation (the proxy stopping
-        between the check and the mv, or having been removed) into SessionUnavailableError, so the caller
+        which the daemon also accepts against a stopped container). A warm-stopped session's proxy is
+        stopped (see stop_proxy) and can also be down after an OOM/daemon restart, so readiness is
+        ensured here via ensure_proxy_running — both callers (start_session at create time,
+        update_egress on refresh) get a ready proxy without pre-sequencing, and a restart fault surfaces
+        as a retryable SessionUnavailableError (503) before anything is written. Any Docker
+        APIError/NotFound raised during the write itself (the proxy stopping between the restart and the
+        mv, or having been removed) is likewise translated into SessionUnavailableError, so the caller
         reports 503 (retryable) rather than an opaque 500. A failed rename leaves a benign
         config.json.tmp behind (PolicyStore watches only config.json); the next provision overwrites it.
         """
+        proxy = self.ensure_proxy_running(token)
         try:
-            proxy = self._proxy(token)
-            proxy.reload()
-            if proxy.status != "running":
-                raise SessionUnavailableError(token, f"refreshed: egress proxy is {proxy.status}")
             # config.json holds secrets, so keep mode 0o600 and own it by the proxy user (RUN_UID) so the
             # non-root mitmdump process can read it; a root-owned 0o600 file would deny-fail closed.
             with _build_single_file_tar_stream(
@@ -198,8 +209,8 @@ class EgressProxyManager:
                     f"egress: failed to install config for {token}: [{result.exit_code}] {result.output!r}"
                 )
         except APIError as exc:
-            # The proxy stopped between the status check and the mv, or was removed (NotFound is an
-            # APIError subclass): a retryable infra fault, not a config bug — map to 503, not 500.
+            # The proxy stopped between the restart and the mv, or was removed (NotFound is an APIError
+            # subclass): a retryable infra fault, not a config bug — map to 503, not 500.
             raise SessionUnavailableError(token, f"refreshed: egress proxy unavailable ({exc})") from exc
 
     def teardown(self, token: str) -> None:
@@ -220,6 +231,29 @@ class EgressProxyManager:
                 pass
             except Exception:
                 logger.exception("egress: failed to remove network %s", getattr(net, "name", "?"))
+
+    def stop_proxy(self, token: str) -> None:
+        """Stop — but do NOT remove — the session's proxy sidecar, freeing its memory while the
+        session is warm-stopped (a non-force close). The proxy container and the internal network are
+        preserved so a resumed session warm-restarts the sidecar via ``proxy_internal_ip``: its confdir
+        (injected CA + provisioned config.json) lives on the writable layer, so it comes back fully
+        configured. Final removal of both proxy and network still happens in ``teardown`` (force close
+        or reaper). A manual ``stop`` also suppresses the on-failure restart_policy, so the daemon does
+        not immediately resurrect what we just stopped.
+
+        Best-effort and idempotent, mirroring ``teardown``: a proxy already gone (NotFound) or already
+        stopped (a Docker no-op) is success; any other per-proxy stop failure is logged and swallowed so
+        a stuck sidecar does not fail the caller's DELETE (teardown, via force close or the reaper, is
+        the backstop that force-removes it). Like ``teardown``, the listing itself is not wrapped: a
+        daemon fault in ``_list`` would propagate — acceptable, since the failure case degrades to the
+        pre-existing "proxy lives until the reaper" behavior, never a new leak."""
+        for proxy in self._list(TYPE_EGRESS_PROXY, token):
+            try:
+                proxy.stop(timeout=settings.STOP_TIMEOUT_SECONDS)
+            except NotFound:
+                pass
+            except Exception:
+                logger.exception("egress: failed to stop proxy %s for token %s", getattr(proxy, "short_id", "?"), token)
 
     def _list(self, type_label: str, token: str) -> list:
         return self.client.containers.list(

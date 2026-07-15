@@ -138,6 +138,44 @@ def test_teardown_logs_and_continues_when_proxy_remove_errors():
     net.remove.assert_called_once()  # network still cleaned up despite the proxy failure
 
 
+def test_stop_proxy_stops_container_without_removing_proxy_or_network():
+    """A non-force close stops the sidecar to free its memory, but must NOT remove the proxy
+    container or the internal network: both are preserved so a resumed session warm-restarts the
+    proxy from its provisioned confdir (on the writable layer). Final removal stays in teardown."""
+    from daiv_sandbox.config import settings
+
+    client = MagicMock()
+    proxy = MagicMock()
+    client.containers.list.return_value = [proxy]
+    EgressProxyManager(client).stop_proxy("tok123")
+    # The explicit STOP_TIMEOUT is deliberate (fast memory reclaim); assert it, don't let a silent
+    # revert to Docker's 10s default pass — mirrors test_sessions.py's stop_container assertion.
+    proxy.stop.assert_called_once_with(timeout=settings.STOP_TIMEOUT_SECONDS)
+    proxy.remove.assert_not_called()
+    client.networks.list.assert_not_called()  # the internal network is left intact for warm reuse
+
+
+def test_stop_proxy_suppresses_notfound():
+    """A proxy already gone (NotFound) is success and must not raise."""
+    client = MagicMock()
+    proxy = MagicMock()
+    proxy.stop.side_effect = NotFound("already gone")
+    client.containers.list.return_value = [proxy]
+    EgressProxyManager(client).stop_proxy("tok123")  # must not raise
+    proxy.stop.assert_called_once()  # the swallow happened at the intended call site, not by skipping it
+
+
+def test_stop_proxy_logs_and_swallows_other_errors():
+    """A non-NotFound stop failure (e.g. daemon busy) must be logged and swallowed, not propagated,
+    so a stuck sidecar never fails the DELETE — teardown (force close / reaper) is the backstop."""
+    client = MagicMock()
+    proxy = MagicMock()
+    proxy.stop.side_effect = APIError("daemon busy")
+    client.containers.list.return_value = [proxy]
+    EgressProxyManager(client).stop_proxy("tok123")  # must not raise
+    proxy.stop.assert_called_once()  # the swallow happened at the intended call site, not by skipping it
+
+
 def _proxy_with_ip(ip: str, network_name: str = "daiv-egress-tok123") -> Mock:
     proxy = Mock()
     proxy.attrs = {"NetworkSettings": {"Networks": {network_name: {"IPAddress": ip}}}}
@@ -209,6 +247,43 @@ def test_proxy_internal_ip_raises_when_running_proxy_has_no_ip(monkeypatch):
     proxy.restart.assert_not_called()
 
 
+def test_ensure_proxy_running_restarts_stopped_proxy(monkeypatch):
+    """A warm-stopped session's sidecar (stopped by a non-force close, or an OOM / daemon restart) is
+    warm-restarted on access so a caller that needs it running — provision on an egress refresh —
+    self-heals instead of failing. Same restart-on-access as proxy_internal_ip."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "exited"
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    assert mgr.ensure_proxy_running("tok123") is proxy
+    proxy.restart.assert_called_once()
+    assert proxy.reload.call_count == 2  # once before the status check, once after restart
+
+
+def test_ensure_proxy_running_leaves_running_proxy_untouched(monkeypatch):
+    """A proxy already running is returned without a needless restart."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "running"
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    assert mgr.ensure_proxy_running("tok123") is proxy
+    proxy.restart.assert_not_called()
+
+
+def test_ensure_proxy_running_raises_session_unavailable_when_restart_fails(monkeypatch):
+    """A restart fault surfaces as a retryable SessionUnavailableError (503), not an opaque 500."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "exited"
+    proxy.restart.side_effect = APIError("daemon refused restart")
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    with pytest.raises(SessionUnavailableError):
+        mgr.ensure_proxy_running("tok123")
+
+
 def _running_proxy_mgr(monkeypatch):
     """An EgressProxyManager whose _proxy() returns a running proxy wired for a successful provision.
 
@@ -246,11 +321,31 @@ def test_provision_raises_when_rename_fails(monkeypatch):
         mgr.provision("tok123", b"{}")
 
 
-def test_provision_raises_session_unavailable_when_proxy_not_running(monkeypatch):
-    """A stopped proxy (e.g. after a daemon restart) must fail as a retryable 503, not a torn write."""
+def test_provision_warm_restarts_stopped_proxy_then_writes(monkeypatch):
+    """A warm-stopped proxy (the normal warm-reuse state, since a non-force close stops it) is
+    warm-restarted by provision and then written — provision no longer 503s on a merely-stopped proxy,
+    so an egress refresh on a resumed session succeeds instead of forcing a session recreate."""
     mgr = EgressProxyManager(Mock())
     proxy = Mock()
     proxy.status = "exited"
+    proxy.put_archive.return_value = True
+    proxy.exec_run.return_value = Mock(exit_code=0, output=b"")
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    mgr.provision("tok123", b"{}")
+
+    proxy.restart.assert_called_once()
+    proxy.put_archive.assert_called_once()
+    proxy.exec_run.assert_called_once()
+
+
+def test_provision_raises_session_unavailable_when_restart_fails(monkeypatch):
+    """If a stopped proxy cannot be warm-restarted (daemon/runtime fault), provision surfaces a
+    retryable 503 and writes nothing — no torn config."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "exited"
+    proxy.restart.side_effect = APIError("daemon refused restart")
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
 
     with pytest.raises(SessionUnavailableError):
