@@ -40,6 +40,26 @@ def test_start_proxy_creates_dualhomed_labeled_container(monkeypatch):
     proxy.start.assert_called_once()
 
 
+def test_start_proxy_sets_onfailure_restart_policy(monkeypatch):
+    """The sidecar must carry an on-failure restart policy so the daemon auto-recovers it after a
+    crash/OOM (non-zero exit) — otherwise a dead proxy poisons a still-warm session's egress until a
+    request happens to warm-restart it. It must NOT be `always`/`unless-stopped`: a proxy that OOMs on
+    every boot would thrash forever on a memory-starved host; on-failure is bounded (MaximumRetryCount)
+    and leaves a clean exit-0 shutdown alone."""
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_PROXY_IMAGE", "img:test")
+    monkeypatch.setattr(settings, "EGRESS_PROXY_NETWORK", "egress-net")
+    client = MagicMock()
+    mgr = EgressProxyManager(client)
+
+    mgr.start_proxy("tok123", "daiv-egress-tok123", ca_pem=b"PEM")
+
+    policy = client.containers.create.call_args.kwargs["restart_policy"]
+    assert policy["Name"] == "on-failure"
+    assert policy.get("MaximumRetryCount", 0) > 0  # bounded, so it can't thrash forever
+
+
 def test_exec_proxy_env_points_clients_at_proxy_and_ca():
     env = exec_proxy_env("10.0.0.2", 8080)
     assert env["HTTPS_PROXY"] == "http://10.0.0.2:8080"
@@ -116,6 +136,77 @@ def test_teardown_logs_and_continues_when_proxy_remove_errors():
     client.networks.list.return_value = [net]
     EgressProxyManager(client).teardown("tok123")  # must not raise
     net.remove.assert_called_once()  # network still cleaned up despite the proxy failure
+
+
+def _proxy_with_ip(ip: str, network_name: str = "daiv-egress-tok123") -> Mock:
+    proxy = Mock()
+    proxy.attrs = {"NetworkSettings": {"Networks": {network_name: {"IPAddress": ip}}}}
+    return proxy
+
+
+def test_proxy_internal_ip_returns_ip_of_running_proxy_without_restart(monkeypatch):
+    """The common path: a running proxy with an IP is resolved directly, never restarted."""
+    mgr = EgressProxyManager(Mock())
+    proxy = _proxy_with_ip("10.1.2.3")
+    proxy.status = "running"
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    assert mgr.proxy_internal_ip("tok123") == "10.1.2.3"
+    proxy.restart.assert_not_called()
+
+
+def test_proxy_internal_ip_restarts_stopped_proxy_and_reresolves(monkeypatch):
+    """A proxy sidecar can be OOM-killed (or lost to a daemon restart) while its session's sandbox
+    stays warm, and the restart policy may not have fired yet. proxy_internal_ip must warm-restart the
+    stopped proxy — same restart-on-access idea as the sandbox — and return the fresh IP, so the
+    session self-heals instead of silently losing egress forever.
+
+    The fresh IP is modeled to appear only on the reload() *after* restart() — as with real docker-py,
+    where restart() does not refresh .attrs — so this test guards the reload-after-restart call: drop
+    it and the method reads back the stale (empty) IP and this assertion fails."""
+    mgr = EgressProxyManager(Mock())
+    proxy = _proxy_with_ip("")  # stopped: Docker releases the endpoint IP
+    proxy.status = "exited"
+
+    def _reload():
+        # docker-py refreshes .attrs on reload(), not on restart(): the fresh endpoint IP only appears
+        # on the reload() *after* restart(). Keying the side effect on restart.called guards that
+        # post-restart reload — drop it and attrs stay empty and the assertion fails with "has no IP".
+        if proxy.restart.called:
+            proxy.attrs = _proxy_with_ip("10.9.9.9").attrs
+
+    proxy.reload.side_effect = _reload
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    assert mgr.proxy_internal_ip("tok123") == "10.9.9.9"
+    proxy.restart.assert_called_once()
+    assert proxy.reload.call_count == 2  # once before the status check, once after restart
+
+
+def test_proxy_internal_ip_raises_session_unavailable_when_restart_fails(monkeypatch):
+    """If the dead proxy cannot be restarted (daemon/runtime fault), surface a retryable
+    SessionUnavailableError (503) rather than the opaque "has no IP" RuntimeError."""
+    mgr = EgressProxyManager(Mock())
+    proxy = _proxy_with_ip("")
+    proxy.status = "exited"
+    proxy.restart.side_effect = APIError("daemon refused restart")
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    with pytest.raises(SessionUnavailableError):
+        mgr.proxy_internal_ip("tok123")
+
+
+def test_proxy_internal_ip_raises_when_running_proxy_has_no_ip(monkeypatch):
+    """A genuinely anomalous state — proxy running yet holding no IP on its internal network — still
+    raises the explicit RuntimeError (it is not a stopped-proxy case, so no restart is attempted)."""
+    mgr = EgressProxyManager(Mock())
+    proxy = _proxy_with_ip("")
+    proxy.status = "running"
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+
+    with pytest.raises(RuntimeError, match="has no IP"):
+        mgr.proxy_internal_ip("tok123")
+    proxy.restart.assert_not_called()
 
 
 def _running_proxy_mgr(monkeypatch):

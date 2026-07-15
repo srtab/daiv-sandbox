@@ -80,6 +80,15 @@ class EgressProxyManager:
             "labels": labels,
             "network": network_name,  # internal NIC
             "runtime": settings.EGRESS_PROXY_RUNTIME,
+            # Auto-recover the sidecar after a crash/OOM (non-zero exit), so a still-warm session does
+            # not lose egress. A backstop, not the whole story: on-failure reliably covers a crash/OOM
+            # but — unlike always/unless-stopped — does not guarantee a restart across a daemon restart;
+            # proxy_internal_ip's warm-restart-on-access is the real safety net for that case (and for
+            # exhausted retries). on-failure — NOT always/unless-stopped — so a proxy that OOMs on every
+            # boot can't thrash forever (bounded by MaximumRetryCount) and a clean exit-0 shutdown is
+            # left alone. teardown force-removes the container, which overrides the policy, so this never
+            # fights cleanup.
+            "restart_policy": {"Name": "on-failure", "MaximumRetryCount": 5},
         }
         if settings.EGRESS_PROXY_MEMORY_BYTES:
             create_kwargs["mem_limit"] = settings.EGRESS_PROXY_MEMORY_BYTES
@@ -119,8 +128,25 @@ class EgressProxyManager:
 
     def proxy_internal_ip(self, token: str) -> str:
         network_name = self._internal_network_name(token)
-        proxy = self._proxy(token)
-        proxy.reload()
+        # A sidecar can die (OOM, crash) while its session's sandbox stays warm — Docker then releases
+        # its endpoint IP, so a stopped proxy reads back with no IPAddress. The restart policy (see
+        # start_proxy) recovers a crash/OOM, but a request can arrive before it fires, its retries can be
+        # exhausted, or a daemon restart may have left the proxy down. Warm-restart it here too — the
+        # same restart-on-access idea as SandboxDockerSession._get_container — so the session self-heals
+        # instead of losing egress until it is explicitly recreated. Safe because the confdir
+        # (/run/egress: the injected CA, plus config.json once provisioned) is on the container's
+        # writable layer, so a restarted proxy comes back with its CA intact. Like provision(), any
+        # Docker APIError (missing proxy, or one stopping/vanishing mid-restart; NotFound is a subclass)
+        # becomes a retryable SessionUnavailableError (503) rather than an opaque 500.
+        try:
+            proxy = self._proxy(token)
+            proxy.reload()
+            if proxy.status != "running":
+                logger.warning("egress: proxy for %s is %s; restarting", token, proxy.status)
+                proxy.restart()
+                proxy.reload()  # restart() does not refresh attrs; reload() surfaces the fresh IP
+        except APIError as exc:
+            raise SessionUnavailableError(token, f"egress proxy unavailable ({exc})") from exc
         nets = proxy.attrs["NetworkSettings"]["Networks"]
         ip = nets.get(network_name, {}).get("IPAddress")
         if not ip:
@@ -139,8 +165,10 @@ class EgressProxyManager:
 
         The rename uses exec_run, which requires the proxy container to be RUNNING (unlike put_archive,
         which the daemon also accepts against a stopped container). A proxy can be stopped or gone while
-        its session's sandbox still exists — e.g. after a daemon restart (neither sets a restart_policy,
-        and only the sandbox warm-restarts on access) or a reaper sweep. We check status up front, and
+        its session's sandbox still exists — e.g. after a daemon restart or a reaper sweep. (The proxy
+        carries an on-failure restart_policy and proxy_internal_ip warm-restarts it on access, but
+        provision deliberately does NOT restart: it only stages+renames config into an already-running
+        proxy, so it fails 503 here and leaves recovery to those paths.) We check status up front, and
         also translate any Docker APIError/NotFound raised during the operation (the proxy stopping
         between the check and the mv, or having been removed) into SessionUnavailableError, so the caller
         reports 503 (retryable) rather than an opaque 500. A failed rename leaves a benign

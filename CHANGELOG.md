@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Pipeline exit codes were masked by the last command; commands now run with `pipefail` enabled so a failing stage in a pipeline (e.g. `cmd1 | cmd2`) correctly propagates a non-zero exit code.
 - Invalid bytes in a command's output raised `UnicodeDecodeError`; such bytes are now replaced with U+FFFD instead of failing the request.
+- Egress proxy now self-heals: the sidecar carries a bounded `on-failure` restart policy and is warm-restarted when its internal IP is resolved, so a session no longer loses egress permanently after the proxy is OOM-killed or lost to a daemon restart while the sandbox stays warm.
 
 ## [0.4.0] - 2026-02-22
 
