@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The egress sidecar now streams message bodies larger than 256KB (`stream_large_bodies`) instead of buffering them whole in memory. Large transfers through the proxy (git packfiles, concurrent wheel downloads) previously accumulated as full-body buffers and parked the sidecar's RSS at the peak (400MB+ observed); the egress addon never inspects bodies, so streaming is behavior-neutral.
 - Bumped `sentry-sdk` to 2.65.0, `mypy` to 2.3.0, and `pyproject-fmt` to 2.25.3.
 - Network access is now requested by supplying an `egress` policy block on `POST /session/`; omitting it isolates the sandbox (`network_mode=none`). There is no longer a separate `POST /session/{id}/egress/` endpoint, and `network_enabled` has been removed from the start-session request. **Breaking change**
 - `DELETE /session/{id}/` now _stops_ the container instead of removing it, preserving it for warm reuse; it is reclaimed later by the reaper, or immediately when `?force=true` is passed. **Breaking change** — the container is no longer removed on close by default.
