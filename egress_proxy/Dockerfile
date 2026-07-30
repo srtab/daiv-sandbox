@@ -15,5 +15,8 @@ RUN mkdir -p /run/egress && chown 1000:1000 /run/egress
 
 # `--mode regular` = forward proxy; confdir holds mitmproxy-ca.pem (provisioned by the server before
 # start). --set connection_strategy=lazy so unintercepted (passthrough) flows aren't eagerly opened.
+# stream_large_bodies: without it mitmproxy buffers every body whole (git packfiles, concurrent uv
+# wheel downloads → 400MB+ RSS kept forever). Streamed flows skip body hooks; the addon has none.
 CMD ["mitmdump", "--mode", "regular", "--listen-host", "0.0.0.0", "--listen-port", "8080", \
-     "--set", "confdir=/run/egress", "--set", "connection_strategy=lazy", "-s", "/addon/addon.py"]
+     "--set", "confdir=/run/egress", "--set", "connection_strategy=lazy", \
+     "--set", "stream_large_bodies=256k", "-s", "/addon/addon.py"]
