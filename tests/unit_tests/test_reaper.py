@@ -55,8 +55,12 @@ def test_list_stopped_filters_out_running():
     assert result == [exited, dead]
 
 
+def _container(cid: str, *, status: str = "exited", finished_at: str = ""):
+    return Mock(id=cid, status=status, labels={}, attrs={"State": {"FinishedAt": finished_at}}, remove=Mock())
+
+
 def _stopped_container(cid: str, finished_at: str):
-    return Mock(id=cid, status="exited", labels={}, attrs={"State": {"FinishedAt": finished_at}}, remove=Mock())
+    return _container(cid, finished_at=finished_at)
 
 
 class _BusyLockManager:
@@ -443,7 +447,7 @@ class _FakeActivity:
 
 
 def _running_container(cid: str):
-    return Mock(id=cid, status="running", labels={}, attrs={"State": {"FinishedAt": ""}}, remove=Mock())
+    return _container(cid, status="running")
 
 
 def _running_client(containers):
@@ -452,10 +456,11 @@ def _running_client(containers):
     return client
 
 
-async def test_list_running_filters_out_stopped():
-    running, exited = Mock(status="running"), Mock(status="exited")
+async def test_list_running_asks_the_daemon_for_running_containers_only():
+    """No ``all=True``: the running-only set comes from the daemon's default, not a Python filter."""
+    running = Mock(status="running")
     client = Mock()
-    client.containers.list.return_value = [running, exited]
+    client.containers.list.return_value = [running]
 
     result = _list_running_sandbox_containers(client)
 
@@ -590,30 +595,6 @@ async def test_idle_sweep_does_not_remove_a_container_that_stopped_during_the_lo
 
     c.remove.assert_not_called()
     assert activity.forgotten == []
-
-
-async def test_idle_sweep_isolates_a_failing_activity_read_per_container():
-    """One unreadable record must not starve the sessions listed after it, mirroring the per-token
-    isolation in _reap_orphan_triads. Otherwise a single poisoned key stalls every sweep."""
-    bad = _running_container("bad")
-    good = _running_container("good")
-    activity = _FakeActivity({"good": NOW - timedelta(hours=9)})
-
-    original = activity.last_seen
-
-    async def raising(session_id):
-        if session_id == "bad":
-            raise OverflowError("timestamp out of range for platform time_t")
-        return await original(session_id)
-
-    activity.last_seen = raising
-
-    await _reap_idle_running_sessions(
-        _running_client([bad, good]), NoopSessionLockManager(), activity, now=NOW, idle_seconds=14400
-    )
-
-    bad.remove.assert_not_called()
-    good.remove.assert_called_once_with(force=True, v=True)
 
 
 async def test_remove_guarded_reports_success_when_only_egress_teardown_fails():

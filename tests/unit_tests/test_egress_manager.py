@@ -284,14 +284,15 @@ def test_ensure_proxy_running_raises_session_unavailable_when_restart_fails(monk
         mgr.ensure_proxy_running("tok123")
 
 
-def _running_proxy_mgr(monkeypatch):
-    """An EgressProxyManager whose _proxy() returns a running proxy wired for a successful provision.
+def _provision_ready_mgr(monkeypatch, *, status: str = "running"):
+    """An EgressProxyManager whose _proxy() returns a proxy wired for a successful provision.
 
-    Tests override a single attribute (put_archive/exec_run) to exercise one specific failure path.
+    Tests override a single attribute (put_archive/exec_run) to exercise one specific failure path, or
+    pass ``status`` to start from a proxy provision has to warm-restart first.
     """
     mgr = EgressProxyManager(Mock())
     proxy = Mock()
-    proxy.status = "running"
+    proxy.status = status
     proxy.put_archive.return_value = True
     proxy.exec_run.return_value = Mock(exit_code=0, output=b"")
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
@@ -300,7 +301,7 @@ def _running_proxy_mgr(monkeypatch):
 
 def test_provision_stages_to_temp_then_renames_atomically(monkeypatch):
     """provision must put_archive a temp file, then rename it over config.json (atomic swap)."""
-    mgr, proxy = _running_proxy_mgr(monkeypatch)
+    mgr, proxy = _provision_ready_mgr(monkeypatch)
 
     mgr.provision("tok123", b'{"policy": {"default": "allow"}, "secrets": {}}')
 
@@ -314,7 +315,7 @@ def test_provision_stages_to_temp_then_renames_atomically(monkeypatch):
 
 def test_provision_raises_when_rename_fails(monkeypatch):
     """A non-zero rename exit must fail loud so a half-applied config never goes unnoticed."""
-    mgr, proxy = _running_proxy_mgr(monkeypatch)
+    mgr, proxy = _provision_ready_mgr(monkeypatch)
     proxy.exec_run.return_value = Mock(exit_code=1, output=b"mv: cannot move")
 
     with pytest.raises(RuntimeError, match="failed to install config"):
@@ -357,7 +358,7 @@ def test_provision_raises_session_unavailable_when_restart_fails(monkeypatch):
 
 def test_provision_translates_apierror_during_mv_to_session_unavailable(monkeypatch):
     """A proxy that stops between the status check and the mv must surface as retryable 503, not 500."""
-    mgr, proxy = _running_proxy_mgr(monkeypatch)
+    mgr, proxy = _provision_ready_mgr(monkeypatch)
     proxy.exec_run.side_effect = APIError("Container abc is not running")
 
     with pytest.raises(SessionUnavailableError):
@@ -377,7 +378,7 @@ def test_provision_translates_notfound_proxy_to_session_unavailable(monkeypatch)
 
 def test_provision_raises_when_put_archive_fails(monkeypatch):
     """A daemon-rejected staging copy (put_archive False) must fail loud, not silently skip the write."""
-    mgr, proxy = _running_proxy_mgr(monkeypatch)
+    mgr, proxy = _provision_ready_mgr(monkeypatch)
     proxy.put_archive.return_value = False
 
     with pytest.raises(RuntimeError, match="failed to stage config"):

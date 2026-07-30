@@ -46,17 +46,16 @@ def _parse_docker_timestamp(value: str) -> datetime | None:
 def _list_stopped_sandbox_containers(client) -> list:
     """Return all sandbox cmd-executor containers that are not currently running.
 
-    Filters by label, then drops running containers in Python so every non-running state
-    (``exited`` from a clean stop, a crash/OOM, or ``dead``) is collected.
+    Needs its own Python filter: no Docker filter expresses "not running", so every non-running state
+    (``exited`` from a clean stop, a crash/OOM, or ``dead``) is collected here.
     """
     containers = client.containers.list(all=True, filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}"})
     return [c for c in containers if getattr(c, "status", None) != "running"]
 
 
 def _list_running_sandbox_containers(client) -> list:
-    """Return all sandbox cmd-executor containers that are currently running."""
-    containers = client.containers.list(filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}"})
-    return [c for c in containers if getattr(c, "status", None) == "running"]
+    """Return all sandbox cmd-executor containers that are currently running (``all=False``)."""
+    return client.containers.list(filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}"})
 
 
 async def _still_stopped(container) -> tuple[bool, str]:
@@ -64,31 +63,6 @@ async def _still_stopped(container) -> tuple[bool, str]:
     if getattr(container, "status", None) == "running":
         return False, "is running again"
     return True, ""
-
-
-def _make_still_idle(activity, idle_seconds: int):
-    """Build the idle-path removal precondition: still running AND still positively confirmed idle.
-
-    Fails closed on an unknown activity read: ``last_seen`` returns None for a Redis fault or a record
-    cleared by a concurrent close, and the outer sweep treats None as seed-and-wait, so this
-    destructive branch must not read it as "idle".
-
-    Re-checks the run state too, which the default ``_still_stopped`` would otherwise have covered: a
-    warm (non-force) DELETE landing during the lock wait stops the container, and force-removing it
-    here would bypass the grace window and LRU cap that preserve its writable layer for reuse.
-    """
-
-    async def _still_idle(container) -> tuple[bool, str]:
-        if getattr(container, "status", None) != "running":
-            return False, "is no longer running; leaving it to the stopped-container sweep"
-        current = await activity.last_seen(container.id)
-        if current is None:
-            return False, "activity record became unknown"
-        if (datetime.now(UTC) - current).total_seconds() < idle_seconds:
-            return False, "was touched again"
-        return True, ""
-
-    return _still_idle
 
 
 async def _remove_guarded(container, lock_manager, *, precondition=_still_stopped) -> bool:
@@ -111,8 +85,8 @@ async def _remove_guarded(container, lock_manager, *, precondition=_still_stoppe
             if not proceed:
                 logger.info("Reaper: container %s %s; skipping removal", container.id, reason)
                 return False
-            # v=True: a caller-supplied base_image may declare VOLUME, which would otherwise leak one
-            # anonymous volume per session. Only anonymous volumes are removed; there are no binds.
+            # v=True: else a base_image VOLUME leaks one anonymous volume per session (see
+            # SandboxDockerSession.remove_container).
             await asyncio.to_thread(container.remove, force=True, v=True)
             if token := egress_token(container):
                 try:
@@ -140,38 +114,35 @@ async def _remove_guarded(container, lock_manager, *, precondition=_still_stoppe
 async def _reap_idle_running_sessions(client, lock_manager, activity, *, now, idle_seconds: int) -> None:
     """Remove running cmd-executors that no request has touched for *idle_seconds*.
 
-    This is the only path that reclaims a session whose ``close_session`` never arrived (worker
-    killed, stack redeployed mid-run, crashed or abandoned job). Without it such a container — and
-    the egress proxy that its still-live token shields from the orphan-triad sweep — stays up
-    forever, because every other sweep here considers only *stopped* containers.
+    The only path that reclaims a session whose ``close_session`` never arrived (killed worker,
+    redeploy mid-run, crashed job): every other sweep here considers only *stopped* containers, and a
+    live token also shields its egress triad from the orphan sweep.
 
-    Safety rests on two independent guards, because ``COMMAND_TIMEOUT`` defaults to unbounded and no
-    idle window can be proven longer than the longest legitimate command. First, the per-session lock:
-    a command holds it for its whole duration, so the reaper's own ``acquire`` raises
-    ``SessionBusyError`` and skips the container mid-run however stale its record looks. Second, the
-    record is stamped on operation *exit* as well as entry (see ``_workspace_executor``), so a command
-    that outlasts the window does not leave a reapable record behind when it releases the lock. The
-    lock alone is not enough: ``RedisSessionLockManager`` stops refreshing after a failed reacquire,
-    and the lock TTL is far shorter than this window.
-
-    A session whose activity is *unknown* is seeded rather than reaped. That costs a full idle window
-    but makes the unknown state safe in both directions: sessions predating this feature and live
-    sessions whose record was lost to a Redis flush each get a fresh window, during which normal
-    traffic re-touches them. Requires an enabled tracker — see ``NoopSessionActivityTracker``.
+    Safe despite an unbounded ``COMMAND_TIMEOUT`` because a command holds the per-session lock for its
+    whole duration (so ``_remove_guarded`` skips it) and ``_workspace_executor`` re-stamps on exit, so a
+    command that outlasts the window leaves no reapable record behind. The lock alone is not enough:
+    ``RedisSessionLockManager`` stops refreshing after a failed reacquire and its TTL is far shorter
+    than this window. Unknown activity is seeded, not reaped, so a session predating this feature or one
+    whose record was lost to a Redis flush gets a fresh window instead of being removed.
     """
     if idle_seconds <= 0 or not activity.enabled:
         return
 
-    still_idle = _make_still_idle(activity, idle_seconds)
+    async def still_idle(container) -> tuple[bool, str]:
+        # Fails closed on unknown, matching the seed-and-wait branch below: this is the destructive
+        # path, and a stopped container belongs to the sweep that preserves its writable layer.
+        if getattr(container, "status", None) != "running":
+            return False, "is no longer running; leaving it to the stopped-container sweep"
+        current = await activity.last_seen(container.id)
+        if current is None:
+            return False, "activity record became unknown"
+        if (datetime.now(UTC) - current).total_seconds() < idle_seconds:
+            return False, "was touched again"
+        return True, ""
+
     containers = await asyncio.to_thread(_list_running_sandbox_containers, client)
     for container in containers:
-        try:
-            last_seen = await activity.last_seen(container.id)
-        except Exception:
-            # Isolate per container, as _reap_orphan_triads does: one unreadable record must not starve
-            # the remaining sessions or the orphan-triad sweep that runs after this one.
-            logger.exception("Reaper: failed to read activity for running session %s", container.id)
-            continue
+        last_seen = await activity.last_seen(container.id)
         if last_seen is None:
             logger.info("Reaper: activity record unknown for running session %s; seeding it", container.id)
             await activity.touch(container.id)
@@ -180,8 +151,8 @@ async def _reap_idle_running_sessions(client, lock_manager, activity, *, now, id
         if idle_for < idle_seconds:
             continue
 
-        # debug, not info: the lock/precondition may well skip this container, and an info line here
-        # would claim a removal on every tick for the whole duration of a long-running command.
+        # debug, not info: the lock/precondition may skip this container, and an info line would claim a
+        # removal on every tick for the whole duration of a long-running command.
         logger.debug("Reaper: running session %s idle for %.0fs; attempting removal", container.id, idle_for)
         if await _remove_guarded(container, lock_manager, precondition=still_idle):
             logger.info("Reaper: reclaimed idle running session %s (idle %.0fs)", container.id, idle_for)
