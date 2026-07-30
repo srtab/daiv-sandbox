@@ -46,37 +46,58 @@ def _parse_docker_timestamp(value: str) -> datetime | None:
 def _list_stopped_sandbox_containers(client) -> list:
     """Return all sandbox cmd-executor containers that are not currently running.
 
-    Filters by label, then drops running containers in Python so every non-running state
-    (``exited`` from a clean stop, a crash/OOM, or ``dead``) is collected.
+    Needs its own Python filter: no Docker filter expresses "not running", so every non-running state
+    (``exited`` from a clean stop, a crash/OOM, or ``dead``) is collected here.
     """
     containers = client.containers.list(all=True, filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}"})
     return [c for c in containers if getattr(c, "status", None) != "running"]
 
 
-async def _remove_guarded(container, lock_manager) -> bool:
+def _list_running_sandbox_containers(client) -> list:
+    """Return all sandbox cmd-executor containers that are currently running (``all=False``)."""
+    return client.containers.list(filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}"})
+
+
+async def _still_stopped(container) -> tuple[bool, str]:
+    """Default removal precondition: proceed only while the container is still not running."""
+    if getattr(container, "status", None) == "running":
+        return False, "is running again"
+    return True, ""
+
+
+async def _remove_guarded(container, lock_manager, *, precondition=_still_stopped) -> bool:
     """Force-remove *container* while holding its per-session lock.
 
-    Re-reads the container state under the lock before removing it: a request (e.g. a GET/run
-    restart-on-access) may have warmed the container between the sweep's listing and now, which
-    makes the list-time ``FinishedAt`` decision stale (a TOCTOU). The per-session lock serializes
-    against in-flight requests, but it does not by itself prevent removing a container that was
-    restarted just before the lock was acquired — so we re-check ``status`` and skip a session that
-    is running again.
+    Re-reads the container state under the lock and re-evaluates *precondition* before removing it:
+    the sweep's list-time decision may be stale by the time the lock is acquired (a TOCTOU). On the
+    stopped path a request (e.g. a GET/run restart-on-access) may have warmed the container; on the
+    idle path a request may have touched the session. The per-session lock serializes against
+    in-flight requests, but it does not by itself prevent a change that landed just before the lock
+    was acquired — hence the re-check.
 
     Returns True if the container was removed (or had already vanished), False if the session was
-    busy or is back in use (skip and let a later sweep retry).
+    busy or the precondition no longer holds (skip and let a later sweep retry).
     """
     try:
         async with lock_manager.acquire(container.id):
             await asyncio.to_thread(container.reload)
-            if getattr(container, "status", None) == "running":
-                logger.info("Reaper: container %s is running again; skipping removal", container.id)
+            proceed, reason = await precondition(container)
+            if not proceed:
+                logger.info("Reaper: container %s %s; skipping removal", container.id, reason)
                 return False
-            await asyncio.to_thread(container.remove, force=True)
-            token = egress_token(container)
-            if token:
-                manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
-                await asyncio.to_thread(manager.teardown, token)
+            # v=True: else a base_image VOLUME leaks one anonymous volume per session (see
+            # SandboxDockerSession.remove_container).
+            await asyncio.to_thread(container.remove, force=True, v=True)
+            if token := egress_token(container):
+                try:
+                    manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
+                    await asyncio.to_thread(manager.teardown, token)
+                except Exception:
+                    # The container is gone, so its token is now unreferenced and _reap_orphan_triads
+                    # finishes the job. Removal succeeded — do not report it as a failure.
+                    logger.exception(
+                        "Reaper: removed container %s but failed to tear down egress triad %s", container.id, token
+                    )
     except SessionBusyError:
         logger.info("Reaper: session %s busy; skipping this tick", container.id)
         return False
@@ -86,14 +107,65 @@ async def _remove_guarded(container, lock_manager) -> bool:
         logger.exception("Reaper: failed to remove container %s", container.id)
         return False
     else:
-        logger.info("Reaper: removed stopped container %s", container.id)
+        logger.info("Reaper: removed container %s", container.id)
         return True
 
 
-async def _reap_once(client, lock_manager, *, now, grace_seconds: int, max_stopped: int) -> None:
+async def _reap_idle_running_sessions(client, lock_manager, activity, *, now, idle_seconds: int) -> None:
+    """Remove running cmd-executors that no request has touched for *idle_seconds*.
+
+    The only path that reclaims a session whose ``close_session`` never arrived (killed worker,
+    redeploy mid-run, crashed job): every other sweep here considers only *stopped* containers, and a
+    live token also shields its egress triad from the orphan sweep.
+
+    Safe despite an unbounded ``COMMAND_TIMEOUT`` because a command holds the per-session lock for its
+    whole duration (so ``_remove_guarded`` skips it) and ``_workspace_executor`` re-stamps on exit, so a
+    command that outlasts the window leaves no reapable record behind. The lock alone is not enough:
+    ``RedisSessionLockManager`` stops refreshing after a failed reacquire and its TTL is far shorter
+    than this window. Unknown activity is seeded, not reaped, so a session predating this feature or one
+    whose record was lost to a Redis flush gets a fresh window instead of being removed.
+    """
+    if idle_seconds <= 0 or not activity.enabled:
+        return
+
+    async def still_idle(container) -> tuple[bool, str]:
+        # Fails closed on unknown, matching the seed-and-wait branch below: this is the destructive
+        # path, and a stopped container belongs to the sweep that preserves its writable layer.
+        if getattr(container, "status", None) != "running":
+            return False, "is no longer running; leaving it to the stopped-container sweep"
+        current = await activity.last_seen(container.id)
+        if current is None:
+            return False, "activity record became unknown"
+        if (datetime.now(UTC) - current).total_seconds() < idle_seconds:
+            return False, "was touched again"
+        return True, ""
+
+    containers = await asyncio.to_thread(_list_running_sandbox_containers, client)
+    for container in containers:
+        last_seen = await activity.last_seen(container.id)
+        if last_seen is None:
+            logger.info("Reaper: activity record unknown for running session %s; seeding it", container.id)
+            await activity.touch(container.id)
+            continue
+        idle_for = (now - last_seen).total_seconds()
+        if idle_for < idle_seconds:
+            continue
+
+        # debug, not info: the lock/precondition may skip this container, and an info line would claim a
+        # removal on every tick for the whole duration of a long-running command.
+        logger.debug("Reaper: running session %s idle for %.0fs; attempting removal", container.id, idle_for)
+        if await _remove_guarded(container, lock_manager, precondition=still_idle):
+            logger.info("Reaper: reclaimed idle running session %s (idle %.0fs)", container.id, idle_for)
+            await activity.forget(container.id)
+
+
+async def _reap_once(
+    client, lock_manager, *, now, grace_seconds: int, max_stopped: int, activity, idle_seconds: int
+) -> None:
     """One sweep: remove stopped containers older than the grace window, then LRU-evict any beyond
-    the count cap (oldest ``FinishedAt`` first). Containers with no parseable ``FinishedAt`` are
-    kept and treated as newest for cap ordering."""
+    the count cap (oldest ``FinishedAt`` first), then reclaim idle running sessions and orphan
+    triads. Containers with no parseable ``FinishedAt`` are kept and treated as newest for cap
+    ordering."""
     containers = await asyncio.to_thread(_list_stopped_sandbox_containers, client)
 
     survivors: list[tuple[object, datetime | None]] = []
@@ -109,6 +181,10 @@ async def _reap_once(client, lock_manager, *, now, grace_seconds: int, max_stopp
         survivors.sort(key=lambda item: item[1] or now)
         for container, _finished in survivors[: len(survivors) - max_stopped]:
             await _remove_guarded(container, lock_manager)
+
+    # Before the triad sweep: a half-failed teardown here leaves the token unreferenced, so the backstop
+    # below reclaims it — once the triad outlives grace_seconds, not necessarily in this tick.
+    await _reap_idle_running_sessions(client, lock_manager, activity, now=now, idle_seconds=idle_seconds)
 
     # Sweep orphan triads unconditionally, NOT gated on settings.egress_enabled: an operator who disables
     # egress (removes the CA files) while triads from earlier sessions still exist would otherwise strand
@@ -165,14 +241,22 @@ async def _reap_orphan_triads(client, *, now, grace_seconds: int) -> None:
             logger.exception("Reaper: failed to tear down orphaned egress triad %s", token)
 
 
-async def _maybe_reap(client, redis, lock_manager, *, grace_seconds: int, max_stopped: int) -> None:
+async def _maybe_reap(
+    client, redis, lock_manager, *, grace_seconds: int, max_stopped: int, activity, idle_seconds: int
+) -> None:
     """Run one sweep, gated by a Redis leader lock so only one replica sweeps per tick.
 
     When ``redis`` is None (single-instance / no locking) the sweep runs inline.
     """
     now = datetime.now(UTC)
+    sweep_kwargs = {
+        "grace_seconds": grace_seconds,
+        "max_stopped": max_stopped,
+        "activity": activity,
+        "idle_seconds": idle_seconds,
+    }
     if redis is None:
-        await _reap_once(client, lock_manager, now=now, grace_seconds=grace_seconds, max_stopped=max_stopped)
+        await _reap_once(client, lock_manager, now=now, **sweep_kwargs)
         return
 
     leader = redis.lock(_REAPER_LEADER_KEY, timeout=settings.REAPER_INTERVAL_SECONDS)
@@ -180,7 +264,7 @@ async def _maybe_reap(client, redis, lock_manager, *, grace_seconds: int, max_st
         logger.debug("Reaper: another replica holds the leader lock; skipping tick")
         return
     try:
-        await _reap_once(client, lock_manager, now=now, grace_seconds=grace_seconds, max_stopped=max_stopped)
+        await _reap_once(client, lock_manager, now=now, **sweep_kwargs)
     finally:
         try:
             await leader.release()
@@ -188,11 +272,21 @@ async def _maybe_reap(client, redis, lock_manager, *, grace_seconds: int, max_st
             logger.debug("Reaper: leader lock already released/expired")
 
 
-async def _reaper_loop(client, redis, lock_manager, *, interval: int, grace_seconds: int, max_stopped: int) -> None:
+async def _reaper_loop(
+    client, redis, lock_manager, *, interval: int, grace_seconds: int, max_stopped: int, activity, idle_seconds: int
+) -> None:
     """Sweep forever on a fixed cadence. A failed sweep is logged and the loop continues."""
     while True:
         try:
-            await _maybe_reap(client, redis, lock_manager, grace_seconds=grace_seconds, max_stopped=max_stopped)
+            await _maybe_reap(
+                client,
+                redis,
+                lock_manager,
+                grace_seconds=grace_seconds,
+                max_stopped=max_stopped,
+                activity=activity,
+                idle_seconds=idle_seconds,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -203,11 +297,21 @@ async def _reaper_loop(client, redis, lock_manager, *, interval: int, grace_seco
 def start_reaper(app) -> asyncio.Task | None:
     """Schedule the reaper loop as a background task, or None when disabled.
 
-    Reads ``app.state.redis`` and ``app.state.session_lock_manager`` set up in ``lifespan``.
+    Reads ``app.state.redis``, ``app.state.session_lock_manager`` and ``app.state.session_activity``
+    set up in ``lifespan``.
     """
     if not settings.REAPER_ENABLED:
         logger.info("Reaper disabled (DAIV_SANDBOX_REAPER_ENABLED=false)")
         return None
+
+    activity = app.state.session_activity
+    if settings.RUNNING_SESSION_MAX_IDLE_SECONDS > 0 and not activity.enabled:
+        # Otherwise the one leak with no other backstop is reintroduced with no runtime signal at all.
+        logger.warning(
+            "Reaper: idle-session reaping is configured (%ss) but disabled because DAIV_SANDBOX_REDIS_URL "
+            "is not set; running sessions whose DELETE never arrives will leak indefinitely",
+            settings.RUNNING_SESSION_MAX_IDLE_SECONDS,
+        )
 
     client = SandboxDockerSession._get_shared_client()
     return asyncio.create_task(
@@ -218,5 +322,7 @@ def start_reaper(app) -> asyncio.Task | None:
             interval=settings.REAPER_INTERVAL_SECONDS,
             grace_seconds=settings.SESSION_GRACE_SECONDS,
             max_stopped=settings.MAX_STOPPED_SESSIONS,
+            activity=activity,
+            idle_seconds=settings.RUNNING_SESSION_MAX_IDLE_SECONDS,
         )
     )

@@ -138,14 +138,14 @@ def test_start_container_force_removes_on_bootstrap_failure(mock_docker_client):
     with pytest.raises(RuntimeError):
         session._start_container("img:latest")
 
-    mock_container.remove.assert_called_once_with(force=True)
+    mock_container.remove.assert_called_once_with(force=True, v=True)
 
 
 def test_remove_container(mock_docker_client):
     session = SandboxDockerSession(session_id="test-session-id")
     session.remove_container()
     mock_docker_client.containers.get.assert_called_with(session.session_id)
-    mock_docker_client.containers.get.return_value.remove.assert_called_once_with(force=True)
+    mock_docker_client.containers.get.return_value.remove.assert_called_once_with(force=True, v=True)
 
 
 def test_remove_container_with_container_not_found(mock_docker_client):

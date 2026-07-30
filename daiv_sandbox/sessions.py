@@ -582,7 +582,7 @@ class SandboxDockerSession:
 
         except Exception:
             try:
-                container.remove(force=True)
+                container.remove(force=True, v=True)
             except Exception:
                 logger.warning("Failed to remove container %s after bootstrap failure", container.short_id)
             raise
@@ -593,7 +593,9 @@ class SandboxDockerSession:
 
         """
         try:
-            self.client.containers.get(self.session_id).remove(force=True)
+            # v=True: a caller-supplied base_image may declare VOLUME, which would otherwise leak one
+            # anonymous volume per session. Only anonymous volumes are removed; there are no binds.
+            self.client.containers.get(self.session_id).remove(force=True, v=True)
         except NotFound:
             logger.warning("Container '%s' not found", self.session_id)
         else:
@@ -1082,12 +1084,9 @@ class SandboxDockerSession:
 
         The *authoritative* proxy env (HTTP(S)_PROXY + CA paths) is baked into the container at create
         time (see start_session) and is inherited by every exec; this method only refreshes it from the
-        sidecar so a command sees a current proxy IP. A non-force DELETE stops the sidecar alongside the
-        sandbox, so a resumed session's first command (this runs for every exec, not only networked
-        ones) warm-restarts the sidecar (via ``proxy_internal_ip``) and this refresh re-resolves
-        whatever IP it comes back with — Docker
-        normally re-assigns the same one, but a changed IP is handled too since the refresh overrides
-        the (now-stale) create-time env for that exec.
+        sidecar so a command sees a current proxy IP. A non-force DELETE stops the sidecar too, so a
+        resumed session's first exec warm-restarts it (via ``proxy_internal_ip``) and re-resolves
+        whatever IP it comes back with, overriding the now-stale create-time env for that exec.
 
         A *successful* resolution — and the stable "this session has no egress" case — is cached on the
         instance. A failed resolution returns {} for this call, which leaves the baked create-time env in

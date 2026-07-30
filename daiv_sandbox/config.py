@@ -145,6 +145,9 @@ class Settings(BaseSettings):
     SESSION_GRACE_SECONDS: int = Field(default=43200, ge=0)  # stopped -> removed age (12h)
     MAX_STOPPED_SESSIONS: int = Field(default=50, ge=0)  # LRU cap on retained stopped containers
     STOP_TIMEOUT_SECONDS: int = Field(default=2, ge=0)  # docker stop grace before SIGKILL
+    # Untouched-by-any-request age after which a RUNNING session is removed; 0 disables (needs Redis).
+    # Must outlast the gap between two requests of one live turn; in-flight work is held by the lock.
+    RUNNING_SESSION_MAX_IDLE_SECONDS: int = Field(default=14400, ge=0)
 
 
 settings = Settings()  # type: ignore

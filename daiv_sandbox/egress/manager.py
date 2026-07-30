@@ -18,6 +18,8 @@ from daiv_sandbox.sessions import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from docker import DockerClient
     from docker.models.containers import Container
 
@@ -80,14 +82,8 @@ class EgressProxyManager:
             "labels": labels,
             "network": network_name,  # internal NIC
             "runtime": settings.EGRESS_PROXY_RUNTIME,
-            # Auto-recover the sidecar after a crash/OOM (non-zero exit), so a still-warm session does
-            # not lose egress. A backstop, not the whole story: on-failure reliably covers a crash/OOM
-            # but — unlike always/unless-stopped — does not guarantee a restart across a daemon restart;
-            # proxy_internal_ip's warm-restart-on-access is the real safety net for that case (and for
-            # exhausted retries). on-failure — NOT always/unless-stopped — so a proxy that OOMs on every
-            # boot can't thrash forever (bounded by MaximumRetryCount) and a clean exit-0 shutdown is
-            # left alone. teardown force-removes the container, which overrides the policy, so this never
-            # fights cleanup.
+            # on-failure (not always/unless-stopped): recovers a crashed/OOM'd sidecar without letting one
+            # that OOMs every boot thrash. ensure_proxy_running covers daemon restarts and exhausted retries.
             "restart_policy": {"Name": "on-failure", "MaximumRetryCount": 5},
         }
         if settings.EGRESS_PROXY_MEMORY_BYTES:
@@ -117,7 +113,7 @@ class EgressProxyManager:
             proxy.start()
         except Exception:
             try:
-                proxy.remove(force=True)
+                proxy.remove(force=True, v=True)
             except NotFound:
                 pass
             except Exception:
@@ -129,17 +125,10 @@ class EgressProxyManager:
     def ensure_proxy_running(self, token: str) -> Container:
         """Return the session's proxy, warm-restarting it if it is not running.
 
-        A sidecar can be stopped while its session's sandbox stays warm: a non-force close stops it to
-        free the idle proxy's memory (see close_session), and an OOM/crash or daemon restart can too.
-        The on-failure restart policy (see start_proxy) recovers a crash/OOM, but a request can arrive
-        before it fires, its retries can be exhausted, or a manual stop / daemon restart may have left
-        the proxy down. Warm-restart it on access — the same restart-on-access idea as
-        SandboxDockerSession._get_container — so the session self-heals instead of losing egress until
-        it is explicitly recreated. Safe because the confdir (/run/egress: the injected CA, plus
-        config.json once provisioned) is on the container's writable layer, so a restarted proxy comes
-        back fully configured. Any Docker APIError (missing proxy, or one stopping/vanishing
-        mid-restart; NotFound is a subclass) becomes a retryable SessionUnavailableError (503) rather
-        than an opaque 500.
+        A warm close stops the sidecar (see stop_proxy) and an OOM/crash or daemon restart can too; the
+        confdir (/run/egress: injected CA + provisioned config.json) is on the writable layer, so a
+        restarted proxy comes back fully configured. Restart-on-access, like
+        SandboxDockerSession._get_container. Any APIError (NotFound included) → retryable 503, not 500.
         """
         try:
             proxy = self._proxy(token)
@@ -156,8 +145,7 @@ class EgressProxyManager:
         """Resolve the proxy's IP on the session's internal network, warm-restarting it if stopped.
 
         The IP is read after ensure_proxy_running, so a just-restarted proxy reports its fresh endpoint
-        IP (Docker releases the endpoint IP while stopped). A running proxy that somehow holds no IP is
-        a genuine anomaly → explicit RuntimeError (not a retryable 503)."""
+        IP (Docker releases the endpoint IP while stopped)."""
         network_name = self._internal_network_name(token)
         proxy = self.ensure_proxy_running(token)
         nets = proxy.attrs["NetworkSettings"]["Networks"]
@@ -177,16 +165,11 @@ class EgressProxyManager:
         over config.json (atomic on the same filesystem): a reader sees the old or new file whole and
         the mtime flips exactly once.
 
-        The rename uses exec_run, which requires the proxy container to be RUNNING (unlike put_archive,
-        which the daemon also accepts against a stopped container). A warm-stopped session's proxy is
-        stopped (see stop_proxy) and can also be down after an OOM/daemon restart, so readiness is
-        ensured here via ensure_proxy_running — both callers (start_session at create time,
-        update_egress on refresh) get a ready proxy without pre-sequencing, and a restart fault surfaces
-        as a retryable SessionUnavailableError (503) before anything is written. Any Docker
-        APIError/NotFound raised during the write itself (the proxy stopping between the restart and the
-        mv, or having been removed) is likewise translated into SessionUnavailableError, so the caller
-        reports 503 (retryable) rather than an opaque 500. A failed rename leaves a benign
-        config.json.tmp behind (PolicyStore watches only config.json); the next provision overwrites it.
+        The rename uses exec_run, which requires the proxy RUNNING (unlike put_archive), so readiness
+        goes through ensure_proxy_running and both callers get a ready proxy without pre-sequencing. A
+        restart fault surfaces as a retryable 503 before anything is written; so does the proxy stopping
+        or vanishing mid-write. A failed rename leaves a benign config.json.tmp behind (PolicyStore
+        watches only config.json); the next provision overwrites it.
         """
         proxy = self.ensure_proxy_running(token)
         try:
@@ -214,46 +197,37 @@ class EgressProxyManager:
             raise SessionUnavailableError(token, f"refreshed: egress proxy unavailable ({exc})") from exc
 
     def teardown(self, token: str) -> None:
-        # Best-effort: an already-gone resource (NotFound) is success; any other failure is logged and
-        # swallowed so one stuck resource never masks the caller's original error or skips the rest of
-        # the cleanup (the reaper retries on the next sweep).
-        for proxy in self._list(TYPE_EGRESS_PROXY, token):
-            try:
-                proxy.remove(force=True)
-            except NotFound:
-                pass
-            except Exception:
-                logger.exception("egress: failed to remove proxy %s", getattr(proxy, "short_id", "?"))
-        for net in self.client.networks.list(filters={"label": f"{EGRESS_SESSION_LABEL}={token}"}):
-            try:
-                net.remove()
-            except NotFound:
-                pass
-            except Exception:
-                logger.exception("egress: failed to remove network %s", getattr(net, "name", "?"))
+        # v=True: the mitmproxy base image declares VOLUME on the confdir, so without it each proxy
+        # leaks one anonymous volume.
+        proxies = self._list(TYPE_EGRESS_PROXY, token)
+        self._best_effort(proxies, lambda proxy: proxy.remove(force=True, v=True), "remove")
+        networks = self.client.networks.list(filters={"label": f"{EGRESS_SESSION_LABEL}={token}"})
+        self._best_effort(networks, lambda net: net.remove(), "remove")
 
     def stop_proxy(self, token: str) -> None:
-        """Stop — but do NOT remove — the session's proxy sidecar, freeing its memory while the
-        session is warm-stopped (a non-force close). The proxy container and the internal network are
-        preserved so a resumed session warm-restarts the sidecar via ``proxy_internal_ip``: its confdir
-        (injected CA + provisioned config.json) lives on the writable layer, so it comes back fully
-        configured. Final removal of both proxy and network still happens in ``teardown`` (force close
-        or reaper). A manual ``stop`` also suppresses the on-failure restart_policy, so the daemon does
-        not immediately resurrect what we just stopped.
+        """Stop — but do NOT remove — the session's proxy sidecar, freeing its memory while the session
+        is warm-stopped (a non-force close). A resumed session warm-restarts it via
+        ``ensure_proxy_running``; ``teardown`` (force close or reaper) still owns final removal. A manual
+        ``stop`` also suppresses the on-failure restart_policy, so the daemon does not resurrect it."""
+        proxies = self._list(TYPE_EGRESS_PROXY, token)
+        self._best_effort(proxies, lambda proxy: proxy.stop(timeout=settings.STOP_TIMEOUT_SECONDS), "stop")
 
-        Best-effort and idempotent, mirroring ``teardown``: a proxy already gone (NotFound) or already
-        stopped (a Docker no-op) is success; any other per-proxy stop failure is logged and swallowed so
-        a stuck sidecar does not fail the caller's DELETE (teardown, via force close or the reaper, is
-        the backstop that force-removes it). Like ``teardown``, the listing itself is not wrapped: a
-        daemon fault in ``_list`` would propagate — acceptable, since the failure case degrades to the
-        pre-existing "proxy lives until the reaper" behavior, never a new leak."""
-        for proxy in self._list(TYPE_EGRESS_PROXY, token):
+    @staticmethod
+    def _best_effort(resources: list, op: Callable[..., object], what: str) -> None:
+        """Apply *op* to each resource, tolerating faults: an already-gone resource (NotFound) is
+        success, and any other failure is logged and swallowed so one stuck resource never masks the
+        caller's original error or skips the rest of the cleanup (the reaper retries next sweep).
+
+        The listing itself is deliberately not wrapped: a daemon fault there propagates, which degrades
+        to "the resource lives until the reaper" rather than to a new leak."""
+        for resource in resources:
             try:
-                proxy.stop(timeout=settings.STOP_TIMEOUT_SECONDS)
+                op(resource)
             except NotFound:
                 pass
             except Exception:
-                logger.exception("egress: failed to stop proxy %s for token %s", getattr(proxy, "short_id", "?"), token)
+                name = getattr(resource, "short_id", None) or getattr(resource, "name", "?")
+                logger.exception("egress: failed to %s %s", what, name)
 
     def _list(self, type_label: str, token: str) -> list:
         return self.client.containers.list(

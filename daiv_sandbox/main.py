@@ -18,6 +18,7 @@ from fastapi.security.api_key import APIKeyHeader
 from redis.asyncio import Redis
 
 from daiv_sandbox import __version__
+from daiv_sandbox.activity import NoopSessionActivityTracker, RedisSessionActivityTracker
 from daiv_sandbox.config import settings
 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, SessionBusyError
@@ -124,13 +125,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             wait_seconds=settings.SESSION_LOCK_WAIT_SECONDS,
             refresh_interval_seconds=settings.SESSION_LOCK_REFRESH_SECONDS,
         )
+        # The TTL margin over the window IS the band in which reaping can happen: at ttl == window a record
+        # expires exactly as it becomes reapable. The floor keeps ttl > 0 when the window is 0 (disabled).
+        app.state.session_activity = RedisSessionActivityTracker(
+            redis_client, ttl_seconds=max(settings.RUNNING_SESSION_MAX_IDLE_SECONDS * 2, 3600)
+        )
     else:
         if settings.ENVIRONMENT == "production":
             logger.warning(
-                "REDIS_URL is not configured; per-session locking is disabled and concurrent requests may race"
+                "REDIS_URL is not configured; per-session locking and idle-session reaping are disabled, "
+                "concurrent requests may race and running sessions whose DELETE never arrives will leak"
             )
         app.state.redis = None
         app.state.session_lock_manager = NoopSessionLockManager()
+        app.state.session_activity = NoopSessionActivityTracker()
 
     reaper_task = start_reaper(app)
     try:
@@ -155,6 +163,7 @@ app = FastAPI(
 )
 app.state.redis = None
 app.state.session_lock_manager = NoopSessionLockManager()
+app.state.session_activity = NoopSessionActivityTracker()
 
 
 @app.exception_handler(SessionBusyError)
@@ -212,7 +221,9 @@ _fs_responses = {code: resp for code, resp in common_responses.items() if code !
 
 
 @app.post("/session/", responses=common_responses, name="Obtain a session ID")
-async def start_session(request: StartSessionRequest, api_key: str = Depends(get_api_key)) -> StartSessionResponse:
+async def start_session(
+    http_request: Request, request: StartSessionRequest, api_key: str = Depends(get_api_key)
+) -> StartSessionResponse:
     """
     Start a session and return the session ID.
 
@@ -282,6 +293,7 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         )
         if cmd_executor.session_id is None:
             raise RuntimeError("Started session is missing a session ID")
+        await http_request.app.state.session_activity.touch(cmd_executor.session_id)
         return StartSessionResponse(session_id=cmd_executor.session_id)
 
     # The triad already exists. Every step from here — start the sandbox, install the CA, provision the
@@ -319,6 +331,9 @@ async def start_session(request: StartSessionRequest, api_key: str = Depends(get
         await asyncio.to_thread(manager.teardown, token)
         raise
 
+    # Stamp the activity record at creation so the reaper's seed-on-unknown branch stays a backstop for
+    # pre-this-feature sessions and lost records, instead of firing for every new session.
+    await http_request.app.state.session_activity.touch(cmd_executor.session_id)
     return StartSessionResponse(session_id=cmd_executor.session_id)
 
 
@@ -461,15 +476,12 @@ async def close_session(
         else:
             await asyncio.to_thread(cmd_executor.stop_container)
 
-        # Clean up the egress sidecar to match the container op (this runs after it, so a failed
-        # sandbox stop leaves the still-running sandbox's proxy alone). Force close tears the whole
-        # triad down; a non-force (warm) close only STOPS the idle mitmproxy — leaving it running for
-        # the whole reaper grace window (default 12h) is pure memory waste, since a stopped sandbox
-        # can't route traffic. The proxy container + network survive, so provision / a run command
-        # warm-restart it on resume; teardown (force close / reaper) still owns final removal.
+        # After the container op, so a failed sandbox stop leaves a still-running sandbox's proxy alone.
         if token:
             manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
             await asyncio.to_thread(manager.teardown if force else manager.stop_proxy, token)
+
+        await request.app.state.session_activity.forget(session_id)
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -522,9 +534,6 @@ async def update_egress(
         manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
         config_bytes = json.dumps(egress.to_sidecar_config()).encode("utf-8")
         try:
-            # provision warm-restarts the sidecar if it was stopped (a warm-stopped session's proxy is
-            # stopped to free memory) before writing the config, so a credential refresh on warm reuse
-            # succeeds instead of 503-ing and forcing the daiv caller to discard the warm session.
             await asyncio.to_thread(manager.provision, token, config_bytes)
         except SessionUnavailableError:
             # provision could not ready the proxy (restart fault), or it stopped/vanished mid-write: a
@@ -537,6 +546,10 @@ async def update_egress(
             raise HTTPException(
                 status_code=500, detail="Egress proxy: failed to refresh policy into the sidecar"
             ) from exc
+
+        # A credential refresh means the caller is still driving this session, and this endpoint does
+        # not go through _workspace_executor, so record activity here too.
+        await request.app.state.session_activity.touch(session_id)
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -609,12 +622,20 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
 
 @asynccontextmanager
 async def _workspace_executor(http_request: Request, session_id: str) -> AsyncIterator[SandboxDockerSession]:
-    """Acquire the session lock and yield a live cmd_executor, or 404."""
+    """Acquire the session lock and yield a live cmd_executor, or 404.
+
+    Activity is stamped on entry AND exit: COMMAND_TIMEOUT is unbounded, so an entry-only stamp would
+    already be past the idle window by the time a long, healthy command released the lock.
+    """
     async with http_request.app.state.session_lock_manager.acquire(session_id):
         cmd = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
         if not cmd.container:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
-        yield cmd
+        await http_request.app.state.session_activity.touch(session_id)
+        try:
+            yield cmd
+        finally:
+            await http_request.app.state.session_activity.touch(session_id)
 
 
 @app.post("/session/{session_id}/fs/write", responses=_fs_responses, name="Write a workspace file")
