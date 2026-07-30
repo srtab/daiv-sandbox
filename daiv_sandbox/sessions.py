@@ -582,7 +582,7 @@ class SandboxDockerSession:
 
         except Exception:
             try:
-                container.remove(force=True)
+                container.remove(force=True, v=True)
             except Exception:
                 logger.warning("Failed to remove container %s after bootstrap failure", container.short_id)
             raise
@@ -593,7 +593,9 @@ class SandboxDockerSession:
 
         """
         try:
-            self.client.containers.get(self.session_id).remove(force=True)
+            # v=True: a caller-supplied base_image may declare VOLUME, which would otherwise leak one
+            # anonymous volume per session. Only anonymous volumes are removed; there are no binds.
+            self.client.containers.get(self.session_id).remove(force=True, v=True)
         except NotFound:
             logger.warning("Container '%s' not found", self.session_id)
         else:

@@ -145,12 +145,8 @@ class Settings(BaseSettings):
     SESSION_GRACE_SECONDS: int = Field(default=43200, ge=0)  # stopped -> removed age (12h)
     MAX_STOPPED_SESSIONS: int = Field(default=50, ge=0)  # LRU cap on retained stopped containers
     STOP_TIMEOUT_SECONDS: int = Field(default=2, ge=0)  # docker stop grace before SIGKILL
-    # How long a RUNNING session may go untouched by any request before the reaper removes it; 0 disables.
-    # Closes the only unbounded leak: a missed close_session (worker killed, redeploy mid-run, crashed job)
-    # otherwise leaves the container + its egress proxy up forever, since the reaper only reaps stopped ones.
-    # In-flight work is protected by the per-session lock, not by this window (COMMAND_TIMEOUT defaults to
-    # unbounded), so the value only has to outlast the gap between two requests of one live turn — 4h is far
-    # beyond any plausible gap while still bounding the leak to hours instead of forever.
+    # Untouched-by-any-request age after which a RUNNING session is removed; 0 disables (needs Redis).
+    # Must outlast the gap between two requests of one live turn; in-flight work is held by the lock.
     RUNNING_SESSION_MAX_IDLE_SECONDS: int = Field(default=14400, ge=0)
 
 

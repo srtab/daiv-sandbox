@@ -32,12 +32,14 @@ class NoopSessionActivityTracker:
 
 
 class RedisSessionActivityTracker:
-    """Records the last time each session was touched by a request, for idle-session reaping.
+    """Records the last time each session was touched, for idle-session reaping.
 
     Every method is best-effort: a Redis fault is logged and swallowed, never raised at the caller.
-    A request must not fail because bookkeeping did, and a sweep must not abort because one read did
-    — an unreadable record is reported as "unknown" (None), which the reaper treats as
-    seed-and-wait rather than as "idle".
+    A request must not fail because bookkeeping did, and a sweep must not abort because one read did.
+
+    Contract: ``last_seen`` returns None for "unknown" — no record, an expired one, an unreadable one,
+    or junk. Unknown is NOT evidence of idleness, so a caller making a destructive decision must treat
+    it as "do not remove" (see ``_reap_idle_running_sessions`` and ``_make_still_idle``).
     """
 
     enabled = True
@@ -71,7 +73,9 @@ class RedisSessionActivityTracker:
             return None
         try:
             return datetime.fromtimestamp(float(raw), UTC)
-        except TypeError, ValueError:
+        except Exception:
+            # Broad on purpose: an out-of-range epoch raises OverflowError/OSError, not just ValueError,
+            # and the reaper's sweep must not abort because one record was junk.
             logger.warning("activity: unparseable activity record for session %s: %r", session_id, raw)
             return None
 

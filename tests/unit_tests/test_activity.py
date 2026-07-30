@@ -52,9 +52,24 @@ async def test_last_seen_is_none_when_absent():
     assert await tracker.last_seen("abc") is None
 
 
-async def test_last_seen_is_none_on_unparseable_value():
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"not-a-timestamp",
+        b"",
+        b"nan",
+        # Out-of-range epochs raise OverflowError/OSError rather than ValueError. These escaped a
+        # narrower handler and aborted the whole reaper sweep, including the orphan-triad backstop.
+        b"inf",
+        b"-inf",
+        b"1e30",
+        b"1e18",
+        b"99999999999999999999",
+    ],
+)
+async def test_last_seen_is_none_on_unparseable_value(raw):
     redis = AsyncMock()
-    redis.get.return_value = b"not-a-timestamp"
+    redis.get.return_value = raw
     tracker = RedisSessionActivityTracker(redis, ttl_seconds=120)
 
     assert await tracker.last_seen("abc") is None

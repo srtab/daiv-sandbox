@@ -2,7 +2,7 @@ import base64
 import io
 import uuid
 from contextlib import AbstractAsyncContextManager, contextmanager
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from docker.errors import APIError, NotFound
@@ -587,6 +587,45 @@ def test_lifespan_starts_and_cancels_reaper():
 
     start_mock.assert_called_once()
     started["task"].cancel.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("idle_seconds", "expected_ttl"),
+    [
+        # The TTL margin over the window IS the band in which reaping can happen: at ttl == window a
+        # record expires exactly as it becomes reapable, so nothing would ever be reaped.
+        (14400, 28800),
+        (60, 3600),
+        # 0 disables idle reaping, and the tracker rejects ttl <= 0 — without the floor, startup dies.
+        (0, 3600),
+    ],
+)
+def test_lifespan_derives_activity_ttl_above_the_idle_window(monkeypatch, idle_seconds, expected_ttl):
+    monkeypatch.setattr(settings, "REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setattr(settings, "RUNNING_SESSION_MAX_IDLE_SECONDS", idle_seconds)
+
+    with (
+        patch("daiv_sandbox.main.start_reaper", return_value=None),
+        patch("daiv_sandbox.main.Redis.from_url", return_value=AsyncMock()),
+        TestClient(app, headers={"X-API-Key": settings.API_KEY.get_secret_value()}, root_path=settings.API_V1_STR),
+    ):
+        tracker = app.state.session_activity
+        assert tracker.enabled is True
+        assert tracker.ttl_seconds == expected_ttl
+        assert tracker.ttl_seconds > idle_seconds
+
+
+def test_lifespan_without_redis_disables_idle_reaping(monkeypatch):
+    """The Noop tracker is what stops the sweep running alongside NoopSessionLockManager, where a
+    running container could be removed from under a live request."""
+    monkeypatch.setattr(settings, "REDIS_URL", None)
+
+    with (
+        patch("daiv_sandbox.main.start_reaper", return_value=None),
+        TestClient(app, headers={"X-API-Key": settings.API_KEY.get_secret_value()}, root_path=settings.API_V1_STR),
+    ):
+        assert app.state.session_activity.enabled is False
+        assert app.state.redis is None
 
 
 def test_close_session_returns_conflict_when_session_is_locked(mock_session, client, monkeypatch):
@@ -1666,6 +1705,19 @@ def test_update_egress_refreshes_running_session(client):
         assert b"github.com" in mock_mgr_class.return_value.provision.call_args.args[1]
 
 
+def test_update_egress_records_session_activity(client, monkeypatch):
+    """A credential refresh means the caller is still driving the session, and this endpoint bypasses
+    _workspace_executor — so without its own touch the session drifts toward the idle sweep."""
+    activity = _RecordingActivity()
+    monkeypatch.setattr(app.state, "session_activity", activity)
+
+    with patch("daiv_sandbox.main.SandboxDockerSession") as cls, patch("daiv_sandbox.main.EgressProxyManager"):
+        cls.return_value.client.containers.get.return_value = Mock(labels={"daiv.sandbox.egress": "tok123"})
+        assert client.put("/session/sbx/egress/", json=_EGRESS_PAYLOAD).status_code == 204
+
+    assert activity.touched == ["sbx"]
+
+
 def test_update_egress_404_when_session_missing(client):
     with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
         cls.return_value.client.containers.get.side_effect = NotFound("gone")
@@ -1751,8 +1803,12 @@ class _RecordingActivity:
 
 
 def test_workspace_op_records_session_activity(client, monkeypatch):
-    """Every workspace op must refresh the activity record, otherwise the reaper's idle sweep would
-    eventually remove a session that is actively in use."""
+    """Every workspace op must refresh the activity record on entry AND on exit, otherwise the reaper's
+    idle sweep would eventually remove a session that is actively in use.
+
+    The exit touch is what makes an operation longer than the idle window safe: an entry-only stamp is
+    already older than the window the moment the lock is released (COMMAND_TIMEOUT is unbounded by
+    default), so the next sweep would reap a session whose command had just succeeded."""
     activity = _RecordingActivity()
     monkeypatch.setattr(app.state, "session_activity", activity)
 
@@ -1760,7 +1816,28 @@ def test_workspace_op_records_session_activity(client, monkeypatch):
         mock_session_class.return_value.container = Mock()
         assert client.get("/session/live-id/").status_code == 204
 
-    assert activity.touched == ["live-id"]
+    assert activity.touched == ["live-id", "live-id"]
+
+
+def test_failed_workspace_op_still_records_activity(client, monkeypatch):
+    """The exit touch lives in a finally: a session whose command raised is still in use, and must not
+    be left with a stale record for the reaper to act on."""
+    activity = _RecordingActivity()
+    monkeypatch.setattr(app.state, "session_activity", activity)
+
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_cmd = Mock()
+        mock_cmd.container = Mock()
+        mock_cmd.write_file.side_effect = OSError("docker transport fault")
+        mock_session_class.return_value = mock_cmd
+
+        with pytest.raises(OSError, match="docker transport fault"):
+            client.post(
+                "/session/live-id/fs/write",
+                json={"path": "/workspace/tmp/a.txt", "content": base64.b64encode(b"x").decode(), "mode": 0o644},
+            )
+
+    assert activity.touched == ["live-id", "live-id"]
 
 
 def test_missing_session_does_not_record_activity(client, monkeypatch):

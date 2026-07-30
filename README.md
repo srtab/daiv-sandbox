@@ -332,7 +332,7 @@ print(resp["results"][0]["output"])
 
 To close a sandbox session, you need to call the `DELETE /session/{session_id}/` endpoint using the session ID returned when starting the session.
 
-`DELETE /session/{id}/` stops the container (kept warm for reuse); pass `?force=true` to remove it immediately. A background reaper removes stopped containers after `DAIV_SANDBOX_SESSION_GRACE_SECONDS` (default 12h) or once the `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` LRU cap is exceeded. A session left running because its close never arrived is removed once it has been idle for `DAIV_SANDBOX_RUNNING_SESSION_MAX_IDLE_SECONDS` (default 4h); a request in flight holds the session lock and is never interrupted.
+`DELETE /session/{id}/` stops the container (kept warm for reuse); pass `?force=true` to remove it immediately. A background reaper removes stopped containers after `DAIV_SANDBOX_SESSION_GRACE_SECONDS` (default 12h) or once the `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` LRU cap is exceeded. A session left running because its close never arrived is removed once it has been idle for `DAIV_SANDBOX_RUNNING_SESSION_MAX_IDLE_SECONDS` (default 4h). A request in flight holds the session lock, and each operation refreshes the idle timer when it finishes as well as when it starts, so a long-running command is not interrupted.
 
 ```sh
 $ curl -X DELETE \

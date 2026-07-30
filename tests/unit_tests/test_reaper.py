@@ -80,7 +80,7 @@ async def test_remove_guarded_removes_when_lock_free():
     c = _stopped_container("a", "2026-06-01T00:00:00Z")
     removed = await _remove_guarded(c, NoopSessionLockManager())
     assert removed is True
-    c.remove.assert_called_once_with(force=True)
+    c.remove.assert_called_once_with(force=True, v=True)
 
 
 async def test_remove_guarded_skips_when_busy():
@@ -129,9 +129,17 @@ async def test_reap_once_removes_only_aged_out():
     client.containers.list.return_value = [old, fresh]
     client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
-    await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=50)
+    await _reap_once(
+        client,
+        NoopSessionLockManager(),
+        now=NOW,
+        grace_seconds=43200,
+        max_stopped=50,
+        activity=NoopSessionActivityTracker(),
+        idle_seconds=0,
+    )
 
-    old.remove.assert_called_once_with(force=True)
+    old.remove.assert_called_once_with(force=True, v=True)
     fresh.remove.assert_not_called()
 
 
@@ -144,10 +152,18 @@ async def test_reap_once_lru_evicts_oldest_beyond_cap():
     client.containers.list.return_value = [c3, c1, c2]  # unsorted on purpose
     client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
-    await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=1)
+    await _reap_once(
+        client,
+        NoopSessionLockManager(),
+        now=NOW,
+        grace_seconds=43200,
+        max_stopped=1,
+        activity=NoopSessionActivityTracker(),
+        idle_seconds=0,
+    )
 
-    c1.remove.assert_called_once_with(force=True)
-    c2.remove.assert_called_once_with(force=True)
+    c1.remove.assert_called_once_with(force=True, v=True)
+    c2.remove.assert_called_once_with(force=True, v=True)
     c3.remove.assert_not_called()
 
 
@@ -159,10 +175,18 @@ async def test_reap_once_max_stopped_zero_evicts_all():
     client.containers.list.return_value = [c1, c2]
     client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
-    await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=0)
+    await _reap_once(
+        client,
+        NoopSessionLockManager(),
+        now=NOW,
+        grace_seconds=43200,
+        max_stopped=0,
+        activity=NoopSessionActivityTracker(),
+        idle_seconds=0,
+    )
 
-    c1.remove.assert_called_once_with(force=True)
-    c2.remove.assert_called_once_with(force=True)
+    c1.remove.assert_called_once_with(force=True, v=True)
+    c2.remove.assert_called_once_with(force=True, v=True)
 
 
 async def test_reap_once_always_runs_orphan_sweep():
@@ -172,7 +196,15 @@ async def test_reap_once_always_runs_orphan_sweep():
     client = Mock()
     client.containers.list.return_value = []
     with patch("daiv_sandbox.reaper._reap_orphan_triads", new=AsyncMock()) as sweep:
-        await _reap_once(client, NoopSessionLockManager(), now=NOW, grace_seconds=43200, max_stopped=50)
+        await _reap_once(
+            client,
+            NoopSessionLockManager(),
+            now=NOW,
+            grace_seconds=43200,
+            max_stopped=50,
+            activity=NoopSessionActivityTracker(),
+            idle_seconds=0,
+        )
     sweep.assert_awaited_once_with(client, now=NOW, grace_seconds=43200)
 
 
@@ -183,7 +215,15 @@ async def test_maybe_reap_runs_directly_without_redis():
     # redis=None -> no leader lock, sweep runs inline (no exception, list consulted).
     from daiv_sandbox.reaper import _maybe_reap
 
-    await _maybe_reap(client, None, NoopSessionLockManager(), grace_seconds=43200, max_stopped=50)
+    await _maybe_reap(
+        client,
+        None,
+        NoopSessionLockManager(),
+        grace_seconds=43200,
+        max_stopped=50,
+        activity=NoopSessionActivityTracker(),
+        idle_seconds=0,
+    )
     client.containers.list.assert_called()
 
 
@@ -198,7 +238,15 @@ async def test_maybe_reap_skips_when_not_leader():
     redis = Mock()
     redis.lock = Mock(return_value=lock)
 
-    await _maybe_reap(client, redis, NoopSessionLockManager(), grace_seconds=43200, max_stopped=50)
+    await _maybe_reap(
+        client,
+        redis,
+        NoopSessionLockManager(),
+        grace_seconds=43200,
+        max_stopped=50,
+        activity=NoopSessionActivityTracker(),
+        idle_seconds=0,
+    )
 
     client.containers.list.assert_not_called()  # sweep skipped
 
@@ -210,6 +258,59 @@ def test_start_reaper_returns_none_when_disabled(monkeypatch):
     monkeypatch.setattr(cfg, "REAPER_ENABLED", False)
     app = Mock()
     assert reaper.start_reaper(app) is None
+
+
+async def test_start_reaper_forwards_activity_and_idle_window(monkeypatch):
+    """Guards the whole feature: dropping either kwarg on the way from settings/app.state into the
+    sweep silently restores the unbounded leak, since _reap_idle_running_sessions just returns."""
+    from daiv_sandbox import reaper
+    from daiv_sandbox.config import settings as cfg
+
+    monkeypatch.setattr(cfg, "REAPER_ENABLED", True)
+    monkeypatch.setattr(cfg, "RUNNING_SESSION_MAX_IDLE_SECONDS", 14400)
+    monkeypatch.setattr(reaper.SandboxDockerSession, "_get_shared_client", staticmethod(lambda: Mock()))
+
+    tracker = NoopSessionActivityTracker()
+    app = Mock()
+    app.state.session_activity = tracker
+
+    captured = {}
+
+    async def fake_loop(*args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(reaper, "_reaper_loop", fake_loop)
+    task = reaper.start_reaper(app)
+    assert task is not None
+    await task
+
+    assert captured["activity"] is tracker
+    assert captured["idle_seconds"] == 14400
+
+
+async def test_maybe_reap_forwards_activity_and_idle_window_to_the_sweep(monkeypatch):
+    """_maybe_reap builds sweep_kwargs by hand, so a dropped key here disables idle reaping silently."""
+    from daiv_sandbox import reaper
+
+    tracker = NoopSessionActivityTracker()
+    captured = {}
+
+    async def fake_reap_once(client, lock_manager, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(reaper, "_reap_once", fake_reap_once)
+    await reaper._maybe_reap(
+        Mock(),
+        None,
+        NoopSessionLockManager(),
+        grace_seconds=43200,
+        max_stopped=50,
+        activity=tracker,
+        idle_seconds=14400,
+    )
+
+    assert captured["activity"] is tracker
+    assert captured["idle_seconds"] == 14400
 
 
 class _Noop:
@@ -230,7 +331,7 @@ def test_reaper_tears_down_triad_for_egress_sandbox():
     with patch("daiv_sandbox.reaper.EgressProxyManager") as mock_mgr_class:
         asyncio.run(_remove_guarded(container, _Noop()))
         mock_mgr_class.return_value.teardown.assert_called_once_with("tok123")
-        container.remove.assert_called_once_with(force=True)
+        container.remove.assert_called_once_with(force=True, v=True)
 
 
 # --- Orphan egress triad sweep ------------------------------------------------
@@ -370,7 +471,7 @@ async def test_idle_sweep_removes_session_idle_past_window():
         _running_client([c]), NoopSessionLockManager(), activity, now=NOW, idle_seconds=14400
     )
 
-    c.remove.assert_called_once_with(force=True)
+    c.remove.assert_called_once_with(force=True, v=True)
     assert activity.forgotten == ["idle"]
 
 
@@ -442,6 +543,93 @@ async def test_idle_sweep_tears_down_egress_triad():
     mgr_cls.return_value.teardown.assert_called_once_with("tok-idle")
 
 
+async def test_idle_sweep_does_not_remove_when_activity_read_fails_under_lock():
+    """An unknown activity read on the destructive branch must fail CLOSED.
+
+    last_seen() returns None for a transient Redis fault as well as for "no record", and the outer
+    sweep treats None as seed-and-wait. If the precondition read it as "still idle", one failed GET
+    between the listing and the lock would force-remove a live container and its writable layer."""
+    c = _running_container("live")
+    activity = _FakeActivity({"live": NOW - timedelta(hours=9)})
+
+    calls = {"n": 0}
+    original = activity.last_seen
+
+    async def flaky(session_id):
+        calls["n"] += 1
+        return await original(session_id) if calls["n"] == 1 else None
+
+    activity.last_seen = flaky
+
+    await _reap_idle_running_sessions(
+        _running_client([c]), NoopSessionLockManager(), activity, now=NOW, idle_seconds=14400
+    )
+
+    c.remove.assert_not_called()
+    assert activity.forgotten == []
+
+
+async def test_idle_sweep_does_not_remove_a_container_that_stopped_during_the_lock_wait():
+    """A container that stops between the listing and the lock belongs to the stopped-container sweep.
+
+    Force-removing it on the idle path would bypass SESSION_GRACE_SECONDS and the MAX_STOPPED_SESSIONS
+    LRU, destroying a writable layer that is still meant to be warm-reusable. The record is left intact
+    here on purpose, so this isolates the run-state re-check rather than the fail-closed activity
+    guard: a crashed/OOM-killed sandbox stops without anything clearing its activity record."""
+    c = _running_container("warm")
+    activity = _FakeActivity({"warm": NOW - timedelta(hours=5)})
+
+    def _stops_under_the_lock():
+        c.status = "exited"
+
+    c.reload.side_effect = _stops_under_the_lock
+
+    await _reap_idle_running_sessions(
+        _running_client([c]), NoopSessionLockManager(), activity, now=NOW, idle_seconds=14400
+    )
+
+    c.remove.assert_not_called()
+    assert activity.forgotten == []
+
+
+async def test_idle_sweep_isolates_a_failing_activity_read_per_container():
+    """One unreadable record must not starve the sessions listed after it, mirroring the per-token
+    isolation in _reap_orphan_triads. Otherwise a single poisoned key stalls every sweep."""
+    bad = _running_container("bad")
+    good = _running_container("good")
+    activity = _FakeActivity({"good": NOW - timedelta(hours=9)})
+
+    original = activity.last_seen
+
+    async def raising(session_id):
+        if session_id == "bad":
+            raise OverflowError("timestamp out of range for platform time_t")
+        return await original(session_id)
+
+    activity.last_seen = raising
+
+    await _reap_idle_running_sessions(
+        _running_client([bad, good]), NoopSessionLockManager(), activity, now=NOW, idle_seconds=14400
+    )
+
+    bad.remove.assert_not_called()
+    good.remove.assert_called_once_with(force=True, v=True)
+
+
+async def test_remove_guarded_reports_success_when_only_egress_teardown_fails():
+    """The container is gone and its token is now unreferenced, so the orphan-triad sweep finishes the
+    job. Reporting False would both misdescribe the failure and skip the activity-record cleanup."""
+    c = _stopped_container("gone", "2026-06-01T00:00:00Z")
+    c.labels = {EGRESS_SESSION_LABEL: "tok-gone"}
+
+    with patch("daiv_sandbox.reaper.EgressProxyManager") as mgr_cls:
+        mgr_cls.return_value.teardown.side_effect = APIError("daemon hiccup")
+        removed = await _remove_guarded(c, NoopSessionLockManager())
+
+    assert removed is True
+    c.remove.assert_called_once_with(force=True, v=True)
+
+
 async def test_idle_sweep_disabled_when_window_is_zero():
     c = _running_container("idle")
     activity = _FakeActivity({"idle": NOW - timedelta(days=30)})
@@ -494,4 +682,4 @@ async def test_reap_once_runs_idle_sweep():
         idle_seconds=14400,
     )
 
-    idle.remove.assert_called_once_with(force=True)
+    idle.remove.assert_called_once_with(force=True, v=True)

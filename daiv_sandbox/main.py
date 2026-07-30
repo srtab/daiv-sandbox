@@ -125,15 +125,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             wait_seconds=settings.SESSION_LOCK_WAIT_SECONDS,
             refresh_interval_seconds=settings.SESSION_LOCK_REFRESH_SECONDS,
         )
-        # TTL comfortably outlives the idle window so a record never expires out from under a session
-        # the reaper would otherwise judge idle; the floor keeps it valid when idle reaping is disabled.
+        # The TTL margin over the window IS the band in which reaping can happen: at ttl == window a record
+        # expires exactly as it becomes reapable. The floor keeps ttl > 0 when the window is 0 (disabled).
         app.state.session_activity = RedisSessionActivityTracker(
             redis_client, ttl_seconds=max(settings.RUNNING_SESSION_MAX_IDLE_SECONDS * 2, 3600)
         )
     else:
         if settings.ENVIRONMENT == "production":
             logger.warning(
-                "REDIS_URL is not configured; per-session locking is disabled and concurrent requests may race"
+                "REDIS_URL is not configured; per-session locking and idle-session reaping are disabled, "
+                "concurrent requests may race and running sessions whose DELETE never arrives will leak"
             )
         app.state.redis = None
         app.state.session_lock_manager = NoopSessionLockManager()
@@ -479,9 +480,6 @@ async def close_session(
             manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
             await asyncio.to_thread(manager.teardown if force else manager.stop_proxy, token)
 
-        # The session is closed either way, so drop its activity record; a warm resume re-touches it
-        # via _workspace_executor. Leaving it behind would only delay the idle sweep on a resumed
-        # session that then leaks.
         await request.app.state.session_activity.forget(session_id)
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -629,14 +627,20 @@ async def _workspace_executor(http_request: Request, session_id: str) -> AsyncIt
     """Acquire the session lock and yield a live cmd_executor, or 404.
 
     The single choke point for every workspace operation (seed/run/get/fs_*), so recording activity
-    here is what keeps a session in use out of the reaper's idle sweep.
+    here is what keeps a session in use out of the reaper's idle sweep. Touched on both entry and exit:
+    COMMAND_TIMEOUT is unbounded by default, so an operation can outlast the whole idle window, and an
+    entry-only stamp would be older than that window the moment the lock is released — making the
+    session reapable the instant a long, perfectly healthy command finished.
     """
     async with http_request.app.state.session_lock_manager.acquire(session_id):
         cmd = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
         if not cmd.container:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
         await http_request.app.state.session_activity.touch(session_id)
-        yield cmd
+        try:
+            yield cmd
+        finally:
+            await http_request.app.state.session_activity.touch(session_id)
 
 
 @app.post("/session/{session_id}/fs/write", responses=_fs_responses, name="Write a workspace file")
