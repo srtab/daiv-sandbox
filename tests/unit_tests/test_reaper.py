@@ -1,13 +1,16 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from docker.errors import APIError, NotFound
 
+from daiv_sandbox.activity import NoopSessionActivityTracker
 from daiv_sandbox.locks import NoopSessionLockManager, SessionBusyError
 from daiv_sandbox.reaper import (
+    _list_running_sandbox_containers,
     _list_stopped_sandbox_containers,
     _parse_docker_timestamp,
+    _reap_idle_running_sessions,
     _reap_once,
     _reap_orphan_triads,
     _remove_guarded,
@@ -311,3 +314,184 @@ async def test_reap_orphan_triads_continues_when_one_teardown_fails():
         mgr_cls.return_value.teardown.side_effect = _teardown
         await _reap_orphan_triads(client, now=NOW, grace_seconds=43200)
     assert mgr_cls.return_value.teardown.call_count == 2  # both attempted despite "bad" raising
+
+
+# --- idle running-session reaping -------------------------------------------------------------
+
+
+class _FakeActivity:
+    """In-memory stand-in for RedisSessionActivityTracker."""
+
+    enabled = True
+
+    def __init__(self, records=None):
+        self.records = dict(records or {})
+        self.touched: list[str] = []
+        self.forgotten: list[str] = []
+
+    async def last_seen(self, session_id):
+        return self.records.get(session_id)
+
+    async def touch(self, session_id):
+        self.touched.append(session_id)
+        self.records[session_id] = datetime.now(UTC)
+
+    async def forget(self, session_id):
+        self.forgotten.append(session_id)
+        self.records.pop(session_id, None)
+
+
+def _running_container(cid: str):
+    return Mock(id=cid, status="running", labels={}, attrs={"State": {"FinishedAt": ""}}, remove=Mock())
+
+
+def _running_client(containers):
+    client = Mock()
+    client.containers.list.return_value = containers
+    return client
+
+
+async def test_list_running_filters_out_stopped():
+    running, exited = Mock(status="running"), Mock(status="exited")
+    client = Mock()
+    client.containers.list.return_value = [running, exited]
+
+    result = _list_running_sandbox_containers(client)
+
+    client.containers.list.assert_called_once_with(filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}"})
+    assert result == [running]
+
+
+async def test_idle_sweep_removes_session_idle_past_window():
+    c = _running_container("idle")
+    activity = _FakeActivity({"idle": NOW - timedelta(hours=5)})
+
+    await _reap_idle_running_sessions(
+        _running_client([c]), NoopSessionLockManager(), activity, now=NOW, idle_seconds=14400
+    )
+
+    c.remove.assert_called_once_with(force=True)
+    assert activity.forgotten == ["idle"]
+
+
+async def test_idle_sweep_keeps_recently_touched_session():
+    c = _running_container("busy")
+    activity = _FakeActivity({"busy": NOW - timedelta(minutes=5)})
+
+    await _reap_idle_running_sessions(
+        _running_client([c]), NoopSessionLockManager(), activity, now=NOW, idle_seconds=14400
+    )
+
+    c.remove.assert_not_called()
+
+
+async def test_idle_sweep_seeds_unknown_session_instead_of_reaping():
+    """A running session with no activity record (pre-upgrade, or record lost to a Redis flush) gets a
+    full idle window rather than being removed on first sight."""
+    c = _running_container("unknown")
+    activity = _FakeActivity()
+
+    await _reap_idle_running_sessions(
+        _running_client([c]), NoopSessionLockManager(), activity, now=NOW, idle_seconds=14400
+    )
+
+    c.remove.assert_not_called()
+    assert activity.touched == ["unknown"]
+
+
+async def test_idle_sweep_skips_busy_session():
+    """An in-flight request holds the per-session lock, so a long command is never reaped mid-run
+    however stale its activity record looks."""
+    c = _running_container("inflight")
+    activity = _FakeActivity({"inflight": NOW - timedelta(hours=9)})
+
+    await _reap_idle_running_sessions(_running_client([c]), _BusyLockManager(), activity, now=NOW, idle_seconds=14400)
+
+    c.remove.assert_not_called()
+    assert activity.forgotten == []
+
+
+async def test_idle_sweep_skips_session_touched_while_waiting_for_lock():
+    """TOCTOU: a request that refreshed the record between the listing and the lock must save the
+    session — the precondition re-reads activity under the lock."""
+    c = _running_container("revived")
+    activity = _FakeActivity({"revived": NOW - timedelta(hours=9)})
+
+    def _revive():
+        activity.records["revived"] = datetime.now(UTC)
+
+    c.reload.side_effect = _revive
+
+    await _reap_idle_running_sessions(
+        _running_client([c]), NoopSessionLockManager(), activity, now=NOW, idle_seconds=14400
+    )
+
+    c.remove.assert_not_called()
+
+
+async def test_idle_sweep_tears_down_egress_triad():
+    c = _running_container("idle")
+    c.labels = {EGRESS_SESSION_LABEL: "tok-idle"}
+    activity = _FakeActivity({"idle": NOW - timedelta(hours=5)})
+
+    with patch("daiv_sandbox.reaper.EgressProxyManager") as mgr_cls:
+        await _reap_idle_running_sessions(
+            _running_client([c]), NoopSessionLockManager(), activity, now=NOW, idle_seconds=14400
+        )
+
+    mgr_cls.return_value.teardown.assert_called_once_with("tok-idle")
+
+
+async def test_idle_sweep_disabled_when_window_is_zero():
+    c = _running_container("idle")
+    activity = _FakeActivity({"idle": NOW - timedelta(days=30)})
+    client = _running_client([c])
+
+    await _reap_idle_running_sessions(client, NoopSessionLockManager(), activity, now=NOW, idle_seconds=0)
+
+    c.remove.assert_not_called()
+    client.containers.list.assert_not_called()
+
+
+async def test_idle_sweep_disabled_without_activity_tracking():
+    """No Redis means no activity records AND no session lock, so removing a running container could
+    kill live work — the sweep must not run at all."""
+    c = _running_container("idle")
+    client = _running_client([c])
+
+    await _reap_idle_running_sessions(
+        client, NoopSessionLockManager(), NoopSessionActivityTracker(), now=NOW, idle_seconds=14400
+    )
+
+    c.remove.assert_not_called()
+    client.containers.list.assert_not_called()
+
+
+async def test_reap_once_runs_idle_sweep():
+    """_reap_once wires the idle sweep, so a stopped-container-only mock is not enough coverage."""
+    idle = _running_container("idle")
+    client = Mock()
+
+    def _list(filters=None, **kwargs):
+        # A full sweep lists containers four times (stopped, running, orphan proxies, orphan
+        # executors); dispatch on the filter so the mock can't be exhausted by call order.
+        label = (filters or {}).get("label", "")
+        if label.endswith(TYPE_CMD_EXECUTOR):
+            return [] if kwargs.get("all") else [idle]
+        return []
+
+    client.containers.list.side_effect = _list
+    client.networks.list.return_value = []
+    activity = _FakeActivity({"idle": NOW - timedelta(hours=5)})
+
+    await _reap_once(
+        client,
+        NoopSessionLockManager(),
+        now=NOW,
+        grace_seconds=43200,
+        max_stopped=50,
+        activity=activity,
+        idle_seconds=14400,
+    )
+
+    idle.remove.assert_called_once_with(force=True)

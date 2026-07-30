@@ -100,7 +100,7 @@ def test_start_proxy_removes_created_container_on_failure(monkeypatch):
 
     with pytest.raises(APIError):
         mgr.start_proxy("tok123", "daiv-egress-tok123", ca_pem=b"PEM")
-    proxy.remove.assert_called_once_with(force=True)
+    proxy.remove.assert_called_once_with(force=True, v=True)
     proxy.start.assert_not_called()
 
 
@@ -110,7 +110,7 @@ def test_teardown_removes_proxy_and_network():
     client.containers.list.return_value = [proxy]
     client.networks.list.return_value = [net]
     EgressProxyManager(client).teardown("tok123")
-    proxy.remove.assert_called_once_with(force=True)
+    proxy.remove.assert_called_once_with(force=True, v=True)
     net.remove.assert_called_once()
 
 

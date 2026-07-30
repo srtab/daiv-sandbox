@@ -18,6 +18,7 @@ from fastapi.security.api_key import APIKeyHeader
 from redis.asyncio import Redis
 
 from daiv_sandbox import __version__
+from daiv_sandbox.activity import NoopSessionActivityTracker, RedisSessionActivityTracker
 from daiv_sandbox.config import settings
 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, SessionBusyError
@@ -124,6 +125,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             wait_seconds=settings.SESSION_LOCK_WAIT_SECONDS,
             refresh_interval_seconds=settings.SESSION_LOCK_REFRESH_SECONDS,
         )
+        # TTL comfortably outlives the idle window so a record never expires out from under a session
+        # the reaper would otherwise judge idle; the floor keeps it valid when idle reaping is disabled.
+        app.state.session_activity = RedisSessionActivityTracker(
+            redis_client, ttl_seconds=max(settings.RUNNING_SESSION_MAX_IDLE_SECONDS * 2, 3600)
+        )
     else:
         if settings.ENVIRONMENT == "production":
             logger.warning(
@@ -131,6 +137,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
         app.state.redis = None
         app.state.session_lock_manager = NoopSessionLockManager()
+        app.state.session_activity = NoopSessionActivityTracker()
 
     reaper_task = start_reaper(app)
     try:
@@ -155,6 +162,7 @@ app = FastAPI(
 )
 app.state.redis = None
 app.state.session_lock_manager = NoopSessionLockManager()
+app.state.session_activity = NoopSessionActivityTracker()
 
 
 @app.exception_handler(SessionBusyError)
@@ -471,6 +479,11 @@ async def close_session(
             manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
             await asyncio.to_thread(manager.teardown if force else manager.stop_proxy, token)
 
+        # The session is closed either way, so drop its activity record; a warm resume re-touches it
+        # via _workspace_executor. Leaving it behind would only delay the idle sweep on a resumed
+        # session that then leaks.
+        await request.app.state.session_activity.forget(session_id)
+
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -537,6 +550,10 @@ async def update_egress(
             raise HTTPException(
                 status_code=500, detail="Egress proxy: failed to refresh policy into the sidecar"
             ) from exc
+
+        # A credential refresh means the caller is still driving this session, and this endpoint does
+        # not go through _workspace_executor, so record activity here too.
+        await request.app.state.session_activity.touch(session_id)
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -609,11 +626,16 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
 
 @asynccontextmanager
 async def _workspace_executor(http_request: Request, session_id: str) -> AsyncIterator[SandboxDockerSession]:
-    """Acquire the session lock and yield a live cmd_executor, or 404."""
+    """Acquire the session lock and yield a live cmd_executor, or 404.
+
+    The single choke point for every workspace operation (seed/run/get/fs_*), so recording activity
+    here is what keeps a session in use out of the reaper's idle sweep.
+    """
     async with http_request.app.state.session_lock_manager.acquire(session_id):
         cmd = await asyncio.to_thread(SandboxDockerSession, session_id=session_id)
         if not cmd.container:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or already closed")
+        await http_request.app.state.session_activity.touch(session_id)
         yield cmd
 
 

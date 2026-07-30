@@ -1729,3 +1729,62 @@ def test_update_egress_returns_conflict_when_session_is_locked(client, monkeypat
 
     assert resp.status_code == 409
     assert resp.json() == {"detail": "Session is busy"}
+
+
+class _RecordingActivity:
+    """Records activity calls so the reaper-facing wiring can be asserted from the endpoints."""
+
+    enabled = True
+
+    def __init__(self):
+        self.touched: list[str] = []
+        self.forgotten: list[str] = []
+
+    async def touch(self, session_id):
+        self.touched.append(session_id)
+
+    async def last_seen(self, session_id):
+        return None
+
+    async def forget(self, session_id):
+        self.forgotten.append(session_id)
+
+
+def test_workspace_op_records_session_activity(client, monkeypatch):
+    """Every workspace op must refresh the activity record, otherwise the reaper's idle sweep would
+    eventually remove a session that is actively in use."""
+    activity = _RecordingActivity()
+    monkeypatch.setattr(app.state, "session_activity", activity)
+
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_session_class.return_value.container = Mock()
+        assert client.get("/session/live-id/").status_code == 204
+
+    assert activity.touched == ["live-id"]
+
+
+def test_missing_session_does_not_record_activity(client, monkeypatch):
+    """A 404 must not create a record for a session that does not exist."""
+    activity = _RecordingActivity()
+    monkeypatch.setattr(app.state, "session_activity", activity)
+
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_session_class.return_value.container = None
+        assert client.get("/session/missing-id/").status_code == 404
+
+    assert activity.touched == []
+
+
+def test_close_session_clears_activity_record(client, monkeypatch):
+    activity = _RecordingActivity()
+    monkeypatch.setattr(app.state, "session_activity", activity)
+
+    with patch("daiv_sandbox.main.SandboxDockerSession") as mock_session_class:
+        mock_cmd_executor = Mock()
+        mock_cmd_executor.session_id = "cmd-executor-id"
+        mock_cmd_executor.client.containers.get.return_value = Mock(labels={})
+        mock_session_class.return_value = mock_cmd_executor
+
+        assert client.delete("/session/cmd-executor-id/").status_code == 204
+
+    assert activity.forgotten == ["cmd-executor-id"]

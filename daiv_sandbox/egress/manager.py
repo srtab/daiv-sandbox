@@ -117,7 +117,7 @@ class EgressProxyManager:
             proxy.start()
         except Exception:
             try:
-                proxy.remove(force=True)
+                proxy.remove(force=True, v=True)
             except NotFound:
                 pass
             except Exception:
@@ -219,7 +219,9 @@ class EgressProxyManager:
         # the cleanup (the reaper retries on the next sweep).
         for proxy in self._list(TYPE_EGRESS_PROXY, token):
             try:
-                proxy.remove(force=True)
+                # v=True: the mitmproxy base image declares VOLUME on the confdir, so each proxy gets an
+                # anonymous volume. Without this it outlives the container and leaks one volume per session.
+                proxy.remove(force=True, v=True)
             except NotFound:
                 pass
             except Exception:
