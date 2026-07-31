@@ -118,6 +118,25 @@ class FsReadResponse(BaseModel):
     encoding: Literal["utf-8", "base64"] | None = Field(
         default=None, description="Encoding of `content`: 'utf-8' for text, 'base64' for binary."
     )
+    total_lines: int | None = Field(
+        default=None,
+        description=(
+            "Total source lines in the file. Text reads only; null for binary reads, the empty-file "
+            "sentinel, and every error."
+        ),
+    )
+    end_line: int | None = Field(
+        default=None,
+        description=(
+            "1-indexed last *complete* source line in `content`. Text reads only. Equals the request's "
+            "`offset` (an empty window) when a byte-capped page holds no complete line at all, i.e. a "
+            "single line longer than the read limit — expected, not a bug."
+        ),
+    )
+    truncated: bool = Field(
+        default=False,
+        description="True when the body was cut by the read byte limit; the text past `end_line` is a partial line.",
+    )
     error: FsError | None = Field(default=None, description="Structured error; null on success.")
 
 

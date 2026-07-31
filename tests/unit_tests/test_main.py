@@ -1246,6 +1246,101 @@ def test_fs_read_binary_exactly_at_cap_is_base64(mock_session, client):
     assert body["error"] is None
 
 
+def test_fs_read_reports_line_window_mid_file(mock_session, client):
+    """A text page in the middle of a file reports the window and the file's total line count."""
+    mock_session.read_file_bytes.return_value = "\n".join(f"line {i}" for i in range(1, 11)).encode("utf-8")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt", "offset": 2, "limit": 3}
+    )
+    body = resp.json()
+    assert body["content"] == "line 3\nline 4\nline 5"
+    assert body["total_lines"] == 10
+    assert body["end_line"] == 5
+    assert body["truncated"] is False
+
+
+def test_fs_read_reports_line_window_at_eof(mock_session, client):
+    """A page that reaches the end of the file reports end_line == total_lines, so the client can tell
+    there is nothing left to read instead of inferring it from a full window."""
+    mock_session.read_file_bytes.return_value = "\n".join(f"line {i}" for i in range(1, 11)).encode("utf-8")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt", "offset": 7, "limit": 5}
+    )
+    body = resp.json()
+    assert body["total_lines"] == 10
+    assert body["end_line"] == 10
+    assert body["truncated"] is False
+
+
+def test_fs_read_byte_capped_page_reports_last_complete_line(mock_session, client):
+    """A byte-capped page reports only the lines it returned *complete*: the cut lands mid-line, so the
+    trailing fragment is excluded from end_line and a resume from there cannot skip source lines."""
+    from daiv_sandbox.main import READ_TRUNCATION_MARKER
+
+    lines = [f"{i:04d}" + "x" * 5996 for i in range(400)]
+    mock_session.read_file_bytes.return_value = "\n".join(lines).encode("utf-8")
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/read",
+        json={"path": "/workspace/tmp/big.txt", "offset": 0, "limit": 100},
+    )
+    body = resp.json()
+    assert body["truncated"] is True
+    assert body["total_lines"] == 400
+    end_line = body["end_line"]
+    assert 0 < end_line < 100, "the cap must cut the 100-line page short of its last line"
+
+    cut = body["content"].removesuffix(READ_TRUNCATION_MARKER)
+    assert cut != body["content"], "the truncation marker must still be appended"
+    assert cut.startswith("\n".join(lines[:end_line])), "every line up to end_line must be returned whole"
+    assert len(cut) > len("\n".join(lines[:end_line])), "the partial line past end_line must not be counted"
+
+
+def test_fs_read_byte_capped_single_line_reports_zero_complete_lines(mock_session, client):
+    """A single line longer than the cap yields no complete line, so end_line equals the request offset —
+    an empty window the client is expected to drop, falling back to the truncation marker."""
+    from daiv_sandbox.main import READ_MAX_OUTPUT_BYTES
+
+    mock_session.read_file_bytes.return_value = b"a" * (READ_MAX_OUTPUT_BYTES + 100_000)
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/huge.txt"})
+    body = resp.json()
+    assert body["truncated"] is True
+    assert body["total_lines"] == 1
+    assert body["end_line"] == 0
+
+
+def test_fs_read_binary_has_no_line_metadata(mock_session, client):
+    """Base64 reads return the whole file and have no line semantics."""
+    mock_session.read_file_bytes.return_value = b"\xff\xfe\x00"
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/b.bin"})
+    body = resp.json()
+    assert body["total_lines"] is None
+    assert body["end_line"] is None
+    assert body["truncated"] is False
+
+
+def test_fs_read_empty_file_has_no_line_metadata(mock_session, client):
+    """The empty-file sentinel is not file content, so it carries no window."""
+    mock_session.read_file_bytes.return_value = b""
+    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/empty.txt"})
+    body = resp.json()
+    assert body["total_lines"] is None
+    assert body["end_line"] is None
+    assert body["truncated"] is False
+
+
+def test_fs_read_invalid_offset_has_no_line_metadata(mock_session, client):
+    """An error response describes no window."""
+    mock_session.read_file_bytes.return_value = b"one\ntwo\n"
+    resp = client.post(
+        f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt", "offset": 50, "limit": 10}
+    )
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_offset"
+    assert body["total_lines"] is None
+    assert body["end_line"] is None
+    assert body["truncated"] is False
+
+
 def test_fs_edit_string_not_found(mock_session, client):
     """edit_file raises ValueError('string_not_found') when `old` isn't present; it must map to the
     STRING_NOT_FOUND code (not MULTIPLE_OCCURRENCES, whose message starts with 'String appears')."""
