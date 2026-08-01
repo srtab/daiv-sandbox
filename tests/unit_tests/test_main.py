@@ -1150,6 +1150,8 @@ def test_fs_read_empty_file(mock_session, client):
     body = resp.json()
     assert body["encoding"] == "utf-8"
     assert "empty" in body["content"].lower()
+    # The sentinel is not file content, so it carries no window.
+    assert (body["total_lines"], body["end_line"], body["truncated"]) == (None, None, False)
 
 
 def test_fs_read_binary_falls_back_to_base64(mock_session, client):
@@ -1158,6 +1160,8 @@ def test_fs_read_binary_falls_back_to_base64(mock_session, client):
     body = resp.json()
     assert body["encoding"] == "base64"
     assert base64.b64decode(body["content"]) == b"\xff\xfe\x00"
+    # Base64 reads return the whole file and have no line semantics.
+    assert (body["total_lines"], body["end_line"], body["truncated"]) == (None, None, False)
 
 
 def test_fs_read_offset_beyond_eof(mock_session, client):
@@ -1165,8 +1169,10 @@ def test_fs_read_offset_beyond_eof(mock_session, client):
     resp = client.post(
         f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt", "offset": 50, "limit": 10}
     )
-    assert resp.json()["error"]["code"] == "invalid_offset"
-    assert "offset" in resp.json()["error"]["message"].lower()
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_offset"
+    assert "offset" in body["error"]["message"].lower()
+    assert (body["total_lines"], body["end_line"], body["truncated"]) == (None, None, False)
 
 
 def test_fs_read_text_truncated_at_cap(mock_session, client):
@@ -1246,29 +1252,25 @@ def test_fs_read_binary_exactly_at_cap_is_base64(mock_session, client):
     assert body["error"] is None
 
 
-def test_fs_read_reports_line_window_mid_file(mock_session, client):
-    """A text page in the middle of a file reports the window and the file's total line count."""
+@pytest.mark.parametrize(
+    ("offset", "limit", "expected_content", "expected_end_line"),
+    [
+        (2, 3, "line 3\nline 4\nline 5", 5),  # a window in the middle of the file
+        (7, 5, "line 8\nline 9\nline 10", 10),  # a window running into EOF: end_line == total_lines
+    ],
+)
+def test_fs_read_reports_line_window(mock_session, client, offset, limit, expected_content, expected_end_line):
+    """A text page reports the file's total line count and the last line it returned; at EOF
+    end_line == total_lines, so the client can tell there is nothing left instead of inferring it."""
     mock_session.read_file_bytes.return_value = "\n".join(f"line {i}" for i in range(1, 11)).encode("utf-8")
     resp = client.post(
-        f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt", "offset": 2, "limit": 3}
+        f"/session/{mock_session.session_id}/fs/read",
+        json={"path": "/workspace/tmp/a.txt", "offset": offset, "limit": limit},
     )
     body = resp.json()
-    assert body["content"] == "line 3\nline 4\nline 5"
+    assert body["content"] == expected_content
     assert body["total_lines"] == 10
-    assert body["end_line"] == 5
-    assert body["truncated"] is False
-
-
-def test_fs_read_reports_line_window_at_eof(mock_session, client):
-    """A page that reaches the end of the file reports end_line == total_lines, so the client can tell
-    there is nothing left to read instead of inferring it from a full window."""
-    mock_session.read_file_bytes.return_value = "\n".join(f"line {i}" for i in range(1, 11)).encode("utf-8")
-    resp = client.post(
-        f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt", "offset": 7, "limit": 5}
-    )
-    body = resp.json()
-    assert body["total_lines"] == 10
-    assert body["end_line"] == 10
+    assert body["end_line"] == expected_end_line
     assert body["truncated"] is False
 
 
@@ -1306,39 +1308,6 @@ def test_fs_read_byte_capped_single_line_reports_zero_complete_lines(mock_sessio
     assert body["truncated"] is True
     assert body["total_lines"] == 1
     assert body["end_line"] == 0
-
-
-def test_fs_read_binary_has_no_line_metadata(mock_session, client):
-    """Base64 reads return the whole file and have no line semantics."""
-    mock_session.read_file_bytes.return_value = b"\xff\xfe\x00"
-    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/b.bin"})
-    body = resp.json()
-    assert body["total_lines"] is None
-    assert body["end_line"] is None
-    assert body["truncated"] is False
-
-
-def test_fs_read_empty_file_has_no_line_metadata(mock_session, client):
-    """The empty-file sentinel is not file content, so it carries no window."""
-    mock_session.read_file_bytes.return_value = b""
-    resp = client.post(f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/empty.txt"})
-    body = resp.json()
-    assert body["total_lines"] is None
-    assert body["end_line"] is None
-    assert body["truncated"] is False
-
-
-def test_fs_read_invalid_offset_has_no_line_metadata(mock_session, client):
-    """An error response describes no window."""
-    mock_session.read_file_bytes.return_value = b"one\ntwo\n"
-    resp = client.post(
-        f"/session/{mock_session.session_id}/fs/read", json={"path": "/workspace/tmp/a.txt", "offset": 50, "limit": 10}
-    )
-    body = resp.json()
-    assert body["error"]["code"] == "invalid_offset"
-    assert body["total_lines"] is None
-    assert body["end_line"] is None
-    assert body["truncated"] is False
 
 
 def test_fs_edit_string_not_found(mock_session, client):

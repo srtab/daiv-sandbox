@@ -129,8 +129,8 @@ class FsReadResponse(BaseModel):
         default=None,
         description=(
             "1-indexed last *complete* source line in `content`. Text reads only. Equals the request's "
-            "`offset` (an empty window) when a byte-capped page holds no complete line at all, i.e. a "
-            "single line longer than the read limit — expected, not a bug."
+            "`offset` when a byte-capped page holds no complete line at all — a single line longer than "
+            "the read limit."
         ),
     )
     truncated: bool = Field(
