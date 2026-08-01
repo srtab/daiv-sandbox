@@ -108,6 +108,25 @@ def test_bash_write_then_agent_read_and_grep(client, workspace_session):
     assert any(m["text"].strip() == "NEEDLE here" for m in g.json()["matches"]), g.text
 
 
+def test_read_reports_line_window_over_a_real_file(client, workspace_session):
+    """The line window is measured against a file the container actually holds, so a paging client can
+    resume from `end_line` without re-deriving it from the returned text."""
+    sid = workspace_session
+    run = client.post(f"/session/{sid}/", json={"commands": ["seq 1 250 > /workspace/tmp/seq.txt"]})
+    assert run.status_code == 200, run.text
+
+    page = client.post(f"/session/{sid}/fs/read", json={"path": "/workspace/tmp/seq.txt", "offset": 100, "limit": 50})
+    assert page.status_code == 200, page.text
+    body = page.json()
+    assert body["total_lines"] == 250
+    assert body["end_line"] == 150
+    assert body["truncated"] is False
+    assert body["content"].splitlines() == [str(n) for n in range(101, 151)]
+
+    tail = client.post(f"/session/{sid}/fs/read", json={"path": "/workspace/tmp/seq.txt", "offset": 150, "limit": 500})
+    assert tail.json()["end_line"] == 250, tail.text
+
+
 def test_grep_with_glob_filters_on_busybox(client, workspace_session):
     """grep with a `glob` must work on alpine's busybox grep (which has no --include)."""
     sid = workspace_session

@@ -4,8 +4,11 @@ Used by the daiv repo's ``test_schema_consistency.py`` to detect drift between
 the two sides. To refresh the dump:
 
     cd ~/work/personal/daiv-sandbox
-    uv run --all-extras python scripts/dump_schemas.py \\
+    PYTHONPATH=. uv run --all-extras python scripts/dump_schemas.py \\
         > ~/work/personal/daiv/daiv/core/sandbox/schemas.dump.json
+
+``PYTHONPATH`` is required: the project declares no build backend, so ``uv run`` never installs
+``daiv_sandbox`` into the venv and the repo root is not otherwise on ``sys.path``.
 """
 
 import json

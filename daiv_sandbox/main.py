@@ -710,11 +710,18 @@ async def fs_read(
             )
         content = "\n".join(page)
         encoded = content.encode("utf-8")
-        if len(encoded) > READ_MAX_OUTPUT_BYTES:
+        end_line = request.offset + len(page)
+        truncated = len(encoded) > READ_MAX_OUTPUT_BYTES
+        if truncated:
             marker_bytes = len(READ_TRUNCATION_MARKER.encode("utf-8"))
-            truncated = encoded[: READ_MAX_OUTPUT_BYTES - marker_bytes].decode("utf-8", errors="ignore")
-            content = truncated + READ_TRUNCATION_MARKER
-        return FsReadResponse(content=content, encoding="utf-8")
+            cut = encoded[: READ_MAX_OUTPUT_BYTES - marker_bytes].decode("utf-8", errors="ignore")
+            content = cut + READ_TRUNCATION_MARKER
+            # Newlines are separators, so the fragment after the last one is a partial line and is
+            # excluded — understating the window never makes a resuming client skip source lines.
+            end_line = request.offset + cut.count("\n")
+        return FsReadResponse(
+            content=content, encoding="utf-8", total_lines=len(lines), end_line=end_line, truncated=truncated
+        )
 
 
 @app.post("/session/{session_id}/fs/ls", responses=_fs_responses, name="List a workspace directory")
