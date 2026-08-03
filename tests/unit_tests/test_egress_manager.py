@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock, Mock
 
 import pytest
-from docker.errors import APIError, NotFound
+from docker.errors import APIError, ImageNotFound, NotFound
 
 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 from daiv_sandbox.sessions import EGRESS_SESSION_LABEL, TYPE_EGRESS_NETWORK, TYPE_EGRESS_PROXY, SessionUnavailableError
@@ -38,6 +38,81 @@ def test_start_proxy_creates_dualhomed_labeled_container(monkeypatch):
     client.networks.get.return_value.connect.assert_called_once_with(proxy)
     assert proxy.put_archive.called  # CA shipped into confdir
     proxy.start.assert_called_once()
+    # The warm path must not reach the registry, nor create the container twice.
+    client.images.pull.assert_not_called()
+    client.containers.create.assert_called_once()
+
+
+def test_start_proxy_pulls_and_retries_when_sidecar_image_missing(monkeypatch):
+    """A host that reclaimed the sidecar image (`docker image prune -a`, or one that never pulled it)
+    must self-heal instead of failing every new egress session."""
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_PROXY_IMAGE", "img:test")
+    monkeypatch.setattr(settings, "EGRESS_PROXY_NETWORK", "egress-net")
+    client = MagicMock()
+    proxy = MagicMock()
+    client.containers.create.side_effect = [ImageNotFound("No such image: img:test"), proxy]
+    mgr = EgressProxyManager(client)
+
+    assert mgr.start_proxy("tok123", "daiv-egress-tok123", ca_pem=b"PEM") is proxy
+
+    client.images.pull.assert_called_once_with("img:test")
+    assert client.containers.create.call_count == 2  # the retry after the pull is what heals it
+    proxy.start.assert_called_once()
+
+
+def test_start_proxy_retries_the_create_exactly_once(monkeypatch):
+    """An image still absent after a successful pull must give up rather than loop: an unbounded
+    pull-and-retry would hang the request while hammering the registry."""
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_PROXY_IMAGE", "img:test")
+    monkeypatch.setattr(settings, "EGRESS_PROXY_NETWORK", "egress-net")
+    client = MagicMock()
+    client.containers.create.side_effect = ImageNotFound("No such image: img:test")
+    mgr = EgressProxyManager(client)
+
+    with pytest.raises(ImageNotFound):
+        mgr.start_proxy("tok123", "daiv-egress-tok123", ca_pem=b"PEM")
+
+    assert client.containers.create.call_count == 2
+    client.images.pull.assert_called_once_with("img:test")
+
+
+def test_start_proxy_reports_registry_fault_instead_of_image_not_found(monkeypatch):
+    """A registry fault (ENOSPC, rate limit) must surface naming the image, not as the misleading
+    ImageNotFound that docker-py's images.pull re-raises when the pull itself failed."""
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_PROXY_IMAGE", "img:test")
+    monkeypatch.setattr(settings, "EGRESS_PROXY_NETWORK", "egress-net")
+    client = MagicMock()
+    client.containers.create.side_effect = ImageNotFound("No such image: img:test")
+    client.images.pull.side_effect = ImageNotFound("No such image: img:test")
+    mgr = EgressProxyManager(client)
+
+    with pytest.raises(RuntimeError, match="cannot pull sidecar image img:test"):
+        mgr.start_proxy("tok123", "daiv-egress-tok123", ca_pem=b"PEM")
+
+    assert client.containers.create.call_count == 1  # no retry once the pull is known to have failed
+
+
+def test_start_proxy_propagates_daemon_fault_without_pulling(monkeypatch):
+    """A create failure that is not a missing image must propagate untouched — widening the catch from
+    ImageNotFound to APIError would turn a daemon fault into a pointless registry pull."""
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_PROXY_IMAGE", "img:test")
+    monkeypatch.setattr(settings, "EGRESS_PROXY_NETWORK", "egress-net")
+    client = MagicMock()
+    client.containers.create.side_effect = APIError("500 Server Error: daemon unreachable")
+    mgr = EgressProxyManager(client)
+
+    with pytest.raises(APIError):
+        mgr.start_proxy("tok123", "daiv-egress-tok123", ca_pem=b"PEM")
+
+    client.images.pull.assert_not_called()
 
 
 def test_start_proxy_sets_onfailure_restart_policy(monkeypatch):

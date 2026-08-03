@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from docker.errors import APIError, NotFound
+from docker.errors import APIError, ImageNotFound, NotFound
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.egress.constants import CA_PATH, CONFIG_DIR
@@ -91,7 +91,13 @@ class EgressProxyManager:
         if settings.EGRESS_PROXY_CPUS:
             create_kwargs["nano_cpus"] = int(settings.EGRESS_PROXY_CPUS * 1e9)
 
-        proxy = self.client.containers.create(**create_kwargs)
+        # Not containers.run (which would auto-pull): the CA must land in the confdir before the proxy
+        # boots, so the container has to exist created-but-not-running first.
+        try:
+            proxy = self.client.containers.create(**create_kwargs)
+        except ImageNotFound:
+            self._pull_sidecar_image(create_kwargs["image"])
+            proxy = self.client.containers.create(**create_kwargs)
         # Self-cleaning: any failure between create and a successful start must remove the just-created
         # container, so this never leaks even when a caller forgot to wrap it in teardown (the caller's
         # teardown then becomes belt-and-suspenders rather than the only safety net).
@@ -121,6 +127,17 @@ class EgressProxyManager:
             raise
         logger.info("egress: started proxy %s for token %s", proxy.short_id, token)
         return proxy
+
+    def _pull_sidecar_image(self, image: str) -> None:
+        """Pull the sidecar image on demand, reporting a registry fault as a pull failure."""
+        logger.warning("egress: sidecar image %s missing locally; pulling", image)
+        try:
+            self.client.images.pull(image)
+        except APIError as exc:
+            # images.pull discards the daemon's errorDetail stream and then re-inspects, so a mid-pull
+            # ENOSPC or rate-limit arrives here as the same ImageNotFound that sent us to this branch.
+            raise RuntimeError(f"egress: cannot pull sidecar image {image}: {exc}") from exc
+        logger.info("egress: pulled sidecar image %s", image)
 
     def ensure_proxy_running(self, token: str) -> Container:
         """Return the session's proxy, warm-restarting it if it is not running.
