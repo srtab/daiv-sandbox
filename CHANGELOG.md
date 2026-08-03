@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pipeline exit codes were masked by the last command; commands now run with `pipefail` enabled so a failing stage in a pipeline (e.g. `cmd1 | cmd2`) correctly propagates a non-zero exit code.
 - Invalid bytes in a command's output raised `UnicodeDecodeError`; such bytes are now replaced with U+FFFD instead of failing the request.
 - Egress proxy now self-heals: the sidecar carries a bounded `on-failure` restart policy and is warm-restarted when its internal IP is resolved, so a session no longer loses egress permanently after the proxy is OOM-killed or lost to a daemon restart while the sandbox stays warm.
+- `POST /session/` carrying an `egress` block returned `503 Egress proxy failed to start` for every new session whenever the egress sidecar image was absent from the host — a fresh deployment, or the image reclaimed by an aggressive cleanup (`docker image prune -a`, `docker system prune -a`, `docker rmi`). The sidecar image is now pulled on demand and the container creation retried. A registry fault during that pull (unreachable registry, rate limit, no disk space) is reported as a pull failure naming the image, instead of resurfacing as the misleading `ImageNotFound` that docker-py's `images.pull` produces when it discards the daemon's error stream.
 
 ## [0.4.0] - 2026-02-22
 
