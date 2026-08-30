@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bumped `docker` to 7.2.0 and `pydantic` to 2.13.4.
 - Bumped `sentry-sdk` to 2.68.0 (2.68.0 makes `enable_logs`/`enable_metrics` no-op; non-impacting here since `SENTRY_ENABLE_LOGS` defaults to `False` and no `sentry_sdk.logger` API is used), `mypy` to 2.3.1, `pyopenssl` to 26.4.0 (pulls `cryptography` 50.0.0), `pyproject-fmt` to 2.28.0, `pytest-env` to 1.7.0, `ruff` to 0.16.3, and `prek` to 0.4.14.
 - The egress sidecar now streams message bodies larger than 256KB (`stream_large_bodies`) instead of buffering them whole in memory. Large transfers through the proxy (git packfiles, concurrent wheel downloads) previously accumulated as full-body buffers and parked the sidecar's RSS at the peak (400MB+ observed); the egress addon never inspects bodies, so streaming is behavior-neutral.
 - Bumped `sentry-sdk` to 2.65.0, `mypy` to 2.3.0, and `pyproject-fmt` to 2.25.3.
