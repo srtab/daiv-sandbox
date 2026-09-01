@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.5.0] - 2026-09-01
 
 ### Added
 
@@ -341,7 +341,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented core functionalities for sandbox sessions using Docker.
 - Added API endpoint to run commands in a sandboxed container.
 
-[Unreleased]: https://github.com/srtab/daiv-sandbox/compare/v0.4.0...HEAD
+[0.5.0]: https://github.com/srtab/daiv-sandbox/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/srtab/daiv-sandbox/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/srtab/daiv-sandbox/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/srtab/daiv-sandbox/compare/v0.2.0...v0.3.0
