@@ -34,8 +34,8 @@ def test_egress_ca_both_set_constructs(monkeypatch):
 def test_reaper_defaults():
     assert settings.REAPER_ENABLED is True
     assert settings.REAPER_INTERVAL_SECONDS == 600
-    assert settings.SESSION_GRACE_SECONDS == 43200
-    assert settings.MAX_STOPPED_SESSIONS == 50
+    assert settings.SESSION_GRACE_SECONDS == 21600
+    assert settings.MAX_STOPPED_SESSIONS == 30
     assert settings.STOP_TIMEOUT_SECONDS == 2
 
 

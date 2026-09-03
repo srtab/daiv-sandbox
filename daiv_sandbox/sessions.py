@@ -1111,6 +1111,28 @@ class SandboxDockerSession:
         self._egress_env_cache = env
         return env
 
+    def _resume_egress(self, container: Container) -> None:
+        """Rebuild the egress network a warm close dropped, before restarting *container*.
+
+        A suspended session's internal network is gone (see EgressProxyManager.suspend), and Docker
+        refuses to start a container whose endpoint names a missing network — so this must run before
+        the restart, not after. No-op for sessions without egress.
+
+        Failures are swallowed deliberately: the restart below is the operation that matters, and its
+        own error handling already maps a Docker fault to a 503. Raising here would convert a
+        recoverable resume into a different, less informative failure. Imported locally because
+        egress.manager imports this module.
+        """
+        token = egress_token(container)
+        if not (settings.egress_enabled and token):
+            return
+        from daiv_sandbox.egress.manager import EgressProxyManager
+
+        try:
+            EgressProxyManager(self.client).resume(token)
+        except Exception:
+            logger.exception("egress: could not rebuild the network for session %s before restart", container.short_id)
+
     def _get_container(self, session_id: str) -> Container | None:
         """
         Get the container by ID. If the container is not running, attempt to restart it.
@@ -1132,6 +1154,7 @@ class SandboxDockerSession:
         logger.warning(
             "Container '%s' is not running (status: %s). Attempting to restart...", container.short_id, container.status
         )
+        self._resume_egress(container)
         try:
             container.restart()
             container.reload()

@@ -142,8 +142,10 @@ class Settings(BaseSettings):
     # Session reaper / lifecycle
     REAPER_ENABLED: bool = True
     REAPER_INTERVAL_SECONDS: int = Field(default=600, gt=0)  # sweep cadence in seconds
-    SESSION_GRACE_SECONDS: int = Field(default=43200, ge=0)  # stopped -> removed age (12h)
-    MAX_STOPPED_SESSIONS: int = Field(default=50, ge=0)  # LRU cap on retained stopped containers
+    SESSION_GRACE_SECONDS: int = Field(default=21600, ge=0)  # stopped -> removed age (6h)
+    # LRU cap on retained stopped containers. A stopped session no longer pins a Docker subnet (see
+    # EgressProxyManager.suspend), so this bounds disk — each retained container holds a seeded repo.
+    MAX_STOPPED_SESSIONS: int = Field(default=30, ge=0)
     STOP_TIMEOUT_SECONDS: int = Field(default=2, ge=0)  # docker stop grace before SIGKILL
     # Untouched-by-any-request age after which a RUNNING session is removed; 0 disables (needs Redis).
     # Must outlast the gap between two requests of one live turn; in-flight work is held by the lock.
