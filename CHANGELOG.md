@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A non-force `DELETE /session/{id}/` now drops the session's internal Docker network instead of keeping it for warm reuse, returning its subnet to Docker's address pool. Docker's default pools yield only 31 bridge subnets host-wide — two of them permanently held by `bridge` and `docker_gwbridge` — so retaining one per warm-stopped session capped concurrency at ~29 regardless of `DAIV_SANDBOX_MAX_STOPPED_SESSIONS`. Once the pool was exhausted, every new session carrying an `egress` block failed with `503` (`all predefined address pools have been fully subnetted`) until the reaper caught up. Both containers still survive the close; the network is recreated and both are reattached when the session resumes, before either container starts.
+
+### Changed
+
+- `DAIV_SANDBOX_SESSION_GRACE_SECONDS` now defaults to `21600` (6h, was `43200`/12h) and `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` to `30` (was `50`). With the internal network released on close, a retained stopped session no longer pins a Docker subnet, so these settings bound disk (each retained container holds a seeded repo) rather than address space.
+
 ## [0.5.0] - 2026-09-01
 
 ### Added
