@@ -518,11 +518,11 @@ def test_force_close_tears_down_triad(client):
         mock_mgr_class.return_value.teardown.assert_called_once_with("tok123")
 
 
-def test_non_force_close_stops_sidecar_but_preserves_triad(client):
-    """A non-force DELETE of an egress session stops BOTH the sandbox and its proxy sidecar — freeing
-    the idle sidecar's memory — but must NOT tear the triad down: the proxy container and internal
-    network survive so the session warm-restarts the proxy on its next turn (via proxy_internal_ip).
-    stop, not teardown, is the warm-reuse-preserving close."""
+def test_non_force_close_suspends_the_triad_instead_of_tearing_it_down(client):
+    """A non-force DELETE of an egress session stops the sandbox and SUSPENDS its egress triad — the
+    sidecar stops and the internal network is dropped so its scarce subnet returns to Docker's pool —
+    but must NOT tear the triad down: both containers survive so the session resumes on its next turn.
+    suspend, not teardown, is the warm-reuse-preserving close."""
     with (
         patch("daiv_sandbox.main.SandboxDockerSession") as cls,
         patch("daiv_sandbox.main.EgressProxyManager") as mock_mgr_class,
@@ -534,7 +534,7 @@ def test_non_force_close_stops_sidecar_but_preserves_triad(client):
         assert resp.status_code == 204
         cls.return_value.stop_container.assert_called_once()
         cls.return_value.remove_container.assert_not_called()
-        mock_mgr_class.return_value.stop_proxy.assert_called_once_with("tok123")
+        mock_mgr_class.return_value.suspend.assert_called_once_with("tok123")
         mock_mgr_class.return_value.teardown.assert_not_called()
 
 

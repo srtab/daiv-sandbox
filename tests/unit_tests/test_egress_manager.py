@@ -213,42 +213,153 @@ def test_teardown_logs_and_continues_when_proxy_remove_errors():
     net.remove.assert_called_once()  # network still cleaned up despite the proxy failure
 
 
-def test_stop_proxy_stops_container_without_removing_proxy_or_network():
-    """A non-force close stops the sidecar to free its memory, but must NOT remove the proxy
-    container or the internal network: both are preserved so a resumed session warm-restarts the
-    proxy from its provisioned confdir (on the writable layer). Final removal stays in teardown."""
+def test_suspend_stops_proxy_and_drops_network_but_keeps_both_containers():
+    """A non-force close stops the sidecar to free its memory AND drops the internal network to return
+    its subnet to Docker's host-wide address pool — the resource that actually runs out (only ~29 are
+    usable, far below MAX_STOPPED_SESSIONS). Neither container may be removed: both are preserved so a
+    resumed session warm-restarts the proxy from its provisioned confdir. Removal stays in teardown."""
     from daiv_sandbox.config import settings
 
     client = MagicMock()
-    proxy = MagicMock()
-    client.containers.list.return_value = [proxy]
-    EgressProxyManager(client).stop_proxy("tok123")
+    proxy, executor, net = MagicMock(), MagicMock(), MagicMock()
+    client.containers.list.side_effect = [[proxy], [executor]]
+    client.networks.list.return_value = [net]
+
+    EgressProxyManager(client).suspend("tok123")
+
     # The explicit STOP_TIMEOUT is deliberate (fast memory reclaim); assert it, don't let a silent
     # revert to Docker's 10s default pass — mirrors test_sessions.py's stop_container assertion.
     proxy.stop.assert_called_once_with(timeout=settings.STOP_TIMEOUT_SECONDS)
+    net.remove.assert_called_once()
     proxy.remove.assert_not_called()
-    client.networks.list.assert_not_called()  # the internal network is left intact for warm reuse
+    executor.remove.assert_not_called()
 
 
-def test_stop_proxy_suppresses_notfound():
+def test_suspend_disconnects_members_before_removing_the_network():
+    """Both members must be disconnected BEFORE the network is removed. Docker resolves an endpoint by
+    network ID, so a container left attached to a removed network can never start again — it fails with
+    "network <id> not found" even once a same-name network exists. Ordering is the whole point here, so
+    assert the sequence, not just the calls."""
+    client = MagicMock()
+    proxy, executor, net = MagicMock(), MagicMock(), MagicMock()
+    client.containers.list.side_effect = [[proxy], [executor]]
+    client.networks.list.return_value = [net]
+    calls = []
+    net.disconnect.side_effect = lambda member, **kw: calls.append(("disconnect", member))
+    net.remove.side_effect = lambda: calls.append(("remove", None))
+
+    EgressProxyManager(client).suspend("tok123")
+
+    assert calls == [("disconnect", proxy), ("disconnect", executor), ("remove", None)]
+
+
+def test_suspend_suppresses_notfound():
     """A proxy already gone (NotFound) is success and must not raise."""
     client = MagicMock()
     proxy = MagicMock()
     proxy.stop.side_effect = NotFound("already gone")
-    client.containers.list.return_value = [proxy]
-    EgressProxyManager(client).stop_proxy("tok123")  # must not raise
+    client.containers.list.side_effect = [[proxy], []]
+    client.networks.list.return_value = []
+    EgressProxyManager(client).suspend("tok123")  # must not raise
     proxy.stop.assert_called_once()  # the swallow happened at the intended call site, not by skipping it
 
 
-def test_stop_proxy_logs_and_swallows_other_errors():
+def test_suspend_logs_and_swallows_other_errors():
     """A non-NotFound stop failure (e.g. daemon busy) must be logged and swallowed, not propagated,
     so a stuck sidecar never fails the DELETE — teardown (force close / reaper) is the backstop."""
     client = MagicMock()
     proxy = MagicMock()
     proxy.stop.side_effect = APIError("daemon busy")
-    client.containers.list.return_value = [proxy]
-    EgressProxyManager(client).stop_proxy("tok123")  # must not raise
+    client.containers.list.side_effect = [[proxy], []]
+    client.networks.list.return_value = []
+    EgressProxyManager(client).suspend("tok123")  # must not raise
     proxy.stop.assert_called_once()  # the swallow happened at the intended call site, not by skipping it
+
+
+def test_suspend_still_removes_the_network_when_a_disconnect_fails():
+    """A stuck disconnect must not strand the subnet: the network removal is the whole point of the
+    suspend, so one bad member is logged and skipped rather than aborting the cleanup."""
+    client = MagicMock()
+    proxy, net = MagicMock(), MagicMock()
+    client.containers.list.side_effect = [[proxy], []]
+    client.networks.list.return_value = [net]
+    net.disconnect.side_effect = APIError("daemon busy")
+
+    EgressProxyManager(client).suspend("tok123")  # must not raise
+
+    net.remove.assert_called_once()
+
+
+def _network(name: str = "daiv-egress-tok123", net_id: str = "net-new") -> MagicMock:
+    net = MagicMock()
+    net.name = name
+    net.id = net_id
+    return net
+
+
+def _member(network_name: str | None = None, net_id: str = "net-new") -> MagicMock:
+    member = MagicMock()
+    networks = {network_name: {"NetworkID": net_id}} if network_name else {}
+    member.attrs = {"NetworkSettings": {"Networks": networks}}
+    return member
+
+
+def test_resume_recreates_the_network_when_it_is_gone():
+    """After a suspend the labelled network no longer exists, so resume must rebuild it under the same
+    name before anything tries to start."""
+    client = MagicMock()
+    client.networks.list.return_value = []
+    client.containers.list.side_effect = [[], []]
+    client.networks.get.return_value = _network()
+
+    assert EgressProxyManager(client).resume("tok123") == "daiv-egress-tok123"
+
+    assert client.networks.create.call_args.kwargs["name"] == "daiv-egress-tok123"
+
+
+def test_resume_reattaches_both_members_before_either_starts():
+    """Both the sidecar and the sandbox must be reconnected by resume. Reattaching only the proxy would
+    leave the sandbox wedged on its next start with "network <id> not found"."""
+    client = MagicMock()
+    net = _network()
+    client.networks.list.return_value = [net]
+    proxy, executor = _member(), _member()
+    client.containers.list.side_effect = [[proxy], [executor]]
+
+    EgressProxyManager(client).resume("tok123")
+
+    assert [c.args[0] for c in net.connect.call_args_list] == [proxy, executor]
+
+
+def test_resume_is_a_noop_for_members_already_on_the_live_network():
+    """resume runs on the request hot path, so an already-attached member must cost nothing — no
+    reconnect churn, and no spurious disconnect that would drop a live session's egress."""
+    client = MagicMock()
+    net = _network(net_id="net-live")
+    client.networks.list.return_value = [net]
+    attached = _member("daiv-egress-tok123", net_id="net-live")
+    client.containers.list.side_effect = [[attached], []]
+
+    EgressProxyManager(client).resume("tok123")
+
+    net.connect.assert_not_called()
+    net.disconnect.assert_not_called()
+
+
+def test_resume_clears_a_stale_endpoint_before_reconnecting():
+    """A member left pointing at a PREVIOUS network generation (same name, dead ID — a partially failed
+    suspend) cannot simply be connected: Docker refuses, and the container stays unstartable. Force-
+    disconnect clears the dead endpoint even though the live network's ID differs, then connect."""
+    client = MagicMock()
+    net = _network(net_id="net-new")
+    client.networks.list.return_value = [net]
+    stale = _member("daiv-egress-tok123", net_id="net-old-and-removed")
+    client.containers.list.side_effect = [[stale], []]
+
+    EgressProxyManager(client).resume("tok123")
+
+    net.disconnect.assert_called_once_with(stale, force=True)
+    net.connect.assert_called_once_with(stale)
 
 
 def _proxy_with_ip(ip: str, network_name: str = "daiv-egress-tok123") -> Mock:
@@ -263,6 +374,7 @@ def test_proxy_internal_ip_returns_ip_of_running_proxy_without_restart(monkeypat
     proxy = _proxy_with_ip("10.1.2.3")
     proxy.status = "running"
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
 
     assert mgr.proxy_internal_ip("tok123") == "10.1.2.3"
     proxy.restart.assert_not_called()
@@ -290,6 +402,7 @@ def test_proxy_internal_ip_restarts_stopped_proxy_and_reresolves(monkeypatch):
 
     proxy.reload.side_effect = _reload
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
 
     assert mgr.proxy_internal_ip("tok123") == "10.9.9.9"
     proxy.restart.assert_called_once()
@@ -304,6 +417,7 @@ def test_proxy_internal_ip_raises_session_unavailable_when_restart_fails(monkeyp
     proxy.status = "exited"
     proxy.restart.side_effect = APIError("daemon refused restart")
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
 
     with pytest.raises(SessionUnavailableError):
         mgr.proxy_internal_ip("tok123")
@@ -316,6 +430,7 @@ def test_proxy_internal_ip_raises_when_running_proxy_has_no_ip(monkeypatch):
     proxy = _proxy_with_ip("")
     proxy.status = "running"
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
 
     with pytest.raises(RuntimeError, match="has no IP"):
         mgr.proxy_internal_ip("tok123")
@@ -330,10 +445,42 @@ def test_ensure_proxy_running_restarts_stopped_proxy(monkeypatch):
     proxy = Mock()
     proxy.status = "exited"
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
 
     assert mgr.ensure_proxy_running("tok123") is proxy
     proxy.restart.assert_called_once()
     assert proxy.reload.call_count == 2  # once before the status check, once after restart
+
+
+def test_ensure_proxy_running_rebuilds_the_network_before_restarting(monkeypatch):
+    """The sidecar of a suspended session has no network to come back to, so resume must run BEFORE the
+    restart — reversed, the restart fails with "network <id> not found" and the session is stuck."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "exited"
+    calls = []
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: calls.append("resume"))
+    proxy.restart.side_effect = lambda: calls.append("restart")
+
+    mgr.ensure_proxy_running("tok123")
+
+    assert calls == ["resume", "restart"]
+
+
+def test_ensure_proxy_running_skips_the_rebuild_for_a_running_proxy(monkeypatch):
+    """resume must stay off the hot path: a running proxy proves its network exists, so the per-request
+    path must not pay for two extra Docker list calls."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "running"
+    resumed = []
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: resumed.append(token))
+
+    mgr.ensure_proxy_running("tok123")
+
+    assert resumed == []
 
 
 def test_ensure_proxy_running_leaves_running_proxy_untouched(monkeypatch):
@@ -342,6 +489,7 @@ def test_ensure_proxy_running_leaves_running_proxy_untouched(monkeypatch):
     proxy = Mock()
     proxy.status = "running"
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
 
     assert mgr.ensure_proxy_running("tok123") is proxy
     proxy.restart.assert_not_called()
@@ -354,6 +502,7 @@ def test_ensure_proxy_running_raises_session_unavailable_when_restart_fails(monk
     proxy.status = "exited"
     proxy.restart.side_effect = APIError("daemon refused restart")
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
 
     with pytest.raises(SessionUnavailableError):
         mgr.ensure_proxy_running("tok123")
@@ -371,6 +520,7 @@ def _provision_ready_mgr(monkeypatch, *, status: str = "running"):
     proxy.put_archive.return_value = True
     proxy.exec_run.return_value = Mock(exit_code=0, output=b"")
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
     return mgr, proxy
 
 
@@ -407,6 +557,7 @@ def test_provision_warm_restarts_stopped_proxy_then_writes(monkeypatch):
     proxy.put_archive.return_value = True
     proxy.exec_run.return_value = Mock(exit_code=0, output=b"")
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
 
     mgr.provision("tok123", b"{}")
 
@@ -423,6 +574,7 @@ def test_provision_raises_session_unavailable_when_restart_fails(monkeypatch):
     proxy.status = "exited"
     proxy.restart.side_effect = APIError("daemon refused restart")
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
 
     with pytest.raises(SessionUnavailableError):
         mgr.provision("tok123", b"{}")

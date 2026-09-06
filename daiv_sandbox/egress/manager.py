@@ -11,6 +11,7 @@ from daiv_sandbox.sessions import (
     DAIV_SANDBOX_TYPE_LABEL,
     EGRESS_SESSION_LABEL,
     SANDBOX_CA_BUNDLE,
+    TYPE_CMD_EXECUTOR,
     TYPE_EGRESS_NETWORK,
     TYPE_EGRESS_PROXY,
     SessionUnavailableError,
@@ -142,16 +143,22 @@ class EgressProxyManager:
     def ensure_proxy_running(self, token: str) -> Container:
         """Return the session's proxy, warm-restarting it if it is not running.
 
-        A warm close stops the sidecar (see stop_proxy) and an OOM/crash or daemon restart can too; the
-        confdir (/run/egress: injected CA + provisioned config.json) is on the writable layer, so a
-        restarted proxy comes back fully configured. Restart-on-access, like
-        SandboxDockerSession._get_container. Any APIError (NotFound included) → retryable 503, not 500.
+        A warm close stops the sidecar and drops the internal network (see suspend), and an OOM/crash
+        or daemon restart can stop it too; the confdir (/run/egress: injected CA + provisioned
+        config.json) is on the writable layer, so a restarted proxy comes back fully configured.
+        Restart-on-access, like SandboxDockerSession._get_container. Any APIError (NotFound included) →
+        retryable 503, not 500.
+
+        ``resume`` is gated on the proxy actually being down, which keeps it off the hot path: a running
+        proxy proves its network still exists, so there is nothing to rebuild. A stopped one may have
+        been suspended, and the restart below would fail with "network <id> not found" without it.
         """
         try:
             proxy = self._proxy(token)
             proxy.reload()
             if proxy.status != "running":
                 logger.warning("egress: proxy for %s is %s; restarting", token, proxy.status)
+                self.resume(token)
                 proxy.restart()
                 proxy.reload()  # restart() does not refresh attrs; reload() surfaces the fresh IP/state
         except APIError as exc:
@@ -221,13 +228,64 @@ class EgressProxyManager:
         networks = self.client.networks.list(filters={"label": f"{EGRESS_SESSION_LABEL}={token}"})
         self._best_effort(networks, lambda net: net.remove(), "remove")
 
-    def stop_proxy(self, token: str) -> None:
-        """Stop — but do NOT remove — the session's proxy sidecar, freeing its memory while the session
-        is warm-stopped (a non-force close). A resumed session warm-restarts it via
-        ``ensure_proxy_running``; ``teardown`` (force close or reaper) still owns final removal. A manual
-        ``stop`` also suppresses the on-failure restart_policy, so the daemon does not resurrect it."""
+    def suspend(self, token: str) -> None:
+        """Release the rebuildable half of the triad on a warm close (a non-force close): stop the
+        sidecar and drop the per-session internal network, keeping both containers for warm reuse.
+        ``resume`` rebuilds what this releases; ``teardown`` (force close or reaper) still owns final
+        removal. A manual ``stop`` also suppresses the on-failure restart_policy, so the daemon does
+        not resurrect the sidecar.
+
+        The network goes because its SUBNET is the scarcest resource in the triad. Docker's default
+        address pools yield only 31 bridge subnets host-wide (172.17-172.31/16 plus 16 × /20 out of
+        192.168.0.0/16), two of which are permanently held by `bridge` and `docker_gwbridge`. Holding
+        one per warm-stopped session therefore caps concurrency near 29 regardless of
+        MAX_STOPPED_SESSIONS, and new sessions fail with "all predefined address pools have been fully
+        subnetted" until the reaper catches up.
+
+        Members are disconnected BEFORE the network is removed: Docker resolves a container's endpoint
+        by network ID, so a container left attached to a removed network can never start again — it
+        fails with "network <id> not found" even once a same-name network exists.
+        """
         proxies = self._list(TYPE_EGRESS_PROXY, token)
         self._best_effort(proxies, lambda proxy: proxy.stop(timeout=settings.STOP_TIMEOUT_SECONDS), "stop")
+        networks = self.client.networks.list(filters={"label": f"{EGRESS_SESSION_LABEL}={token}"})
+        members = proxies + self._list(TYPE_CMD_EXECUTOR, token)
+        for network in networks:
+            self._best_effort(members, lambda member, net=network: net.disconnect(member, force=True), "disconnect")
+        self._best_effort(networks, lambda net: net.remove(), "remove")
+
+    def resume(self, token: str) -> str:
+        """Rebuild what ``suspend`` released and return the internal network's name: recreate the
+        network if it is gone, and reattach the sidecar and the sandbox to it.
+
+        Idempotent, so both entry points (a sandbox restart in SandboxDockerSession._get_container and a
+        sidecar restart in ``ensure_proxy_running``) can call it without coordinating; the attachment
+        check reads ``NetworkID`` off the container-list payload rather than re-inspecting each member.
+
+        Both members are reattached here, before either is started, because Docker refuses to start a
+        container whose recorded endpoint names a network ID that no longer exists. A member still
+        carrying such a stale endpoint is force-disconnected first: ``connect`` alone would fail, and
+        ``disconnect(force=True)`` clears the dead endpoint even though the live network's ID differs.
+        """
+        networks = self.client.networks.list(filters={"label": f"{EGRESS_SESSION_LABEL}={token}"})
+        network = networks[0] if networks else self.client.networks.get(self.create_network(token))
+        for member in self._list(TYPE_EGRESS_PROXY, token) + self._list(TYPE_CMD_EXECUTOR, token):
+            self._attach(network, member)
+        return network.name
+
+    def _attach(self, network, member: Container) -> None:
+        """Connect *member* to *network* unless it is already on that exact network.
+
+        The identity check is by network ID, not name: ``suspend`` + ``resume`` recreate the network
+        under the same name with a fresh ID, and an endpoint pointing at the old ID is worse than no
+        endpoint at all (it wedges the container's next start).
+        """
+        attached = member.attrs.get("NetworkSettings", {}).get("Networks", {}).get(network.name)
+        if attached and attached.get("NetworkID") == network.id:
+            return
+        if attached:
+            self._best_effort([member], lambda m: network.disconnect(m, force=True), "disconnect stale")
+        self._best_effort([member], lambda m: network.connect(m), "connect")
 
     @staticmethod
     def _best_effort(resources: list, op: Callable[..., object], what: str) -> None:

@@ -453,10 +453,11 @@ async def close_session(
 ) -> Response:
     """
     Close a session. By default the container is *stopped* (preserved for warm reuse and reclaimed
-    later by the reaper), and its egress proxy sidecar (if any) is stopped alongside it — freeing the
-    idle sidecar's memory while keeping the proxy container and internal network for warm restart on
-    the next turn. Pass ``?force=true`` to remove the container and tear the egress triad down
-    immediately.
+    later by the reaper), and its egress triad (if any) is *suspended* — the sidecar is stopped and the
+    per-session internal network dropped, freeing the idle sidecar's memory and returning the network's
+    subnet to Docker's host-wide address pool, which is the resource that actually runs out. Both
+    containers survive, and ``resume`` rebuilds the network on the next turn. Pass ``?force=true`` to
+    remove the container and tear the egress triad down immediately.
     """
     async with request.app.state.session_lock_manager.acquire(session_id):
         cmd_executor = SandboxDockerSession()
@@ -479,7 +480,7 @@ async def close_session(
         # After the container op, so a failed sandbox stop leaves a still-running sandbox's proxy alone.
         if token:
             manager = EgressProxyManager(SandboxDockerSession._get_shared_client())
-            await asyncio.to_thread(manager.teardown if force else manager.stop_proxy, token)
+            await asyncio.to_thread(manager.teardown if force else manager.suspend, token)
 
         await request.app.state.session_activity.forget(session_id)
 

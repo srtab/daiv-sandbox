@@ -237,6 +237,72 @@ def test_get_container_restarts_stopped_container():
     assert result is container
 
 
+def test_get_container_rebuilds_the_egress_network_before_restarting(monkeypatch, tmp_path):
+    """A warm close drops the session's internal network, and Docker refuses to start a container whose
+    endpoint names a missing network. The rebuild must therefore happen BEFORE restart() — reversed, the
+    restart fails with "network <id> not found" and the warm session is unrecoverable."""
+    from daiv_sandbox import sessions
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(tmp_path / "ca.pem"))
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(tmp_path / "ca.key"))
+    container = Mock(status="exited", labels={sessions.EGRESS_SESSION_LABEL: "tok123"})
+    calls = []
+    container.restart.side_effect = lambda: calls.append("restart")
+    container.reload.side_effect = lambda: setattr(container, "status", "running")
+    client = Mock()
+    client.containers.get.return_value = container
+    monkeypatch.setattr(
+        "daiv_sandbox.egress.manager.EgressProxyManager.resume", lambda self, token: calls.append(f"resume:{token}")
+    )
+
+    _bare_session(client)._get_container("sid")
+
+    assert calls == ["resume:tok123", "restart"]
+
+
+def test_get_container_does_not_touch_egress_for_a_session_without_a_token(monkeypatch, tmp_path):
+    """A network-isolated session has no triad to rebuild; the resume path must stay out of its way."""
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(tmp_path / "ca.pem"))
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(tmp_path / "ca.key"))
+    container = Mock(status="exited", labels={})
+    container.reload.side_effect = lambda: setattr(container, "status", "running")
+    client = Mock()
+    client.containers.get.return_value = container
+    resumed = []
+    monkeypatch.setattr(
+        "daiv_sandbox.egress.manager.EgressProxyManager.resume", lambda self, token: resumed.append(token)
+    )
+
+    _bare_session(client)._get_container("sid")
+
+    assert resumed == []
+    container.restart.assert_called_once()
+
+
+def test_get_container_still_restarts_when_the_network_rebuild_fails(monkeypatch, tmp_path):
+    """A rebuild fault must not pre-empt the restart: the restart's own error handling maps a Docker
+    fault to a retryable 503, which is a better outcome than a different error raised from the resume."""
+    from daiv_sandbox import sessions
+    from daiv_sandbox.config import settings
+
+    monkeypatch.setattr(settings, "EGRESS_CA_CERT_FILE", str(tmp_path / "ca.pem"))
+    monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(tmp_path / "ca.key"))
+    container = Mock(status="exited", labels={sessions.EGRESS_SESSION_LABEL: "tok123"})
+    container.reload.side_effect = lambda: setattr(container, "status", "running")
+    client = Mock()
+    client.containers.get.return_value = container
+    monkeypatch.setattr(
+        "daiv_sandbox.egress.manager.EgressProxyManager.resume",
+        lambda self, token: (_ for _ in ()).throw(APIError("daemon busy")),
+    )
+
+    assert _bare_session(client)._get_container("sid") is container
+    container.restart.assert_called_once()
+
+
 def test_get_container_returns_none_when_missing():
     client = Mock()
     client.containers.get.side_effect = NotFound("nope")
