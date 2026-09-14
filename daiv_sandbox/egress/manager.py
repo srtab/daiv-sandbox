@@ -180,14 +180,14 @@ class EgressProxyManager:
 
     def provision(self, token: str, config_bytes: bytes) -> None:
         """Warm-restart the proxy if needed, then write the config JSON into it ATOMICALLY; the addon
-        reloads on mtime change.
+        picks it up on its next request (PolicyStore keys staleness on inode/mtime/size).
 
         put_archive extracts in place and is not atomic: a request landing mid-write could read a
-        truncated config.json, and PolicyStore caches that failed parse against the new mtime (deny-all
-        until the next write) — and since mtime only advances when the file is replaced, a re-write with
-        identical bytes would not clear that cached deny-all. So stage to a temp file, then rename it
-        over config.json (atomic on the same filesystem): a reader sees the old or new file whole and
-        the mtime flips exactly once.
+        truncated config.json, and PolicyStore caches that failed parse until the file changes again.
+        So stage to a temp file, then rename it over config.json (atomic on the same filesystem): a
+        reader sees the old or new file whole, and the rename gives it a new inode, which is what the
+        addon detects — timestamps cannot be relied on here, since put_archive stamps the extracted
+        member from the tar and two refreshes can land in the same second.
 
         The rename uses exec_run, which requires the proxy RUNNING (unlike put_archive), so readiness
         goes through ensure_proxy_running and both callers get a ready proxy without pre-sequencing. A

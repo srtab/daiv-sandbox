@@ -7,6 +7,7 @@ import posixpath
 import tarfile
 import tempfile
 import threading
+import time
 from pathlib import Path, PurePosixPath
 from typing import IO, TYPE_CHECKING, NamedTuple
 
@@ -205,6 +206,11 @@ def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int, u
     callers are unchanged. Callers extracting into a container that reads the file as a
     non-root user (e.g. the egress proxy running as RUN_UID) must pass that uid/gid so the
     extracted file is owned by — and readable by — that user.
+
+    The member is stamped with the current time. ``put_archive`` extracts the member's mtime
+    verbatim, so leaving ``TarInfo``'s default of 0 makes every write of a given path land with an
+    identical timestamp — which silently defeats any mtime-based staleness check on the reading
+    side (see ``PolicyStore`` in the egress sidecar).
     """
     stream = tempfile.SpooledTemporaryFile(max_size=_SINGLE_FILE_TAR_SPOOL_LIMIT)  # noqa: SIM115
     try:
@@ -215,6 +221,7 @@ def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int, u
             info.type = tarfile.REGTYPE
             info.uid = uid
             info.gid = gid
+            info.mtime = int(time.time())
             tf.addfile(info, io.BytesIO(content))
         stream.seek(0)
     except BaseException:

@@ -1,3 +1,6 @@
+import io
+import tarfile
+import time
 from unittest.mock import MagicMock, Mock
 
 import pytest
@@ -536,6 +539,24 @@ def test_provision_stages_to_temp_then_renames_atomically(monkeypatch):
         ["mv", "-f", "/run/egress/config.json.tmp", "/run/egress/config.json"], user="root"
     )
     proxy.reload.assert_called_once()
+
+
+def test_provision_stages_a_config_whose_mtime_advances_per_write(monkeypatch):
+    """The staged tar must carry a real mtime. put_archive extracts the member timestamp verbatim and
+    the rename keeps it, so a zero/constant mtime makes every config.json land identical to the last
+    one — the sidecar's staleness check then never fires and it serves a superseded token forever."""
+    mgr, proxy = _provision_ready_mgr(monkeypatch)
+    # provision closes the stream on the way out, so snapshot the bytes while the call is in flight.
+    staged: list[bytes] = []
+    proxy.put_archive.side_effect = lambda _parent, tar: staged.append(tar.read()) or True
+
+    before = int(time.time())
+    mgr.provision("tok123", b'{"policy": {"default": "deny"}, "secrets": {}}')
+
+    with tarfile.open(fileobj=io.BytesIO(staged[0])) as tf:
+        member = tf.getmembers()[0]
+    assert member.name == "config.json.tmp"
+    assert before <= member.mtime <= int(time.time())
 
 
 def test_provision_raises_when_rename_fails(monkeypatch):

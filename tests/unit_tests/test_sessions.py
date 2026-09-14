@@ -1,5 +1,6 @@
 import io
 import tarfile
+import time
 from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
@@ -917,6 +918,16 @@ def test_build_single_file_tar_stream_returns_seekable_stream():
             assert members[0].isfile()
             assert (members[0].mode & 0o7777) == 0o644
             assert tf.extractfile(members[0]).read() == content
+
+
+def test_build_single_file_tar_stream_stamps_a_current_mtime():
+    """TarInfo.mtime defaults to 0, and put_archive extracts it verbatim — so without an explicit
+    stamp every write of the same path lands dated 1970 and any mtime-based staleness check
+    (PolicyStore's, a build tool's) can never see the file change."""
+    before = int(time.time())
+    with _build_single_file_tar_stream("foo.txt", b"hello", mode=0o600) as stream, tarfile.open(fileobj=stream) as tf:
+        mtime = tf.getmembers()[0].mtime
+    assert before <= mtime <= int(time.time())
 
 
 def test_build_single_file_tar_stream_handles_large_content():

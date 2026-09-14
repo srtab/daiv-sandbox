@@ -111,6 +111,13 @@ class PolicyEvaluator:
             intercept = "all"
         return cls(default, intercept, rules, secrets)
 
+    def describe(self) -> str:
+        """One-line summary of the effective policy, logged on every reload so an operator can tell a
+        refreshed sidecar from a stale one. Counts only — a secret value must never reach a log."""
+        return (
+            f"default={self._default} intercept={self._intercept} rules={len(self._rules)} secrets={len(self._secrets)}"
+        )
+
     def _match(self, host: str, method: str) -> tuple[_Rule | None, _Rule | None]:
         """Return (rule allowing host+method, first rule whose host matched at all).
 
@@ -158,23 +165,34 @@ _DENY_ALL = PolicyEvaluator("deny", "all", [], {})
 
 
 class PolicyStore:
-    """Loads the config JSON, caching the parsed PolicyEvaluator and reloading on mtime change.
+    """Loads the config JSON, caching the parsed PolicyEvaluator and reloading when the file changes.
 
     A missing/unreadable/invalid file yields a deny-all policy — fail closed.
     """
 
     def __init__(self, path: str):
         self._path = path
-        self._mtime: float | None = None
+        self._stamp: tuple[int, int, int] | None = None
         self._policy = _DENY_ALL
+
+    def _stat_stamp(self) -> tuple[int, int, int]:
+        """Staleness key for the config file.
+
+        The inode is what makes this correct, not a belt-and-braces addition: the writer installs
+        every config with an atomic rename (see EgressProxyManager.provision), which always changes
+        the inode but carries over the staged file's timestamp — so mtime alone can repeat forever
+        and a refreshed credential would never be picked up.
+        """
+        st = os.stat(self._path)  # noqa: PTH116
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
 
     def current(self) -> PolicyEvaluator:
         try:
-            mtime = os.path.getmtime(self._path)  # noqa: PTH204
+            stamp = self._stat_stamp()
         except OSError:
-            self._mtime, self._policy = None, _DENY_ALL
+            self._stamp, self._policy = None, _DENY_ALL
             return self._policy
-        if mtime != self._mtime:
+        if stamp != self._stamp:
             try:
                 with open(self._path, encoding="utf-8") as fh:  # noqa: PTH123
                     self._policy = PolicyEvaluator.from_config(json.load(fh))
@@ -186,5 +204,7 @@ class PolicyStore:
                 # structurally-bad config) must therefore collapse to deny-all, never propagate.
                 logger.exception("egress: failed to load policy from %s; failing closed (deny-all)", self._path)
                 self._policy = _DENY_ALL
-            self._mtime = mtime
+            else:
+                logger.info("egress: policy reloaded from %s — %s", self._path, self._policy.describe())
+            self._stamp = stamp
         return self._policy

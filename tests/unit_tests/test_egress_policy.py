@@ -289,3 +289,96 @@ def test_policy_store_dangling_inject_config_is_deny_all(tmp_path):
     store = PolicyStore(str(path))
     assert store.current().evaluate("github.com", "CONNECT").allow is False
     assert store.current().evaluate("unlisted.example", "GET").allow is False  # default-allow also gone
+
+
+def _replace_preserving_mtime(path, payload):
+    """Rewrite *path* the way ``EgressProxyManager.provision`` does: stage a sibling temp file, then
+    atomically rename it over the target — and stamp the staged file with the target's existing mtime,
+    which is what a tar member extracted by ``put_archive`` produces (every write lands with the same
+    member mtime)."""
+    import os
+
+    mtime_ns = path.stat().st_mtime_ns
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload))
+    os.utime(tmp, ns=(mtime_ns, mtime_ns))
+    tmp.replace(path)
+
+
+def test_policy_store_reloads_when_atomic_replace_preserves_mtime(tmp_path):
+    """The production write path (put_archive + mv) lands every config.json with an identical member
+    mtime, so an mtime-only staleness check never fires and the sidecar keeps serving the first policy
+    it ever parsed — silently injecting an expired token. Reload must key on the file identity the
+    rename actually changes, not on the timestamp."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_cfg()))
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("github.com", "GET").allow is False
+
+    _replace_preserving_mtime(path, _cfg(rules=[{"host": "github.com"}]))
+
+    assert store.current().evaluate("github.com", "GET").allow is True
+
+
+def test_policy_store_reloads_a_refreshed_secret_at_an_unchanged_mtime(tmp_path):
+    """The exact production failure: only the injected credential's value changes. A stale reload
+    keeps injecting the superseded token."""
+    path = tmp_path / "config.json"
+    rules = [{"host": "github.com", "methods": ["*"], "inject": "git"}]
+    path.write_text(json.dumps(_cfg(rules=rules, secrets={"git": {"header": "Authorization", "value": "Basic old"}})))
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("github.com", "GET").inject == ("Authorization", "Basic old")
+
+    new_secrets = {"git": {"header": "Authorization", "value": "Basic new"}}
+    _replace_preserving_mtime(path, _cfg(rules=rules, secrets=new_secrets))
+
+    assert store.current().evaluate("github.com", "GET").inject == ("Authorization", "Basic new")
+
+
+def test_policy_store_clears_cached_deny_all_when_garbage_is_replaced_at_an_unchanged_mtime(tmp_path):
+    """A parse failure caches deny-all. Recovering from it must not require the clock to move either,
+    or one torn write wedges the proxy closed until the container restarts."""
+    path = tmp_path / "config.json"
+    path.write_text("{ not json")
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("github.com", "GET").allow is False
+
+    _replace_preserving_mtime(path, _cfg(rules=[{"host": "github.com"}]))
+
+    assert store.current().evaluate("github.com", "GET").allow is True
+
+
+def test_policy_store_logs_effective_policy_on_reload(tmp_path, caplog):
+    """Every reload announces the policy it installed, so a stale sidecar is greppable: the absence of
+    this line after a refresh is the only signal that the write did not take."""
+    import logging
+
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            _cfg(
+                rules=[{"host": "github.com", "methods": ["*"], "inject": "git"}],
+                secrets={"git": {"header": "Authorization", "value": "Basic t"}},
+            )
+        )
+    )
+    store = PolicyStore(str(path))
+    with caplog.at_level(logging.INFO, logger="daiv_sandbox.egress"):
+        store.current()
+    assert "policy reloaded" in caplog.text
+    assert "rules=1" in caplog.text and "secrets=1" in caplog.text
+    assert "Basic t" not in caplog.text  # the secret value must never reach the log
+
+
+def test_policy_store_does_not_relog_when_config_is_unchanged(tmp_path, caplog):
+    """The reload log runs on the per-request hot path; it must fire on change only, never per request."""
+    import logging
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_cfg()))
+    store = PolicyStore(str(path))
+    store.current()
+    with caplog.at_level(logging.INFO, logger="daiv_sandbox.egress"):
+        store.current()
+        store.current()
+    assert "policy reloaded" not in caplog.text
