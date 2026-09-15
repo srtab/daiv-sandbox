@@ -281,3 +281,63 @@ def test_create_endpoint_provisions_egress_and_enforces_policy(
     assert deny.status_code == 200, deny.text
     deny_output = deny.json()["results"][0]["output"]
     assert "403" in deny_output, deny_output
+
+
+def _policy_allowing(host: str) -> bytes:
+    """A passthrough (no-inject) allow-list for one host. Callers pass equal-length hosts so successive
+    configs are byte-identical in length, which is what a re-minted credential looks like in production."""
+    return json.dumps({
+        "policy": {"default": "deny", "intercept": "credentialed", "rules": [{"host": host, "methods": ["*"]}]},
+        "secrets": {},
+    }).encode()
+
+
+def test_repeated_provision_takes_effect_after_a_request_has_cached_the_policy(docker_client):
+    """The whole put_archive -> mv -> PolicyStore chain across repeated installs, with a request between.
+
+    Both existing triad tests call provision() exactly once, which is the blind spot the stale-policy bug
+    lived in. This covers the chain, not the stat-collision mechanics: whether the filesystem recycles the
+    inode a rename freed is not controllable from a test, so the collision itself is pinned by unit tests.
+    """
+    if not _image_present(docker_client, settings.EGRESS_PROXY_IMAGE):
+        pytest.skip("egress proxy image not built; run `make build-egress-proxy`")
+
+    token = uuid.uuid4().hex[:12]
+    mgr = EgressProxyManager(docker_client)
+    sandbox = None
+    try:
+        combined, _ = _self_signed_ca()
+        net = mgr.create_network(token)
+        mgr.start_proxy(token, net, ca_pem=combined)
+        mgr.provision(token, _policy_allowing("example.com"))
+        env = exec_proxy_env(mgr.proxy_internal_ip(token), settings.EGRESS_PROXY_PORT)
+        sandbox = docker_client.containers.run("curlimages/curl:latest", command="sleep 120", detach=True, network=net)
+
+        def _curl(url):
+            return (
+                sandbox
+                .exec_run(
+                    ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10", url], environment=env
+                )
+                .output.decode()
+                .strip()
+            )
+
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if _curl("https://example.com").startswith(("2", "3")):
+                break
+            time.sleep(0.25)
+        assert _curl("https://example.com").startswith(("2", "3"))  # caches the stamp in PolicyStore
+
+        # Two installs, back to back: same wall-clock second, and all three hosts are 11 characters, so
+        # every config.json is the same size.
+        mgr.provision(token, _policy_allowing("example.net"))
+        mgr.provision(token, _policy_allowing("example.org"))
+
+        assert _curl("https://example.org").startswith(("2", "3"))  # the third config is live
+        assert "403" in _curl("https://example.com")  # the first is gone
+    finally:
+        if sandbox is not None:
+            sandbox.remove(force=True)
+        mgr.teardown(token)

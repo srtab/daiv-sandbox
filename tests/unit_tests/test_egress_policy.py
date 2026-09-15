@@ -1,4 +1,7 @@
+import hashlib
 import json
+import logging
+import os
 
 import pytest
 
@@ -289,3 +292,160 @@ def test_policy_store_dangling_inject_config_is_deny_all(tmp_path):
     store = PolicyStore(str(path))
     assert store.current().evaluate("github.com", "CONNECT").allow is False
     assert store.current().evaluate("unlisted.example", "GET").allow is False  # default-allow also gone
+
+
+def _replace_preserving_mtime(path, payload):
+    """Rewrite *path* the way ``provision`` does — stage a sibling, then rename over the target — but
+    with the mtime pinned, so the reload is proven to hold even if the writer's stamp is ever dropped."""
+    mtime_ns = path.stat().st_mtime_ns
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload))
+    os.utime(tmp, ns=(mtime_ns, mtime_ns))
+    tmp.replace(path)
+
+
+def test_policy_store_reloads_when_atomic_replace_preserves_mtime(tmp_path):
+    """Keying the reload on the mtime alone is not safe: the writer's stamp has whole-second resolution,
+    so two refreshes can share one and the sidecar would keep serving the first policy it parsed."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_cfg()))
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("github.com", "GET").allow is False
+
+    _replace_preserving_mtime(path, _cfg(rules=[{"host": "github.com"}]))
+
+    assert store.current().evaluate("github.com", "GET").allow is True
+
+
+def test_policy_store_reloads_a_refreshed_secret_at_an_unchanged_mtime(tmp_path):
+    """The exact production failure: only the injected credential's value changes. A stale reload
+    keeps injecting the superseded token."""
+    path = tmp_path / "config.json"
+    rules = [{"host": "github.com", "methods": ["*"], "inject": "git"}]
+    path.write_text(json.dumps(_cfg(rules=rules, secrets={"git": {"header": "Authorization", "value": "Basic old"}})))
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("github.com", "GET").inject == ("Authorization", "Basic old")
+
+    new_secrets = {"git": {"header": "Authorization", "value": "Basic new"}}
+    _replace_preserving_mtime(path, _cfg(rules=rules, secrets=new_secrets))
+
+    assert store.current().evaluate("github.com", "GET").inject == ("Authorization", "Basic new")
+
+
+def test_policy_store_clears_cached_deny_all_when_garbage_is_replaced_at_an_unchanged_mtime(tmp_path):
+    """A parse failure caches deny-all. Recovering must not require the clock to move, or one bad
+    config wedges the proxy closed until the container restarts."""
+    path = tmp_path / "config.json"
+    path.write_text("{ not json")
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("github.com", "GET").allow is False
+
+    _replace_preserving_mtime(path, _cfg(rules=[{"host": "github.com"}]))
+
+    assert store.current().evaluate("github.com", "GET").allow is True
+
+
+def test_policy_store_logs_effective_policy_on_reload(tmp_path, caplog):
+    """Every reload announces the policy it installed, so a stale sidecar is greppable."""
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            _cfg(
+                rules=[{"host": "github.com", "methods": ["*"], "inject": "git"}],
+                secrets={"git": {"header": "Authorization", "value": "Basic t"}},
+            )
+        )
+    )
+    store = PolicyStore(str(path))
+    with caplog.at_level(logging.INFO, logger="daiv_sandbox.egress"):
+        store.current()
+    assert "policy reloaded" in caplog.text
+    assert "rules=1" in caplog.text and "secrets=1" in caplog.text
+    assert "Basic t" not in caplog.text  # the secret value must never reach the log
+
+
+def test_policy_store_does_not_relog_when_config_is_unchanged(tmp_path, caplog):
+    """The reload log runs on the per-request hot path; it must fire on change only, never per request."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_cfg()))
+    store = PolicyStore(str(path))
+    store.current()
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="daiv_sandbox.egress"):
+        store.current()
+        store.current()
+    assert "policy reloaded" not in caplog.text
+
+
+def test_stat_stamp_keys_on_ctime_as_well(tmp_path):
+    """ctime backstops the other three, which can all repeat: ext4 recycles the inode a rename frees,
+    the mtime is writer-supplied, and a re-minted credential keeps the size. Pinned white-box because
+    ctime moves on its own — nothing a test can do to the file distinguishes it behaviourally."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_cfg()))
+    st = path.stat()
+
+    assert PolicyStore(str(path))._stat_stamp() == (st.st_ino, st.st_mtime_ns, st.st_size, st.st_ctime_ns)
+
+
+def test_policy_store_drops_a_loaded_policy_when_the_config_disappears(tmp_path):
+    """A config that vanishes mid-session must fail closed. Keeping the last good policy would go on
+    injecting its credential into a session the server believes has no egress config at all."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_cfg(rules=[{"host": "github.com"}])))
+    store = PolicyStore(str(path))
+    assert store.current().evaluate("github.com", "GET").allow is True
+
+    path.unlink()
+    assert store.current().evaluate("github.com", "GET").allow is False
+
+    path.write_text(json.dumps(_cfg(rules=[{"host": "github.com"}])))
+    assert store.current().evaluate("github.com", "GET").allow is True
+
+
+def test_policy_store_does_not_log_a_reload_when_the_config_fails_to_parse(tmp_path, caplog):
+    """A failed parse installs deny-all, not the config. Announcing a reload there would invert the
+    signal the reload line exists to give."""
+    path = tmp_path / "config.json"
+    path.write_text("{ not json")
+    store = PolicyStore(str(path))
+    with caplog.at_level(logging.INFO, logger="daiv_sandbox.egress"):
+        store.current()
+    assert "policy reloaded" not in caplog.text
+    assert "failed to load policy" in caplog.text
+
+
+def test_policy_store_logs_a_config_digest_that_matches_the_servers(tmp_path, caplog):
+    """The digest is what pairs this line with the server's install line; without a shared id the two
+    sides cannot be matched and 'did my refresh land?' stays unanswerable."""
+    raw = json.dumps(_cfg()).encode()
+    path = tmp_path / "config.json"
+    path.write_bytes(raw)
+    store = PolicyStore(str(path))
+    with caplog.at_level(logging.INFO, logger="daiv_sandbox.egress"):
+        store.current()
+    assert hashlib.sha256(raw).hexdigest()[:8] in caplog.text
+
+
+def test_policy_store_warns_once_when_a_loaded_config_becomes_unreadable(tmp_path, caplog):
+    """A config that disappears is otherwise indistinguishable from one that legitimately denies — the
+    block log reads default=deny either way. Announce the transition, and only the transition."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_cfg(rules=[{"host": "github.com"}])))
+    store = PolicyStore(str(path))
+    store.current()
+    path.unlink()
+
+    with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
+        store.current()
+        store.current()
+
+    assert caplog.text.count("became unreadable") == 1
+
+
+def test_policy_store_missing_from_the_start_does_not_warn(tmp_path, caplog):
+    """A never-provisioned store is the normal pre-provision state, not a fault worth a warning."""
+    store = PolicyStore(str(tmp_path / "config.json"))
+    with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
+        store.current()
+    assert caplog.text == ""

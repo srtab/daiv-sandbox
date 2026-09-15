@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import threading
+import time
 from typing import TYPE_CHECKING
 
 from docker.errors import APIError, ImageNotFound, NotFound
@@ -25,6 +28,18 @@ if TYPE_CHECKING:
     from docker.models.containers import Container
 
 logger = logging.getLogger("daiv_sandbox.egress")
+
+_stamp_lock = threading.Lock()
+_last_install_stamp_ns = 0
+
+
+def _next_install_stamp_ns() -> int:
+    """A strictly increasing mtime for each installed config, so no two installs leave config.json
+    stat-identical. Module-level because a manager is constructed per request."""
+    global _last_install_stamp_ns
+    with _stamp_lock:
+        _last_install_stamp_ns = max(_last_install_stamp_ns + 1, time.time_ns())
+        return _last_install_stamp_ns
 
 
 def exec_proxy_env(proxy_ip: str, port: int) -> dict[str, str]:
@@ -180,14 +195,14 @@ class EgressProxyManager:
 
     def provision(self, token: str, config_bytes: bytes) -> None:
         """Warm-restart the proxy if needed, then write the config JSON into it ATOMICALLY; the addon
-        reloads on mtime change.
+        picks it up on its next request.
 
         put_archive extracts in place and is not atomic: a request landing mid-write could read a
-        truncated config.json, and PolicyStore caches that failed parse against the new mtime (deny-all
-        until the next write) — and since mtime only advances when the file is replaced, a re-write with
-        identical bytes would not clear that cached deny-all. So stage to a temp file, then rename it
-        over config.json (atomic on the same filesystem): a reader sees the old or new file whole and
-        the mtime flips exactly once.
+        truncated config.json, and PolicyStore caches that failed parse until the file changes again.
+        So stage to a temp file, then rename it over config.json (atomic on the same filesystem): the
+        reader sees the old or new file whole. The rename is then stamped with a writer-chosen mtime,
+        because nothing the filesystem supplies is guaranteed to differ between two installs — the
+        inode a rename frees is recycled by the next one, and a re-minted credential keeps the size.
 
         The rename uses exec_run, which requires the proxy RUNNING (unlike put_archive), so readiness
         goes through ensure_proxy_running and both callers get a ready proxy without pre-sequencing. A
@@ -204,17 +219,28 @@ class EgressProxyManager:
             ) as tar:
                 if not proxy.put_archive(CONFIG_DIR, tar):
                     raise RuntimeError(f"egress: failed to stage config for {token}")
-            # rename() is atomic within a filesystem: config.json flips content+mtime in one step, so a
-            # concurrent PolicyStore read never observes a partial file. rename() keeps the temp file's
-            # inode (incl. RUN_UID ownership) — no chown needed. Run as root to avoid any confdir
-            # permission edge case.
+            # rename() is atomic within a filesystem, so a concurrent PolicyStore read never observes a
+            # partial file; it keeps the temp file's inode (incl. RUN_UID ownership) — no chown needed.
+            # A reader landing between the mv and the touch reloads twice, never zero times.
+            stamp_ns = _next_install_stamp_ns()
+            stamp = f"{stamp_ns // 1_000_000_000}.{stamp_ns % 1_000_000_000:09d}"
+            config_path = f"{CONFIG_DIR}/config.json"
             result = proxy.exec_run(
-                ["mv", "-f", f"{CONFIG_DIR}/config.json.tmp", f"{CONFIG_DIR}/config.json"], user="root"
+                ["sh", "-c", f"mv -f {CONFIG_DIR}/config.json.tmp {config_path} && touch -d @{stamp} {config_path}"],
+                user="root",
             )
             if result.exit_code != 0:
                 raise RuntimeError(
                     f"egress: failed to install config for {token}: [{result.exit_code}] {result.output!r}"
                 )
+            # The sidecar's own reload line only fires on its next proxied request, which may be much
+            # later or never; pairing the two by digest is what makes a refresh confirmable.
+            logger.info(
+                "egress: installed config for %s (sha256=%s, %d bytes)",
+                token,
+                hashlib.sha256(config_bytes).hexdigest()[:8],
+                len(config_bytes),
+            )
         except APIError as exc:
             # The proxy stopped between the restart and the mv, or was removed (NotFound is an APIError
             # subclass): a retryable infra fault, not a config bug — map to 503, not 500.

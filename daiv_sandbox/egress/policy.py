@@ -1,4 +1,4 @@
-"""Egress policy evaluator and mtime-reloading config store.
+"""Egress policy evaluator and self-reloading config store.
 
 This module is copied verbatim into the mitmproxy sidecar image, which runs Python 3.13 (the repo
 targets 3.14). Keep it free of 3.14-only syntax — e.g. an unparenthesized `except A, B:` (PEP 758)
@@ -8,6 +8,7 @@ is a SyntaxError on 3.13 and would crash the addon at import (failing OPEN). See
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import logging
 import os
@@ -86,7 +87,7 @@ class PolicyEvaluator:
             methods = tuple(m.upper() for m in r.get("methods", ["*"]))
             # Re-enforce the wire schema's invariant (EgressRule._upper) independently: an empty methods
             # list yields a host reachable via CONNECT but blocking every request. The config file is the
-            # trust boundary the sidecar actually reads (PolicyStore reloads it on mtime change), so the
+            # trust boundary the sidecar actually reads (PolicyStore reloads it whenever it changes), so the
             # parser must fail closed on its own — raising here makes PolicyStore collapse to deny-all.
             if not methods:
                 raise ValueError(f"egress: rule for host {r.get('host')!r} has empty methods; use ['*'] for any")
@@ -110,6 +111,12 @@ class PolicyEvaluator:
             logger.warning("egress: unknown intercept mode %r; failing closed to 'all'", intercept)
             intercept = "all"
         return cls(default, intercept, rules, secrets)
+
+    def describe(self) -> str:
+        """One-line summary of the effective policy. Counts only — a secret value must never reach a log."""
+        return (
+            f"default={self._default} intercept={self._intercept} rules={len(self._rules)} secrets={len(self._secrets)}"
+        )
 
     def _match(self, host: str, method: str) -> tuple[_Rule | None, _Rule | None]:
         """Return (rule allowing host+method, first rule whose host matched at all).
@@ -158,33 +165,60 @@ _DENY_ALL = PolicyEvaluator("deny", "all", [], {})
 
 
 class PolicyStore:
-    """Loads the config JSON, caching the parsed PolicyEvaluator and reloading on mtime change.
+    """Loads the config JSON, caching the parsed PolicyEvaluator and reloading when the file changes.
 
     A missing/unreadable/invalid file yields a deny-all policy — fail closed.
     """
 
     def __init__(self, path: str):
         self._path = path
-        self._mtime: float | None = None
+        self._stamp: tuple[int, int, int, int] | None = None
         self._policy = _DENY_ALL
+
+    def _stat_stamp(self) -> tuple[int, int, int, int]:
+        """Staleness key for the config file.
+
+        Four components because no single one is guaranteed to differ between two installs: the inode a
+        rename frees is recycled by the next one, and a re-minted credential of the same length keeps
+        the size. The writer-supplied mtime (see EgressProxyManager.provision) is the one that actually
+        guarantees a change; ctime only backstops it, and carries the kernel's coarse-clock granularity,
+        so two writes in the same tick share it.
+        """
+        st = os.stat(self._path)  # noqa: PTH116
+        return (st.st_ino, st.st_mtime_ns, st.st_size, st.st_ctime_ns)
 
     def current(self) -> PolicyEvaluator:
         try:
-            mtime = os.path.getmtime(self._path)  # noqa: PTH204
-        except OSError:
-            self._mtime, self._policy = None, _DENY_ALL
+            stamp = self._stat_stamp()
+        except OSError as exc:
+            # Only on the transition: a never-provisioned store is the normal pre-provision state, but a
+            # config that vanishes under a live session otherwise looks identical to a legitimate deny.
+            if self._stamp is not None:
+                logger.warning("egress: config %s became unreadable (%s); failing closed", self._path, exc)
+            self._stamp, self._policy = None, _DENY_ALL
             return self._policy
-        if mtime != self._mtime:
+        if stamp != self._stamp:
             try:
-                with open(self._path, encoding="utf-8") as fh:  # noqa: PTH123
-                    self._policy = PolicyEvaluator.from_config(json.load(fh))
+                with open(self._path, "rb") as fh:  # noqa: PTH123
+                    raw = fh.read()
+                policy = PolicyEvaluator.from_config(json.loads(raw))
             except Exception:
                 # Catch broadly ON PURPOSE: this evaluator backs a security boundary, and the addon
                 # hooks that call it run inside mitmproxy, which FAILS OPEN on an unhandled hook
                 # exception (it logs and lets the flow through). Any parse/structure error here
                 # (OSError, JSON ValueError, KeyError, or a TypeError/AttributeError from a
                 # structurally-bad config) must therefore collapse to deny-all, never propagate.
-                logger.exception("egress: failed to load policy from %s; failing closed (deny-all)", self._path)
+                # Commit the safe state BEFORE logging, per addon._deny: a raise out of the log call
+                # would otherwise leave the previous, more permissive policy in place.
                 self._policy = _DENY_ALL
-            self._mtime = mtime
+                logger.exception("egress: failed to load policy from %s; failing closed (deny-all)", self._path)
+            else:
+                self._policy = policy
+                logger.info(
+                    "egress: policy reloaded from %s — sha256=%s %s",
+                    self._path,
+                    hashlib.sha256(raw).hexdigest()[:8],
+                    policy.describe(),
+                )
+            self._stamp = stamp
         return self._policy

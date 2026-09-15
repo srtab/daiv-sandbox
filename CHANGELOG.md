@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `PUT /session/{id}/egress/` now takes effect on the running sidecar. The proxy went on serving the policy it first parsed, so a refreshed credential was ignored: a session resumed after the original token's TTL failed every authenticated request through the proxy — for git-over-HTTPS, `fatal: could not read Username` — despite a `204` from the refresh.
+- A config that failed to parse no longer wedges the proxy closed until the container is recreated; the next valid config recovers it.
+- Egress config installs and sidecar policy reloads are now logged, each carrying a short digest of the config so a refresh can be confirmed end to end. Counts and digests only; secret values never reach a log.
 - A non-force `DELETE /session/{id}/` now drops the session's internal Docker network instead of keeping it for warm reuse, returning its subnet to Docker's address pool. Docker's default pools yield only 31 bridge subnets host-wide — two of them permanently held by `bridge` and `docker_gwbridge` — so retaining one per warm-stopped session capped concurrency at ~29 regardless of `DAIV_SANDBOX_MAX_STOPPED_SESSIONS`. Once the pool was exhausted, every new session carrying an `egress` block failed with `503` (`all predefined address pools have been fully subnetted`) until the reaper caught up. Both containers still survive the close; the network is recreated and both are reattached when the session resumes, before either container starts.
 
 ### Changed
