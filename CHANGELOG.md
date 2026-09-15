@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `DAIV_SANDBOX_SESSION_GRACE_SECONDS` now defaults to `21600` (6h, was `43200`/12h) and `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` to `30` (was `50`). With the internal network released on close, a retained stopped session no longer pins a Docker subnet, so these settings bound disk (each retained container holds a seeded repo) rather than address space.
-- Bumped `ipython` to 9.17.1 (patch; not imported by the app), `ruff` to 0.16.6, `pyproject-fmt` to 2.29.3 (formatting refinement; no reformatting of `pyproject.toml`), and `prek` to 0.5.2.
+- Bumped `ipython` to 9.17.1 (patch; not imported by the app), `sentry-sdk` to 2.69.1 (additive: adds FastAPI/Starlette `http.route` span attribute; no breaking changes to the `init()` API or kwargs used here), `ruff` to 0.16.7, `pyproject-fmt` to 2.29.4 (formatting refinement; no reformatting of `pyproject.toml`), `pytest-env` to 1.7.1, and `prek` to 0.5.3.
 
 ## [0.5.0] - 2026-09-01
 
