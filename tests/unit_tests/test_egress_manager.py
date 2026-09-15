@@ -1,4 +1,7 @@
+import hashlib
 import io
+import logging
+import re
 import tarfile
 import time
 from unittest.mock import MagicMock, Mock
@@ -535,16 +538,17 @@ def test_provision_stages_to_temp_then_renames_atomically(monkeypatch):
 
     proxy.put_archive.assert_called_once()
     assert proxy.put_archive.call_args.args[0] == "/run/egress"
-    proxy.exec_run.assert_called_once_with(
-        ["mv", "-f", "/run/egress/config.json.tmp", "/run/egress/config.json"], user="root"
-    )
+    proxy.exec_run.assert_called_once()
+    cmd = proxy.exec_run.call_args.args[0]
+    assert cmd[:2] == ["sh", "-c"]
+    assert cmd[2].startswith("mv -f /run/egress/config.json.tmp /run/egress/config.json && ")
+    assert proxy.exec_run.call_args.kwargs == {"user": "root"}
     proxy.reload.assert_called_once()
 
 
-def test_provision_stages_a_config_whose_mtime_advances_per_write(monkeypatch):
-    """The staged tar must carry a real mtime. put_archive extracts the member timestamp verbatim and
-    the rename keeps it, so a zero/constant mtime makes every config.json land identical to the last
-    one — the sidecar's staleness check then never fires and it serves a superseded token forever."""
+def test_provision_stamps_the_staged_member_with_a_current_mtime(monkeypatch):
+    """put_archive extracts the member timestamp verbatim, so TarInfo's default of 0 would land every
+    config.json dated 1970 for any reader keyed on timestamps."""
     mgr, proxy = _provision_ready_mgr(monkeypatch)
     # provision closes the stream on the way out, so snapshot the bytes while the call is in flight.
     staged: list[bytes] = []
@@ -633,3 +637,58 @@ def test_provision_raises_when_put_archive_fails(monkeypatch):
         mgr.provision("tok123", b"{}")
 
     proxy.exec_run.assert_not_called()  # never attempt the rename if staging failed
+
+
+def _install_stamps(proxy):
+    """The mtimes provision handed to touch, as integer nanoseconds, in call order.
+
+    Parsed back to int rather than float: epoch nanoseconds need 19 significant digits and float64
+    carries ~16, so a float comparison silently drops the distinction the stamp exists to make.
+    """
+    stamps = []
+    for call in proxy.exec_run.call_args_list:
+        seconds, _, frac = re.search(r"touch -d @([0-9.]+) ", call.args[0][2]).group(1).partition(".")
+        stamps.append(int(seconds) * 1_000_000_000 + int(frac))
+    return stamps
+
+
+def test_provision_stamps_each_install_with_a_distinct_mtime(monkeypatch):
+    """Two refreshes must not leave config.json stat-identical. ext4 recycles the inode freed by the
+    previous rename and a re-minted credential of the same length keeps the size, so an mtime the
+    writer does not control can repeat — and the sidecar then keeps serving the superseded policy."""
+    mgr, proxy = _provision_ready_mgr(monkeypatch)
+    config = b'{"policy": {"default": "deny"}, "secrets": {}}'
+
+    mgr.provision("tok123", config)
+    mgr.provision("tok123", config)
+
+    stamps = _install_stamps(proxy)
+    assert len(stamps) == 2
+    assert stamps[0] != stamps[1]
+
+
+def test_provision_stamp_advances_when_the_clock_steps_backwards(monkeypatch):
+    """An NTP step backwards must not hand two installs the same mtime."""
+    mgr, proxy = _provision_ready_mgr(monkeypatch)
+    ticks = iter([2_000_000_000_000_000_000, 1_000_000_000_000_000_000])
+    monkeypatch.setattr("daiv_sandbox.egress.manager.time.time_ns", lambda: next(ticks))
+
+    mgr.provision("tok123", b"{}")
+    mgr.provision("tok123", b"{}")
+
+    stamps = _install_stamps(proxy)
+    assert stamps[1] > stamps[0]
+
+
+def test_provision_logs_the_installed_config_digest(monkeypatch, caplog):
+    """The refresh is otherwise silent server-side, and the sidecar's reload line only fires on its
+    next proxied request — so this is what an operator matches against the sidecar to confirm a
+    refresh landed."""
+    mgr, proxy = _provision_ready_mgr(monkeypatch)
+    config = b'{"policy": {"default": "deny"}, "secrets": {}}'
+
+    with caplog.at_level(logging.INFO, logger="daiv_sandbox.egress"):
+        mgr.provision("tok123", config)
+
+    assert hashlib.sha256(config).hexdigest()[:8] in caplog.text
+    assert "deny" not in caplog.text  # the config body must not reach the log

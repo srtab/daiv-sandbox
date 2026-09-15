@@ -921,9 +921,8 @@ def test_build_single_file_tar_stream_returns_seekable_stream():
 
 
 def test_build_single_file_tar_stream_stamps_a_current_mtime():
-    """TarInfo.mtime defaults to 0, and put_archive extracts it verbatim — so without an explicit
-    stamp every write of the same path lands dated 1970 and any mtime-based staleness check
-    (PolicyStore's, a build tool's) can never see the file change."""
+    """TarInfo.mtime defaults to 0 and put_archive extracts it verbatim, so without an explicit stamp
+    every write of the same path lands dated 1970."""
     before = int(time.time())
     with _build_single_file_tar_stream("foo.txt", b"hello", mode=0o600) as stream, tarfile.open(fileobj=stream) as tf:
         mtime = tf.getmembers()[0].mtime

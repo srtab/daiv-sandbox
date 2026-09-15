@@ -207,10 +207,8 @@ def _build_single_file_tar_stream(filename: str, content: bytes, *, mode: int, u
     non-root user (e.g. the egress proxy running as RUN_UID) must pass that uid/gid so the
     extracted file is owned by — and readable by — that user.
 
-    The member is stamped with the current time. ``put_archive`` extracts the member's mtime
-    verbatim, so leaving ``TarInfo``'s default of 0 makes every write of a given path land with an
-    identical timestamp — which silently defeats any mtime-based staleness check on the reading
-    side (see ``PolicyStore`` in the egress sidecar).
+    The member carries a real mtime: ``put_archive`` extracts it verbatim, so ``TarInfo``'s default
+    of 0 would land every write of a given path dated 1970.
     """
     stream = tempfile.SpooledTemporaryFile(max_size=_SINGLE_FILE_TAR_SPOOL_LIMIT)  # noqa: SIM115
     try:
