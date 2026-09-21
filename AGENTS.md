@@ -64,3 +64,13 @@ make build-egress-proxy  # builds the mitmproxy sidecar image
   `RUN_UID/RUN_GID`; the stream spools through a `SpooledTemporaryFile`.
 - **Ruff:** line length 120, target Python 3.14, `preview = true`. Update `CHANGELOG.md` (Keep a
   Changelog) for any user-facing/functional change. `make lint-fix` before committing.
+- **`uv lock --upgrade --dry-run` respects `==` pins on direct deps**, so it only reports
+  transitive updates plus `>=`-bounded direct deps (e.g. `redis`, `prek`). To find newer versions
+  of `==`-pinned direct deps, query PyPI per-package (`curl -sk https://pypi.org/pypi/<pkg>/json`).
+  `uv lock --upgrade` (no `--dry-run`) applies transitive updates to the lockfile and, after editing
+  the `==` pins in `pyproject.toml`, the direct bumps too. It may also pick up a newly-released
+  transitive minor that the dry-run missed (e.g. `watchfiles` via `uvicorn`).
+- **Do not run two `edit_file` calls on the same file in parallel.** They race on read-modify-write
+  of the whole file and the last writer wins, silently dropping the other call's change (e.g. bumping
+  `sentry-sdk` and `ruff` pins in `pyproject.toml` in parallel lost the `sentry-sdk` edit). Edit one
+  file sequentially, or batch unrelated files in parallel.
