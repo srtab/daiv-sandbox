@@ -67,7 +67,7 @@ from daiv_sandbox.sessions import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ While `gVisor` significantly improves security, it may introduce some performanc
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     redis_client: Redis | None = None
 
     if settings.REDIS_URL:
@@ -622,7 +622,7 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
 
 
 @asynccontextmanager
-async def _workspace_executor(http_request: Request, session_id: str) -> AsyncIterator[SandboxDockerSession]:
+async def _workspace_executor(http_request: Request, session_id: str) -> AsyncGenerator[SandboxDockerSession]:
     """Acquire the session lock and yield a live cmd_executor, or 404.
 
     Activity is stamped on entry AND exit: COMMAND_TIMEOUT is unbounded, so an entry-only stamp would

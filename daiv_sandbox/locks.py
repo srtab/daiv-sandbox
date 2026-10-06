@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from redis.exceptions import LockError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from redis.asyncio import Redis
     from redis.asyncio.lock import Lock
@@ -25,7 +25,7 @@ class SessionBusyError(RuntimeError):
 
 class NoopSessionLockManager:
     @asynccontextmanager
-    async def acquire(self, session_id: str) -> AsyncIterator[None]:
+    async def acquire(self, session_id: str) -> AsyncGenerator[None]:
         del session_id
         yield
 
@@ -79,7 +79,7 @@ class RedisSessionLockManager:
             logger.exception("Unexpected error in lock refresh loop (key=%s)", lock.name)
 
     @asynccontextmanager
-    async def acquire(self, session_id: str) -> AsyncIterator[None]:
+    async def acquire(self, session_id: str) -> AsyncGenerator[None]:
         lock = self.redis_client.lock(
             self._key(session_id),
             timeout=self.ttl_seconds,
