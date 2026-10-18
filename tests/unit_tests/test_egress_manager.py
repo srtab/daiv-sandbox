@@ -149,6 +149,12 @@ def test_exec_proxy_env_points_clients_at_proxy_and_ca():
     assert env["NODE_EXTRA_CA_CERTS"].endswith("ca-certificates.crt")
 
 
+def test_exec_proxy_env_keeps_loopback_off_the_proxy():
+    """The sidecar cannot reach the sandbox's own loopback, so proxying it turns a local call into a 502."""
+    env = exec_proxy_env("10.7.0.2", 8080)
+    assert env["NO_PROXY"] == env["no_proxy"] == "localhost,127.0.0.1,::1"
+
+
 def test_start_proxy_raises_when_ca_put_archive_fails(monkeypatch):
     """If the CA copy into the sidecar confdir is rejected, start_proxy must fail closed (raise) and
     NOT boot the proxy — otherwise mitmdump starts with a self-generated CA the sandbox won't trust,
