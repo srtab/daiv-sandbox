@@ -405,8 +405,12 @@ TLS interception requires a shared CA. Generate it once and mount the files into
 
 ```sh
 # One-time: generate the shared egress CA (operator step). Mount the files and point the settings at them.
-openssl req -x509 -newkey rsa:4096 -nodes -keyout egress-ca.key -out egress-ca.crt -days 3650 -subj "/CN=daiv-sandbox-egress"
+openssl req -x509 -newkey rsa:4096 -nodes -keyout egress-ca.key -out egress-ca.crt -days 3650 -subj "/CN=daiv-sandbox-egress" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
 ```
+
+> [!IMPORTANT]
+> Keep the `keyUsage` extension. Python 3.13+ verifies certificates strictly by default and rejects a CA without it (`CA cert does not include key usage extension`), so every Python HTTPS call from the sandbox fails while `curl` and `git` still work. A CA generated without it must be replaced.
 
 Then set:
 

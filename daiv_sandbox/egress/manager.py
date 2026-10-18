@@ -42,6 +42,9 @@ def _next_install_stamp_ns() -> int:
         return _last_install_stamp_ns
 
 
+LOOPBACK_HOSTS = "localhost,127.0.0.1,::1"
+
+
 def exec_proxy_env(proxy_ip: str, port: int) -> dict[str, str]:
     """Env injected into sandbox execs so clients route through the proxy and trust the CA bundle."""
     url = f"http://{proxy_ip}:{port}"
@@ -51,6 +54,8 @@ def exec_proxy_env(proxy_ip: str, port: int) -> dict[str, str]:
         "http_proxy": url,
         "https_proxy": url,
         "ALL_PROXY": url,
+        "NO_PROXY": LOOPBACK_HOSTS,
+        "no_proxy": LOOPBACK_HOSTS,
         "NODE_EXTRA_CA_CERTS": SANDBOX_CA_BUNDLE,
         "GIT_SSL_CAINFO": SANDBOX_CA_BUNDLE,
         "REQUESTS_CA_BUNDLE": SANDBOX_CA_BUNDLE,
