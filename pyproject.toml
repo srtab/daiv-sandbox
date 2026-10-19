@@ -39,7 +39,7 @@ dev = [
   "pytest-env==1.8.0",
   "pytest-mock==3.16.0",
   "pytest-xdist==3.8.0",
-  "ruff==0.17.0",
+  "ruff==0.17.1",
 ]
 
 [tool.ruff]
