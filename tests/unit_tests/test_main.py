@@ -13,7 +13,7 @@ from daiv_sandbox.config import settings
 from daiv_sandbox.locks import SessionBusyError
 from daiv_sandbox.main import app
 from daiv_sandbox.schemas import RunResult
-from daiv_sandbox.sessions import SessionUnavailableError
+from daiv_sandbox.sessions import EXTRA_REPOS_ROOT, SANDBOX_ROOT, SKILLS_ROOT, SessionUnavailableError
 
 # Minimal egress payload used across egress-enabled start_session tests.
 _EGRESS_PAYLOAD = {"policy": {"default": "deny", "rules": [{"host": "github.com", "methods": ["*"]}]}}
@@ -649,11 +649,12 @@ def _minimal_archive_bytes(member_name: str = "README.md", member_content: bytes
     return buf.getvalue()
 
 
-def test_seed_session_extracts_repo_archive(mock_session, client):
-    """repo_archive only: copy_to_container is called once with /workspace/repo as dest."""
+@pytest.mark.parametrize(
+    ("kind", "dest"), [("repo", SANDBOX_ROOT), ("skills", SKILLS_ROOT), ("repos", EXTRA_REPOS_ROOT)]
+)
+def test_seed_session_extracts_single_archive(mock_session, client, kind, dest):
+    """One archive: cleared and extracted into its root; seed runs no in-container commands."""
     from docker.models.containers import ExecResult
-
-    from daiv_sandbox.sessions import SANDBOX_ROOT
 
     mock_session.container.exec_run.side_effect = [
         ExecResult(exit_code=1, output=b""),
@@ -662,12 +663,13 @@ def test_seed_session_extracts_repo_archive(mock_session, client):
 
     resp = client.post(
         f"/session/{mock_session.session_id}/seed/",
-        files={"repo_archive": ("repo.tar", _minimal_archive_bytes(), "application/x-tar")},
+        files={f"{kind}_archive": (f"{kind}.tar", _minimal_archive_bytes(), "application/x-tar")},
     )
     assert resp.status_code == 200, resp.text
+    assert resp.json() == {"seeded": [kind]}
     mock_session.copy_to_container.assert_called_once()
-    assert mock_session.copy_to_container.call_args.kwargs.get("dest") == SANDBOX_ROOT
-    assert resp.json() == {"seeded": ["repo"]}
+    assert mock_session.copy_to_container.call_args.kwargs == {"dest": dest, "clear_before_copy": True}
+    mock_session.execute_command.assert_not_called()
 
 
 def test_seed_session_rejects_unknown_session(client):
@@ -695,54 +697,6 @@ def test_seed_session_rejects_double_seed(mock_session, client):
     assert resp.json() == {"detail": "Session already seeded"}
 
 
-def test_seed_session_extracts_skills_archive_only(mock_session, client):
-    """skills_archive only: copy_to_container hits /skills; seed runs no in-container commands."""
-    from docker.models.containers import ExecResult
-
-    from daiv_sandbox.sessions import SKILLS_ROOT
-
-    mock_session.container.exec_run.side_effect = [
-        ExecResult(exit_code=1, output=b""),
-        ExecResult(exit_code=0, output=b""),
-    ]
-
-    resp = client.post(
-        f"/session/{mock_session.session_id}/seed/",
-        files={"skills_archive": ("skills.tar", _minimal_archive_bytes("intro.md", b"# hi\n"), "application/x-tar")},
-    )
-    assert resp.status_code == 200, resp.text
-    mock_session.copy_to_container.assert_called_once()
-    assert mock_session.copy_to_container.call_args.kwargs.get("dest") == SKILLS_ROOT
-    assert resp.json() == {"seeded": ["skills"]}
-    # Seeding only copies archives + writes the marker (via exec_run); never execute_command.
-    mock_session.execute_command.assert_not_called()
-
-
-def test_seed_session_extracts_both_archives(mock_session, client):
-    """Both archives: copy_to_container called twice with the right destinations, in order."""
-    from docker.models.containers import ExecResult
-
-    from daiv_sandbox.sessions import SANDBOX_ROOT, SKILLS_ROOT
-
-    mock_session.container.exec_run.side_effect = [
-        ExecResult(exit_code=1, output=b""),
-        ExecResult(exit_code=0, output=b""),
-    ]
-
-    resp = client.post(
-        f"/session/{mock_session.session_id}/seed/",
-        files=[
-            ("repo_archive", ("repo.tar", _minimal_archive_bytes(), "application/x-tar")),
-            ("skills_archive", ("skills.tar", _minimal_archive_bytes("intro.md", b"# hi\n"), "application/x-tar")),
-        ],
-    )
-    assert resp.status_code == 200, resp.text
-    assert mock_session.copy_to_container.call_count == 2
-    dests = [call.kwargs.get("dest") for call in mock_session.copy_to_container.call_args_list]
-    assert dests == [SANDBOX_ROOT, SKILLS_ROOT]
-    assert resp.json() == {"seeded": ["repo", "skills"]}
-
-
 def test_seed_session_requires_at_least_one_archive(mock_session, client):
     """Posting neither archive returns 422."""
     resp = client.post(f"/session/{mock_session.session_id}/seed/")
@@ -751,8 +705,9 @@ def test_seed_session_requires_at_least_one_archive(mock_session, client):
     assert "repos_archive" in resp.json()["detail"]
 
 
-def test_seed_session_invalid_repo_archive_returns_422(mock_session, client):
-    """copy_to_container raising ValueError for repo_archive returns 422."""
+@pytest.mark.parametrize("kind", ["repo", "skills", "repos"])
+def test_seed_session_invalid_archive_returns_422(mock_session, client, kind):
+    """copy_to_container raising ValueError returns 422 naming the archive."""
     from docker.models.containers import ExecResult
 
     mock_session.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
@@ -760,25 +715,10 @@ def test_seed_session_invalid_repo_archive_returns_422(mock_session, client):
 
     resp = client.post(
         f"/session/{mock_session.session_id}/seed/",
-        files={"repo_archive": ("repo.tar", b"not a tar", "application/x-tar")},
+        files={f"{kind}_archive": (f"{kind}.tar", b"not a tar", "application/x-tar")},
     )
     assert resp.status_code == 422
-    assert "repo_archive" in resp.json()["detail"].lower()
-
-
-def test_seed_session_invalid_skills_archive_returns_422(mock_session, client):
-    """copy_to_container raising ValueError for skills_archive returns 422."""
-    from docker.models.containers import ExecResult
-
-    mock_session.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
-    mock_session.copy_to_container.side_effect = ValueError("Invalid or truncated archive: ...")
-
-    resp = client.post(
-        f"/session/{mock_session.session_id}/seed/",
-        files={"skills_archive": ("skills.tar", b"garbage", "application/x-tar")},
-    )
-    assert resp.status_code == 422
-    assert "skills_archive" in resp.json()["detail"].lower()
+    assert resp.json()["detail"].startswith(f"{kind}_archive is invalid:")
 
 
 def test_seed_session_marker_write_failure_returns_500(mock_session, client):
@@ -796,26 +736,6 @@ def test_seed_session_marker_write_failure_returns_500(mock_session, client):
     )
     assert resp.status_code == 500
     assert "seeded" in resp.json()["detail"].lower()
-
-
-def test_seed_extracts_repos_archive_into_extra_repos_root(mock_session, client):
-    from docker.models.containers import ExecResult
-
-    from daiv_sandbox.sessions import EXTRA_REPOS_ROOT
-
-    mock_session.container.exec_run.side_effect = [
-        ExecResult(exit_code=1, output=b""),
-        ExecResult(exit_code=0, output=b""),
-    ]
-
-    resp = client.post(
-        f"/session/{mock_session.session_id}/seed/",
-        files={"repos_archive": ("repos.tar", _minimal_archive_bytes("lib/README.md"), "application/x-tar")},
-    )
-    assert resp.status_code == 200, resp.text
-    assert resp.json() == {"seeded": ["repos"]}
-    mock_session.copy_to_container.assert_called_once()
-    assert mock_session.copy_to_container.call_args.kwargs == {"dest": EXTRA_REPOS_ROOT, "clear_before_copy": True}
 
 
 def test_seed_reports_every_archive_it_extracted(mock_session, client):
@@ -837,26 +757,7 @@ def test_seed_reports_every_archive_it_extracted(mock_session, client):
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"seeded": ["repo", "skills", "repos"]}
     dests = [call.kwargs.get("dest") for call in mock_session.copy_to_container.call_args_list]
-    assert dests == ["/workspace/repo", "/workspace/skills", "/workspace/repos"]
-
-
-def test_seed_rejects_repos_archive_escaping_its_root(mock_session, client):
-    from docker.models.containers import ExecResult
-
-    from daiv_sandbox.sessions import _sanitize_archive_stream
-
-    def sanitize(stream, **kwargs):
-        _sanitize_archive_stream(stream, io.BytesIO(), uid=1000, gid=1000)
-
-    mock_session.container.exec_run.return_value = ExecResult(exit_code=1, output=b"")
-    mock_session.copy_to_container.side_effect = sanitize
-
-    resp = client.post(
-        f"/session/{mock_session.session_id}/seed/",
-        files={"repos_archive": ("repos.tar", _minimal_archive_bytes("../evil"), "application/x-tar")},
-    )
-    assert resp.status_code == 422
-    assert resp.json()["detail"].startswith("repos_archive is invalid:")
+    assert dests == [SANDBOX_ROOT, SKILLS_ROOT, EXTRA_REPOS_ROOT]
 
 
 def test_fs_write_then_read_roundtrip(mock_session, client):

@@ -652,8 +652,8 @@ class SandboxDockerSession:
         if to_dir_norm in {"", "/"}:
             raise ValueError("Refusing to extract an archive into the container root directory")
 
-        # Confine the destination to WORKSPACE_ROOT (SANDBOX_ROOT/EXTRA_REPOS_ROOT/SKILLS_ROOT/SCRATCH_ROOT all live
-        # under it, so the single /workspace prefix subsumes them). Validate lexically through the
+        # Confine the destination to WORKSPACE_ROOT (every *_ROOT lives under it, so the single
+        # /workspace prefix subsumes them). Validate lexically through the
         # shared validator so a `..`/NUL/newline in `dest` is rejected at this boundary rather than
         # relying on every caller pre-validating. allow_root=True permits a bare-root dest.
         # (The seed marker lives in the sandbox home, outside /workspace — written there via exec, not

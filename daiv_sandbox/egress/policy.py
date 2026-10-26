@@ -64,12 +64,16 @@ class _Rule:
     inject: str | None
     path_prefix: str | None = None
 
-    def matches_path(self, path: str | None, method: str, dotted: bool) -> bool:
+    @property
+    def needs_interception(self) -> bool:
+        return self.inject is not None or "*" not in self.methods or self.path_prefix is not None
+
+    def matches_path(self, path: str | None, method: str) -> bool:
         if self.path_prefix is None:
             return True
         if path is None:
             return method == "CONNECT"
-        return not dotted and (path == self.path_prefix or path.startswith(self.path_prefix + "/"))
+        return (path == self.path_prefix or path.startswith(self.path_prefix + "/")) and not _has_dot_segment(path)
 
 
 def _has_dot_segment(path: str) -> bool:
@@ -159,59 +163,37 @@ class PolicyEvaluator:
             f"default={self._default} intercept={self._intercept} rules={len(self._rules)} secrets={len(self._secrets)}"
         )
 
-    def _match(self, host: str, method: str, path: str | None, dotted: bool) -> tuple[_Rule | None, _Rule | None]:
-        """Return (rule allowing host+method+path, first rule whose host and path matched at all).
-
-        `path` is None at the CONNECT phase, where every path-scoped rule still matches.
-
-        `host` is already lower-cased and `method` already upper-cased by evaluate(); rule hosts are
-        lower-cased in from_config, so fnmatchcase (which skips the redundant os.path.normcase that
-        fnmatch.fnmatch does on both args) is the case-insensitive match. The second element lets
-        evaluate() distinguish 'host not listed' from 'host listed but this method isn't permitted' in a
-        single pass over the rules — and, in the latter case, report which rule's host+methods matched.
-        """
-        host_match: _Rule | None = None
-        for rule in self._rules:
-            if fnmatch.fnmatchcase(host, rule.host) and rule.matches_path(path, method, dotted):
-                if host_match is None:
-                    host_match = rule
-                # CONNECT is a host-reachability check: the TLS tunnel hasn't been established yet, so
-                # the real HTTP method is unknown. Match any host-listed rule; the specific method
-                # restriction is enforced later at the request (post-interception) phase.
-                if method == "CONNECT" or "*" in rule.methods or method in rule.methods:
-                    return rule, host_match
-        return None, host_match
-
-    def _host_rules(self, host: str) -> list[_Rule]:
-        return [r for r in self._rules if fnmatch.fnmatchcase(host, r.host)]
-
     def evaluate(self, host: str, method: str, path: str | None = None) -> Decision:
-        host = host.lower()  # case-insensitive host matching; rule hosts are lower-cased in from_config
+        """`path` is None at the CONNECT phase, where every path-scoped rule still matches.
+
+        Rule hosts are lower-cased in from_config, so fnmatchcase on the lower-cased `host` is the
+        case-insensitive match (it skips the redundant os.path.normcase that fnmatch.fnmatch does).
+        """
+        host = host.lower()
         method = method.upper()
         if path is not None:
             path = path.split("?", 1)[0]
-        dotted = path is not None and _has_dot_segment(path)
-        rule, host_match = self._match(host, method, path, dotted)
+        host_rules = [r for r in self._rules if fnmatch.fnmatchcase(host, r.host)]
+        path_rules = [r for r in host_rules if r.matches_path(path, method)]
+        # CONNECT only checks reachability: the real method is unknown until the tunnel is intercepted,
+        # so any listed rule allows it and the method restriction is enforced at the request phase.
+        rule = next((r for r in path_rules if method == "CONNECT" or "*" in r.methods or method in r.methods), None)
         if rule is not None:
             inject = self._secrets.get(rule.inject) if rule.inject else None
-            # Judge interception over every rule for the host, not just the first match: the request phase
-            # may pick a later rule that injects, restricts methods, or is path-scoped.
-            intercept = self._intercept == "all" or any(
-                r.inject is not None or "*" not in r.methods or r.path_prefix is not None
-                for r in self._host_rules(host)
-            )
+            # Judge interception over every rule for the host: the request phase may pick a later rule.
+            intercept = self._intercept == "all" or any(r.needs_interception for r in host_rules)
             return Decision(allow=True, intercept=intercept, inject=inject)
         # No rule allows host+method. If the host IS listed in a rule but this (non-CONNECT) method
         # isn't permitted, the operator constrained that host -> deny regardless of `default`
         # (otherwise a per-host method limit would silently no-op under default="allow"). CONNECT
         # stays a reachability-only check, so the TLS tunnel still opens and the method is enforced
         # at the request phase.
-        if method != "CONNECT" and host_match is not None:
-            block = BlockReason(REASON_METHOD_NOT_ALLOWED, host=host_match.host, methods=host_match.methods)
+        if method != "CONNECT" and path_rules:
+            block = BlockReason(REASON_METHOD_NOT_ALLOWED, host=path_rules[0].host, methods=path_rules[0].methods)
             return Decision(allow=False, intercept=False, inject=None, block=block)
         if self._default == "allow":
             return Decision(allow=True, intercept=self._intercept == "all", inject=None)
-        if self._host_rules(host):
+        if host_rules:
             block = BlockReason(REASON_PATH_NOT_LISTED, path=path)
             return Decision(allow=False, intercept=False, inject=None, block=block)
         return Decision(allow=False, intercept=False, inject=None, block=BlockReason(REASON_HOST_NOT_LISTED))

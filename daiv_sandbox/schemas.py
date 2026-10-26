@@ -30,8 +30,11 @@ class StartSessionResponse(BaseModel):
     session_id: str = Field(description="Unique identifier for the session.")
 
 
+SeedKind = Literal["repo", "skills", "repos"]
+
+
 class SeedSessionResponse(BaseModel):
-    seeded: list[Literal["repo", "skills", "repos"]] = Field(description="The archives that were extracted, in order.")
+    seeded: list[SeedKind] = Field(description="The archives that were extracted, in order.")
 
 
 class RunRequest(BaseModel):

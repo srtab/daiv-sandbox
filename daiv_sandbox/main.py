@@ -48,6 +48,7 @@ from daiv_sandbox.schemas import (
     RunRequest,
     RunResponse,
     RunResult,
+    SeedKind,
     SeedSessionResponse,
     StartSessionRequest,
     StartSessionResponse,
@@ -363,9 +364,7 @@ async def seed_session(
       * ``repos_archive``   — tar (same compression options) extracted into ``/workspace/repos``;
                               members are ``<repository slug>/<path>``.
 
-    Responds 200 with the archives extracted, in order: ``repo``, ``skills``, ``repos``. A sandbox that
-    predates ``repos_archive`` ignores the field: it answers 204 when another archive is present, or 422
-    when ``repos_archive`` is the only archive.
+    Responds 200 with the archives extracted, in order: ``repo``, ``skills``, ``repos``.
 
     One-shot per session: subsequent calls return 409.
     """
@@ -382,7 +381,7 @@ async def seed_session(
         if check.exit_code == 0:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session already seeded")
 
-        seeded: list[Literal["repo", "skills", "repos"]] = []
+        seeded: list[SeedKind] = []
         for kind, archive, dest in (
             ("repo", repo_archive, SANDBOX_ROOT),
             ("skills", skills_archive, SKILLS_ROOT),
