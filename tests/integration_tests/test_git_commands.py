@@ -16,7 +16,8 @@ def test_git_commands_dont_raise_safe_directory_exception(client: TestClient, sa
         f"/session/{session_id}/seed/",
         files={"repo_archive": ("repo.tar.gz", make_tar_gz_with_git(), "application/gzip")},
     )
-    assert seed.status_code == 204, seed.text
+    assert seed.status_code == 200, seed.text
+    assert seed.json() == {"seeded": ["repo"]}
 
     run = client.post(f"/session/{session_id}/", json={"commands": ["git status"]})
     assert run.status_code == 200, run.text
