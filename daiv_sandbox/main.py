@@ -364,7 +364,8 @@ async def seed_session(
                               members are ``<repository slug>/<path>``.
 
     Responds 200 with the archives extracted, in order: ``repo``, ``skills``, ``repos``. A sandbox that
-    predates ``repos_archive`` ignores the field and answers 204 instead.
+    predates ``repos_archive`` ignores the field: it answers 204 when another archive is present, or 422
+    when ``repos_archive`` is the only archive.
 
     One-shot per session: subsequent calls return 409.
     """
