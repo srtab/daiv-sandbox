@@ -19,13 +19,18 @@ def make_tar_gz(files: dict[str, bytes]) -> bytes:
 
 
 def make_tar_gz_with_git(
-    files: dict[str, bytes] | None = None, *, commit_message: str = "Initial commit", default_branch: str = "main"
+    files: dict[str, bytes] | None = None,
+    *,
+    commit_message: str = "Initial commit",
+    default_branch: str = "main",
+    prefix: str = "",
 ) -> bytes:
     """
     Create a .tar.gz archive containing a valid git repository at its root.
 
     The returned value is raw bytes suitable for passing as a multipart upload
     field in integration tests (the sandbox will extract it into its working directory).
+    A non-empty ``prefix`` nests every member under that directory (``<prefix>/<path>``).
     """
     files = files or {"README.md": b"# test repo\n"}
 
@@ -63,6 +68,8 @@ def make_tar_gz_with_git(
 
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            if prefix:
+                tf.add(root, arcname=prefix, recursive=False)
             # Use os.walk to include dot-directories like .git/
             for dirpath, dirnames, filenames in os.walk(root):
                 dirnames.sort()
@@ -70,11 +77,11 @@ def make_tar_gz_with_git(
 
                 dir_rel = Path(dirpath).relative_to(root)
                 if str(dir_rel) != ".":
-                    tf.add(dirpath, arcname=str(dir_rel), recursive=False)
+                    tf.add(dirpath, arcname=str(Path(prefix) / dir_rel), recursive=False)
 
                 for filename in filenames:
                     full_path = Path(dirpath) / filename
-                    arcname = str(full_path.relative_to(root))
+                    arcname = str(Path(prefix) / full_path.relative_to(root))
                     tf.add(full_path, arcname=arcname, recursive=False)
 
         return buf.getvalue()

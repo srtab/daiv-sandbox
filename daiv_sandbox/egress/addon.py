@@ -17,6 +17,7 @@ try:  # works both as `daiv_sandbox.egress.policy` (tests) and flat `policy` (si
         REASON_HOST_HEADER_MISMATCH,
         REASON_HOST_NOT_LISTED,
         REASON_METHOD_NOT_ALLOWED,
+        REASON_PATH_NOT_LISTED,
         BlockReason,
         PolicyStore,
     )
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - exercised only inside the sidecar imag
         REASON_HOST_HEADER_MISMATCH,
         REASON_HOST_NOT_LISTED,
         REASON_METHOD_NOT_ALLOWED,
+        REASON_PATH_NOT_LISTED,
         BlockReason,
         PolicyStore,
     )
@@ -58,6 +60,8 @@ def _describe_block(block) -> str:
         return f"reason=method-not-allowed (matched rule host={block.host!r}, allows methods=[{methods}])"
     if block.code == REASON_HOST_NOT_LISTED:
         return "reason=host-not-listed (no rule matched; default=deny)"
+    if block.code == REASON_PATH_NOT_LISTED:
+        return f"reason=path-not-listed (no path_prefix rule covers path={block.path!r}; default=deny)"
     return f"reason={block.code}"
 
 
@@ -128,7 +132,7 @@ class EgressAddon:
         # client-controlled Host header, so judging by it would hand one host's secret to another.
         host = flow.request.host
         try:
-            decision = self._store.current().evaluate(host, flow.request.method)
+            decision = self._store.current().evaluate(host, flow.request.method, flow.request.path)
             header_matches = decision.inject is None or _host_header_matches(flow.request)
         except Exception:
             # Fail closed: deny and never fall through to the credential-injection branch.

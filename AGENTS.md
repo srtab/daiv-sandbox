@@ -32,8 +32,9 @@ make build-egress-proxy  # builds the mitmproxy sidecar image
   container id**. `_get_container()` restarts a stopped container on access (warm reuse); `DELETE`
   stops it (preserves the writable layer) unless `?force=true`; the **reaper** (`reaper.py`) later
   removes stopped containers. See `daiv_sandbox/sessions.py` and `daiv_sandbox/reaper.py`.
-- **`/workspace/{repo,skills,tmp}` is the single source of truth in the sandbox** (constants
-  `SANDBOX_ROOT`, `SKILLS_ROOT`, `SCRATCH_ROOT` in `sessions.py`; `SANDBOX_HOME` lives outside
+- **`/workspace/{repo,repos,skills,tmp}` is the single source of truth in the sandbox** (constants
+  `SANDBOX_ROOT`, `EXTRA_REPOS_ROOT`, `SKILLS_ROOT`, `SCRATCH_ROOT` in `sessions.py`; `repos/<slug>/`
+  holds the extra repositories of a multi-repo session; `SANDBOX_HOME` lives outside
   `/workspace` and holds the one-shot seed-guard marker). There is no server-side patch/diff — recover
   changes by running git inside `/workspace/repo`.
 - **Egress is mandatory for network access, never direct.** Sessions without an `egress` block run

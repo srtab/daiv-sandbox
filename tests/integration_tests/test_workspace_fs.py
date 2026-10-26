@@ -17,7 +17,8 @@ def workspace_session(client, sandbox_session):
         f"/session/{sid}/seed/",
         files={"repo_archive": ("repo.tar.gz", make_tar_gz({"README.md": b"# workspace test\n"}), "application/gzip")},
     )
-    assert seed.status_code == 204, seed.text
+    assert seed.status_code == 200, seed.text
+    assert seed.json() == {"seeded": ["repo"]}
     return sid
 
 
@@ -75,7 +76,8 @@ def test_seed_nested_tree_is_sandbox_owned_and_writable(client, sandbox_session)
         f"/session/{sid}/seed/",
         files={"repo_archive": ("repo.tar.gz", make_tar_gz({"pkg/sub/mod.py": b"x = 1\n"}), "application/gzip")},
     )
-    assert seed.status_code == 204, seed.text
+    assert seed.status_code == 200, seed.text
+    assert seed.json() == {"seeded": ["repo"]}
 
     run = client.post(
         f"/session/{sid}/",

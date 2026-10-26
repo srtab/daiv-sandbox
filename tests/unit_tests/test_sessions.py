@@ -14,6 +14,7 @@ from daiv_sandbox.sessions import (
     _PATH_ABSENT_EXIT,
     _PATH_DENIED_EXIT,
     _PATH_WRONG_TYPE_EXIT,
+    EXTRA_REPOS_ROOT,
     PIPEFAIL_WRAPPER,
     SANDBOX_HOME,
     SANDBOX_ROOT,
@@ -109,7 +110,8 @@ def test__start_container(mock_docker_client):
     assert session.session_id == mock_docker_client.containers.run.return_value.id
     # Should create sandbox directories and chown them
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
+        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, EXTRA_REPOS_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
+        user="root",
     )
     mock_container.exec_run.assert_any_call(
         [
@@ -118,6 +120,7 @@ def test__start_container(mock_docker_client):
             "--",
             WORKSPACE_ROOT,
             SANDBOX_ROOT,
+            EXTRA_REPOS_ROOT,
             SANDBOX_HOME,
             SKILLS_ROOT,
             SCRATCH_ROOT,
@@ -1138,7 +1141,8 @@ def test_start_container_creates_skills_root(mock_docker_client):
 
     # mkdir -p was called including SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT], user="root"
+        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, EXTRA_REPOS_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
+        user="root",
     )
     # chown was called for SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
@@ -1148,6 +1152,7 @@ def test_start_container_creates_skills_root(mock_docker_client):
             "--",
             WORKSPACE_ROOT,
             SANDBOX_ROOT,
+            EXTRA_REPOS_ROOT,
             SANDBOX_HOME,
             SKILLS_ROOT,
             SCRATCH_ROOT,
