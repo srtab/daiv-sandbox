@@ -25,9 +25,9 @@ def _write_cfg(tmp_path, **kw):
     return str(path)
 
 
-def _flow(host="github.com", method="GET"):
-    headers = {}
-    request = types.SimpleNamespace(pretty_host=host, host=host, method=method, headers=headers)
+def _flow(host="github.com", method="GET", **request_fields):
+    request = types.SimpleNamespace(host=host, host_header=host, method=method, headers={})
+    vars(request).update(request_fields)
     return types.SimpleNamespace(request=request, response=None)
 
 
@@ -63,6 +63,56 @@ def test_request_injects_configured_header(tmp_path):
     flow.request.headers["Authorization"] = "attacker-supplied"
     a.request(flow)
     assert flow.request.headers["Authorization"] == "Bearer t"  # stripped + replaced
+
+
+def _gitlab_cfg(tmp_path, extra_rules=()):
+    return _write_cfg(
+        tmp_path,
+        rules=[{"host": "gitlab.com", "inject": "gl"}, *extra_rules],
+        secrets={"gl": {"header": "Authorization", "value": "Bearer secret"}},
+    )
+
+
+def test_request_to_unlisted_host_with_spoofed_host_header_is_denied(tmp_path, caplog):
+    a = EgressAddon(_gitlab_cfg(tmp_path))
+    flow = _flow(host="echoprobe", host_header="gitlab.com")
+    with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
+        a.request(flow)
+    assert flow.response == "FORBIDDEN"
+    assert "Authorization" not in flow.request.headers
+    assert "reason=host-header-mismatch" in caplog.text
+
+
+def test_request_whose_host_header_names_another_listed_host_is_denied(tmp_path):
+    a = EgressAddon(_gitlab_cfg(tmp_path, extra_rules=[{"host": "pypi.org"}]))
+    flow = _flow(host="pypi.org", host_header="gitlab.com")
+    a.request(flow)
+    assert flow.response == "FORBIDDEN"
+    assert "Authorization" not in flow.request.headers
+
+
+@pytest.mark.parametrize("host_header", ["gitlab.com", "GitLab.COM", "gitlab.com:443", None])
+def test_request_with_matching_or_absent_host_header_injects(tmp_path, host_header):
+    a = EgressAddon(_gitlab_cfg(tmp_path))
+    flow = _flow(host="gitlab.com", host_header=host_header)
+    a.request(flow)
+    assert flow.response is None
+    assert flow.request.headers["Authorization"] == "Bearer secret"
+
+
+def test_request_with_bracketed_ipv6_host_header_matches_its_host(tmp_path):
+    a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "2001:db8::1"}]))
+    flow = _flow(host="2001:db8::1", host_header="[2001:db8::1]:8080")
+    a.request(flow)
+    assert flow.response is None
+
+
+def test_request_with_malformed_host_header_fails_closed(tmp_path):
+    a = EgressAddon(_gitlab_cfg(tmp_path))
+    flow = _flow(host="gitlab.com", host_header="[gitlab.com")
+    a.request(flow)
+    assert flow.response == "FORBIDDEN"
+    assert "Authorization" not in flow.request.headers
 
 
 def test_tls_clienthello_passthrough_for_allowed_noncred(tmp_path):

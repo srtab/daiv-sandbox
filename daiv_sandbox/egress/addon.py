@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+from urllib.parse import urlsplit
 
 try:  # works both as `daiv_sandbox.egress.policy` (tests) and flat `policy` (sidecar image, see Dockerfile)
     from daiv_sandbox.egress.constants import CONFIG_PATH, CONFIG_PATH_ENV
@@ -45,10 +46,16 @@ def _describe_block(block) -> str:
 def _deny(flow, log_prefix: str, block) -> None:
     """Deny a flow fail-closed: commit the 403 BEFORE formatting the reason. mitmproxy fails OPEN on an
     un-denied hook, so _forbidden must run before any code (reason formatting) that could conceivably
-    raise. Both the CONNECT and request deny paths route through here, so that ordering lives in one place.
+    raise. The policy deny paths (CONNECT and request) route through here, so that ordering lives in one place.
     """
     _forbidden(flow)
     logger.warning("egress: blocked %s — %s", log_prefix, _describe_block(block))
+
+
+def _host_header_matches(request) -> bool:
+    """True when the request has no Host/:authority header, or it names the host the request is sent to."""
+    authority = request.host_header
+    return authority is None or urlsplit(f"//{authority}").hostname == request.host.lower()
 
 
 class EgressAddon:
@@ -93,13 +100,25 @@ class EgressAddon:
             data.ignore_connection = True
 
     def request(self, flow) -> None:
-        host = flow.request.pretty_host
+        # `host` is where the connection goes (the CONNECT target inside a tunnel); `pretty_host` is the
+        # client-controlled Host header, so judging by it would hand one host's secret to another.
+        host = flow.request.host
         try:
+            header_matches = _host_header_matches(flow.request)
             decision = self._store.current().evaluate(host, flow.request.method)
         except Exception:
             # Fail closed: deny and never fall through to the credential-injection branch.
             logger.exception("egress: error evaluating %s %s; failing closed (deny)", flow.request.method, host)
             _forbidden(flow)
+            return
+        if not header_matches:
+            _forbidden(flow)
+            logger.warning(
+                "egress: blocked %s %s — reason=host-header-mismatch (Host header %r)",
+                flow.request.method,
+                host,
+                flow.request.host_header,
+            )
             return
         if not decision.allow:
             _deny(flow, f"{flow.request.method} {host}", decision.block)
