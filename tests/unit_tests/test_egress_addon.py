@@ -172,14 +172,28 @@ def test_blocked_request_logs_method_not_allowed_with_matched_rule(tmp_path, cap
     its currently-allowed methods — the data needed to extend that rule."""
     a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "*.github.com", "methods": ["GET", "POST"]}]))
     with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
-        a.requestheaders(_flow(host="api.github.com", method="DELETE", path="/repo.git/info/refs?token=hunter2"))
+        a.requestheaders(_flow(host="api.github.com", method="DELETE", path="/services/hunter2"))
     msg = caplog.text
     assert "DELETE" in msg and "api.github.com" in msg
     assert "method-not-allowed" in msg
     assert "*.github.com" in msg  # matched rule host glob
     assert "GET" in msg and "POST" in msg  # currently-allowed methods
-    assert "/repo.git/info/refs" in msg
-    assert "token=hunter2" not in msg and "hunter2" not in msg
+    assert "hunter2" not in msg
+
+
+def test_blocked_request_on_path_only_host_logs_path_not_listed(tmp_path, caplog):
+    a = EgressAddon(
+        _write_cfg(
+            tmp_path,
+            rules=[{"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"}],
+            secrets={"mod": {"header": "Authorization", "value": "S"}},
+        )
+    )
+    with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
+        a.requestheaders(_flow(host="gitlab.com", path="/g/other.git/info/refs?token=hunter2"))
+    assert "reason=path-not-listed" in caplog.text
+    assert "'/g/other.git/info/refs'" in caplog.text
+    assert "hunter2" not in caplog.text
 
 
 def test_blocked_request_on_unlisted_host_logs_host_not_listed(tmp_path, caplog):

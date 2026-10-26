@@ -391,9 +391,8 @@ async def seed_session(
             if archive is None:
                 continue
             try:
-                await asyncio.to_thread(
-                    cmd_executor.copy_to_container, archive.file, dest=dest, clear_before_copy=False
-                )
+                # A failed archive leaves the session unmarked, so a retry must not extract over the earlier attempt.
+                await asyncio.to_thread(cmd_executor.copy_to_container, archive.file, dest=dest, clear_before_copy=True)
             except ValueError as exc:
                 logger.warning("seed_session: invalid %s_archive for session %s: %s", kind, session_id, exc)
                 raise HTTPException(

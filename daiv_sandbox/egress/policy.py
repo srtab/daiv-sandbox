@@ -24,6 +24,7 @@ logger = logging.getLogger("daiv_sandbox.egress")
 REASON_HOST_NOT_LISTED: Final = "host-not-listed"
 REASON_METHOD_NOT_ALLOWED: Final = "method-not-allowed"
 REASON_HOST_HEADER_MISMATCH: Final = "host-header-mismatch"
+REASON_PATH_NOT_LISTED: Final = "path-not-listed"
 
 
 @dataclass(frozen=True)
@@ -36,13 +37,16 @@ class BlockReason:
     rule to point at and both are None.
     ``host-header-mismatch``: set by the addon, not the evaluator — a request that would carry a secret
     named another host in its Host header; both are None.
+    ``path-not-listed``: the host has only path-scoped rules and none covers the request path (or the path
+    has a dot segment); ``path`` is that path without its query string, the prefix an operator would add.
     """
 
     # The literals are the REASON_* constants above; kept as literals here because Literal[] cannot
     # reference the names. mypy then checks the construction sites and narrows the code at the consumer.
-    code: Literal["host-not-listed", "method-not-allowed", "host-header-mismatch"]
+    code: Literal["host-not-listed", "method-not-allowed", "host-header-mismatch", "path-not-listed"]
     host: str | None = None
     methods: tuple[str, ...] | None = None
+    path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -60,12 +64,12 @@ class _Rule:
     inject: str | None
     path_prefix: str | None = None
 
-    def matches_path(self, path: str | None, method: str) -> bool:
-        if self.path_prefix is None or method == "CONNECT":
+    def matches_path(self, path: str | None, method: str, dotted: bool) -> bool:
+        if self.path_prefix is None:
             return True
-        if path is None or _has_dot_segment(path):
-            return False
-        return path == self.path_prefix or path.startswith(self.path_prefix + "/")
+        if path is None:
+            return method == "CONNECT"
+        return not dotted and (path == self.path_prefix or path.startswith(self.path_prefix + "/"))
 
 
 def _has_dot_segment(path: str) -> bool:
@@ -77,7 +81,7 @@ def valid_path_prefix(prefix: str) -> bool:
     return (
         prefix.startswith("/")
         and not prefix.endswith("/")
-        and not any(c.isspace() or ord(c) < 0x20 or c in "?#" for c in prefix)
+        and not any(c.isspace() or not c.isprintable() or c in "?#" for c in prefix)
         and not _has_dot_segment(prefix)
     )
 
@@ -155,7 +159,7 @@ class PolicyEvaluator:
             f"default={self._default} intercept={self._intercept} rules={len(self._rules)} secrets={len(self._secrets)}"
         )
 
-    def _match(self, host: str, method: str, path: str | None) -> tuple[_Rule | None, _Rule | None]:
+    def _match(self, host: str, method: str, path: str | None, dotted: bool) -> tuple[_Rule | None, _Rule | None]:
         """Return (rule allowing host+method+path, first rule whose host and path matched at all).
 
         `path` is None at the CONNECT phase, where every path-scoped rule still matches.
@@ -168,7 +172,7 @@ class PolicyEvaluator:
         """
         host_match: _Rule | None = None
         for rule in self._rules:
-            if fnmatch.fnmatchcase(host, rule.host) and rule.matches_path(path, method):
+            if fnmatch.fnmatchcase(host, rule.host) and rule.matches_path(path, method, dotted):
                 if host_match is None:
                     host_match = rule
                 # CONNECT is a host-reachability check: the TLS tunnel hasn't been established yet, so
@@ -178,21 +182,24 @@ class PolicyEvaluator:
                     return rule, host_match
         return None, host_match
 
-    def _host_has_path_scoped_rule(self, host: str) -> bool:
-        return any(r.path_prefix is not None and fnmatch.fnmatchcase(host, r.host) for r in self._rules)
+    def _host_rules(self, host: str) -> list[_Rule]:
+        return [r for r in self._rules if fnmatch.fnmatchcase(host, r.host)]
 
     def evaluate(self, host: str, method: str, path: str | None = None) -> Decision:
         host = host.lower()  # case-insensitive host matching; rule hosts are lower-cased in from_config
         method = method.upper()
         if path is not None:
             path = path.split("?", 1)[0]
-        rule, host_match = self._match(host, method, path)
+        dotted = path is not None and _has_dot_segment(path)
+        rule, host_match = self._match(host, method, path, dotted)
         if rule is not None:
             inject = self._secrets.get(rule.inject) if rule.inject else None
-            method_restricted = "*" not in rule.methods
-            intercept = self._intercept == "all" or inject is not None or method_restricted
-            if method == "CONNECT" and self._host_has_path_scoped_rule(host):
-                intercept = True
+            # Judge interception over every rule for the host, not just the first match: the request phase
+            # may pick a later rule that injects, restricts methods, or is path-scoped.
+            intercept = self._intercept == "all" or any(
+                r.inject is not None or "*" not in r.methods or r.path_prefix is not None
+                for r in self._host_rules(host)
+            )
             return Decision(allow=True, intercept=intercept, inject=inject)
         # No rule allows host+method. If the host IS listed in a rule but this (non-CONNECT) method
         # isn't permitted, the operator constrained that host -> deny regardless of `default`
@@ -204,6 +211,9 @@ class PolicyEvaluator:
             return Decision(allow=False, intercept=False, inject=None, block=block)
         if self._default == "allow":
             return Decision(allow=True, intercept=self._intercept == "all", inject=None)
+        if self._host_rules(host):
+            block = BlockReason(REASON_PATH_NOT_LISTED, path=path)
+            return Decision(allow=False, intercept=False, inject=None, block=block)
         return Decision(allow=False, intercept=False, inject=None, block=BlockReason(REASON_HOST_NOT_LISTED))
 
 

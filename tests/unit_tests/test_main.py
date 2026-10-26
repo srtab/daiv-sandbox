@@ -748,6 +748,7 @@ def test_seed_session_requires_at_least_one_archive(mock_session, client):
     resp = client.post(f"/session/{mock_session.session_id}/seed/")
     assert resp.status_code == 422
     assert "at least one" in resp.json()["detail"].lower()
+    assert "repos_archive" in resp.json()["detail"]
 
 
 def test_seed_session_invalid_repo_archive_returns_422(mock_session, client):
@@ -814,8 +815,7 @@ def test_seed_extracts_repos_archive_into_extra_repos_root(mock_session, client)
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"seeded": ["repos"]}
     mock_session.copy_to_container.assert_called_once()
-    assert mock_session.copy_to_container.call_args.kwargs == {"dest": EXTRA_REPOS_ROOT, "clear_before_copy": False}
-    assert EXTRA_REPOS_ROOT == "/workspace/repos"
+    assert mock_session.copy_to_container.call_args.kwargs == {"dest": EXTRA_REPOS_ROOT, "clear_before_copy": True}
 
 
 def test_seed_reports_every_archive_it_extracted(mock_session, client):
@@ -838,12 +838,6 @@ def test_seed_reports_every_archive_it_extracted(mock_session, client):
     assert resp.json() == {"seeded": ["repo", "skills", "repos"]}
     dests = [call.kwargs.get("dest") for call in mock_session.copy_to_container.call_args_list]
     assert dests == ["/workspace/repo", "/workspace/skills", "/workspace/repos"]
-
-
-def test_seed_without_any_archive_is_422(mock_session, client):
-    resp = client.post(f"/session/{mock_session.session_id}/seed/")
-    assert resp.status_code == 422
-    assert "repos_archive" in resp.json()["detail"]
 
 
 def test_seed_rejects_repos_archive_escaping_its_root(mock_session, client):

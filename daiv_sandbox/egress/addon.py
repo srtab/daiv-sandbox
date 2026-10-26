@@ -17,6 +17,7 @@ try:  # works both as `daiv_sandbox.egress.policy` (tests) and flat `policy` (si
         REASON_HOST_HEADER_MISMATCH,
         REASON_HOST_NOT_LISTED,
         REASON_METHOD_NOT_ALLOWED,
+        REASON_PATH_NOT_LISTED,
         BlockReason,
         PolicyStore,
     )
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - exercised only inside the sidecar imag
         REASON_HOST_HEADER_MISMATCH,
         REASON_HOST_NOT_LISTED,
         REASON_METHOD_NOT_ALLOWED,
+        REASON_PATH_NOT_LISTED,
         BlockReason,
         PolicyStore,
     )
@@ -58,6 +60,8 @@ def _describe_block(block) -> str:
         return f"reason=method-not-allowed (matched rule host={block.host!r}, allows methods=[{methods}])"
     if block.code == REASON_HOST_NOT_LISTED:
         return "reason=host-not-listed (no rule matched; default=deny)"
+    if block.code == REASON_PATH_NOT_LISTED:
+        return f"reason=path-not-listed (no path_prefix rule covers path={block.path!r}; default=deny)"
     return f"reason={block.code}"
 
 
@@ -136,7 +140,7 @@ class EgressAddon:
             _forbidden(flow)
             return
         if not decision.allow:
-            _deny(flow, f"{flow.request.method} {host}{flow.request.path.split('?', 1)[0]}", decision.block)
+            _deny(flow, f"{flow.request.method} {host}", decision.block)
             return
         if not header_matches:
             prefix = f"{flow.request.method} {host} (Host header {flow.request.host_header!r})"

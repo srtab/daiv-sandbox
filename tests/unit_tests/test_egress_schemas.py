@@ -100,6 +100,7 @@ def test_rule_path_prefix_defaults_to_none():
         "/g/app.git/",
         "/g/app#x",
         "/g/a\x00",
+        "/g/a\x7f",
         "/g/./app.git",
         "/g/../app.git",
         "/g/%2e%2e/x",

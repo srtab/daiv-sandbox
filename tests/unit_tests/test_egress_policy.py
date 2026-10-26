@@ -5,7 +5,13 @@ import os
 
 import pytest
 
-from daiv_sandbox.egress.policy import REASON_HOST_NOT_LISTED, REASON_METHOD_NOT_ALLOWED, PolicyEvaluator, PolicyStore
+from daiv_sandbox.egress.policy import (
+    REASON_HOST_NOT_LISTED,
+    REASON_METHOD_NOT_ALLOWED,
+    BlockReason,
+    PolicyEvaluator,
+    PolicyStore,
+)
 
 
 def _cfg(default="deny", intercept="all", rules=None, secrets=None):
@@ -509,10 +515,31 @@ def test_connect_without_path_scoped_rules_keeps_credentialed_passthrough():
     assert decision.allow and not decision.intercept
 
 
-def test_unmatched_path_on_path_only_host_falls_to_default():
+def test_connect_intercepts_when_a_later_host_rule_injects_under_credentialed():
+    p = _scoped(
+        {"host": "gitlab.com"},
+        {"host": "gitlab.com", "inject": "main"},
+        secrets=SCOPED_SECRETS,
+        intercept="credentialed",
+    )
+    decision = p.evaluate("gitlab.com", "CONNECT")
+    assert decision.allow and decision.intercept
+
+
+def test_connect_method_with_a_path_is_matched_on_that_path():
+    p = _scoped(
+        {"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"},
+        {"host": "gitlab.com", "inject": "main"},
+        secrets=SCOPED_SECRETS,
+    )
+    assert p.evaluate("gitlab.com", "CONNECT", "/g/app.git/info/refs").inject == ("Authorization", "M")
+
+
+def test_unmatched_path_on_path_only_host_reports_path_not_listed():
     p = _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"}, secrets=SCOPED_SECRETS)
-    decision = p.evaluate("gitlab.com", "GET", "/g/other.git/info/refs")
-    assert not decision.allow and decision.block.code == "host-not-listed"
+    decision = p.evaluate("gitlab.com", "GET", "/g/other.git/info/refs?x=1")
+    assert not decision.allow
+    assert decision.block == BlockReason("path-not-listed", path="/g/other.git/info/refs")
 
 
 @pytest.mark.parametrize("methods", [["GET"], ["GET", "POST"], ["POST"]])
@@ -542,7 +569,7 @@ def test_policy_store_path_prefix_with_methods_is_deny_all(tmp_path):
 def test_missing_path_does_not_match_a_path_scoped_rule_for_a_request():
     p = _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"}, secrets=SCOPED_SECRETS)
     decision = p.evaluate("gitlab.com", "GET")
-    assert not decision.allow and decision.block.code == "host-not-listed"
+    assert not decision.allow and decision.block.code == "path-not-listed"
 
 
 @pytest.mark.parametrize(
@@ -553,6 +580,7 @@ def test_missing_path_does_not_match_a_path_scoped_rule_for_a_request():
         "/g/mod.git/",
         "/g/mod.git?x",
         "/g/mod git",
+        "/g/mod\x7f.git",
         "/g/./mod.git",
         "/g/../mod.git",
         "/g/%2e%2E/x",
