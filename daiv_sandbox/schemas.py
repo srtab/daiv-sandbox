@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import Base64Bytes, BaseModel, Field, SecretStr, computed_field, field_validator, model_validator
 
+from daiv_sandbox.egress.policy import valid_path_prefix
+
 
 class StartSessionRequest(BaseModel):
     base_image: str = Field(description="Docker image to be used as the base image for the sandbox.")
@@ -262,14 +264,10 @@ class EgressRule(BaseModel):
     def _valid_path_prefix(cls, value: str | None) -> str | None:
         if value is None:
             return value
-        if (
-            not value.startswith("/")
-            or value.endswith("/")
-            or any(c.isspace() or ord(c) < 0x20 or c in "?#" for c in value)
-        ):
+        if not valid_path_prefix(value):
             raise ValueError(
                 "path_prefix must start with '/', not end with '/', and contain no whitespace, "
-                "control characters, '?' or '#'"
+                "control characters, '?', '#' or '.'/'..' segments"
             )
         return value
 
@@ -279,6 +277,12 @@ class EgressRule(BaseModel):
         if not value:
             raise ValueError("methods must not be empty; use ['*'] to allow all methods")
         return [m.upper() for m in value]
+
+    @model_validator(mode="after")
+    def _path_prefix_excludes_methods(self) -> EgressRule:
+        if self.path_prefix is not None and self.methods != ["*"]:
+            raise ValueError("path_prefix cannot be combined with a methods restriction; it only scopes grants")
+        return self
 
 
 # RFC 7230 token: the grammar for a header field-name. Used with fullmatch so the whole value must be
@@ -314,8 +318,8 @@ class EgressPolicy(BaseModel):
     intercept: Literal["all", "credentialed"] = Field(
         default="all",
         description=(
-            "'all' MITMs every reachable host; 'credentialed' MITMs only hosts that inject a credential "
-            "or carry a per-host methods restriction (others are tunnelled untouched)."
+            "'all' MITMs every reachable host; 'credentialed' MITMs only hosts that inject a credential, "
+            "restrict methods, or carry a path-scoped rule (others are tunnelled untouched)."
         ),
     )
     rules: list[EgressRule] = Field(default_factory=list)

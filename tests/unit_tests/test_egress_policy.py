@@ -515,16 +515,50 @@ def test_unmatched_path_on_path_only_host_falls_to_default():
     assert not decision.allow and decision.block.code == "host-not-listed"
 
 
-def test_method_not_allowed_cites_only_rules_matching_the_path():
-    p = _scoped(
-        {"host": "gitlab.com", "path_prefix": "/g/mod.git", "methods": ["GET"]},
-        {"host": "gitlab.com", "path_prefix": "/g/app.git", "methods": ["GET", "POST"]},
-    )
-    decision = p.evaluate("gitlab.com", "POST", "/g/mod.git/git-receive-pack")
-    assert decision.block.code == "method-not-allowed" and decision.block.methods == ("GET",)
+@pytest.mark.parametrize("methods", [["GET"], ["GET", "POST"], ["POST"]])
+def test_from_config_rejects_path_prefix_combined_with_methods(methods):
+    with pytest.raises(ValueError, match="path_prefix"):
+        _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "methods": methods})
 
 
-@pytest.mark.parametrize("prefix", ["g/mod.git", "", "/g/mod.git/", "/g/mod.git?x", "/g/mod git"])
+def test_from_config_accepts_path_prefix_with_wildcard_methods():
+    p = _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "methods": ["*"]})
+    assert p.evaluate("gitlab.com", "POST", "/g/mod.git/x").allow
+
+
+def test_path_scoped_methods_restriction_cannot_fail_open_under_default_allow():
+    cfg = _cfg(default="allow", rules=[{"host": "gitlab.com", "path_prefix": "/g/mod.git", "methods": ["GET"]}])
+    with pytest.raises(ValueError):
+        PolicyEvaluator.from_config(cfg)
+
+
+def test_policy_store_path_prefix_with_methods_is_deny_all(tmp_path):
+    path = tmp_path / "config.json"
+    cfg = _cfg(default="allow", rules=[{"host": "gitlab.com", "path_prefix": "/g/mod.git", "methods": ["GET"]}])
+    path.write_text(json.dumps(cfg))
+    assert not PolicyStore(str(path)).current().evaluate("example.com", "GET", "/").allow
+
+
+def test_missing_path_does_not_match_a_path_scoped_rule_for_a_request():
+    p = _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"}, secrets=SCOPED_SECRETS)
+    decision = p.evaluate("gitlab.com", "GET")
+    assert not decision.allow and decision.block.code == "host-not-listed"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "g/mod.git",
+        "",
+        "/g/mod.git/",
+        "/g/mod.git?x",
+        "/g/mod git",
+        "/g/./mod.git",
+        "/g/../mod.git",
+        "/g/%2e%2E/x",
+        "/g\\..\\x",
+    ],
+)
 def test_from_config_rejects_invalid_path_prefix(prefix):
     with pytest.raises(ValueError):
         _scoped({"host": "gitlab.com", "path_prefix": prefix})

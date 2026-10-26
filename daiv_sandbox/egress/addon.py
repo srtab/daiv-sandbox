@@ -102,7 +102,7 @@ class EgressAddon:
             _forbidden(flow)
             return
         if not decision.allow:
-            _deny(flow, f"{flow.request.method} {host}", decision.block)
+            _deny(flow, f"{flow.request.method} {host}{flow.request.path.split('?', 1)[0]}", decision.block)
             return
         if decision.inject is not None:
             name, value = decision.inject

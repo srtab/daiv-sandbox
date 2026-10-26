@@ -57,10 +57,10 @@ class _Rule:
     inject: str | None
     path_prefix: str | None = None
 
-    def matches_path(self, path: str | None) -> bool:
-        if self.path_prefix is None or path is None:
+    def matches_path(self, path: str | None, method: str) -> bool:
+        if self.path_prefix is None or method == "CONNECT":
             return True
-        if _has_dot_segment(path):
+        if path is None or _has_dot_segment(path):
             return False
         return path == self.path_prefix or path.startswith(self.path_prefix + "/")
 
@@ -69,11 +69,13 @@ def _has_dot_segment(path: str) -> bool:
     return any(seg in (".", "..") for seg in re.split(r"[/\\]", unquote(path)))
 
 
-def _valid_path_prefix(prefix: str) -> bool:
+def valid_path_prefix(prefix: str) -> bool:
+    """A prefix that can match: absolute, no trailing slash, no whitespace/control/`?`/`#`, no dot segment."""
     return (
         prefix.startswith("/")
         and not prefix.endswith("/")
         and not any(c.isspace() or ord(c) < 0x20 or c in "?#" for c in prefix)
+        and not _has_dot_segment(prefix)
     )
 
 
@@ -122,8 +124,15 @@ class PolicyEvaluator:
             if inject is not None and inject not in secrets:
                 raise ValueError(f"egress: rule for host {r.get('host')!r} references unknown secret {inject!r}")
             path_prefix = r.get("path_prefix")
-            if path_prefix is not None and not (isinstance(path_prefix, str) and _valid_path_prefix(path_prefix)):
-                raise ValueError(f"egress: rule for host {r.get('host')!r} has invalid path_prefix {path_prefix!r}")
+            if path_prefix is not None:
+                if not (isinstance(path_prefix, str) and valid_path_prefix(path_prefix)):
+                    raise ValueError(f"egress: rule for host {r.get('host')!r} has invalid path_prefix {path_prefix!r}")
+                # Path matching is exact-string, so a differently-spelled path would slip past a method
+                # restriction and fall through to the default (fail-open); only grants may be path-scoped.
+                if methods != ("*",):
+                    raise ValueError(
+                        f"egress: rule for host {r.get('host')!r} combines path_prefix with a methods restriction"
+                    )
             rules.append(_Rule(host=r["host"].lower(), methods=methods, inject=inject, path_prefix=path_prefix))
         # Unknown default/intercept values are a misconfiguration: fail closed (deny / full MITM) and warn
         # rather than relying on `== "allow"`/`== "all"` to accidentally do the safe thing for a typo.
@@ -156,9 +165,9 @@ class PolicyEvaluator:
         """
         host_match: _Rule | None = None
         for rule in self._rules:
-            if fnmatch.fnmatchcase(host, rule.host) and rule.matches_path(path):
+            if fnmatch.fnmatchcase(host, rule.host) and rule.matches_path(path, method):
                 if host_match is None:
-                    host_match = rule  # first host glob that matched — the rule to cite on a method deny
+                    host_match = rule
                 # CONNECT is a host-reachability check: the TLS tunnel hasn't been established yet, so
                 # the real HTTP method is unknown. Match any host-listed rule; the specific method
                 # restriction is enforced later at the request (post-interception) phase.
