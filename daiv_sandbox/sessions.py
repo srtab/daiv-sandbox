@@ -25,6 +25,7 @@ logger = logging.getLogger("daiv_sandbox")
 # Canonical sandbox root directory inside all containers
 WORKSPACE_ROOT = "/workspace"
 SANDBOX_ROOT = "/workspace/repo"
+EXTRA_REPOS_ROOT = "/workspace/repos"
 SANDBOX_HOME = "/home/daiv-sandbox"
 SKILLS_ROOT = "/workspace/skills"
 SCRATCH_ROOT = "/workspace/tmp"
@@ -568,7 +569,7 @@ class SandboxDockerSession:
 
         # Bootstrap the directory layout. On failure, force-remove so a failed start() leaks nothing
         # (no leaked container holding its runtime/cpu/memory reservations).
-        sandbox_dirs = [WORKSPACE_ROOT, SANDBOX_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT]
+        sandbox_dirs = [WORKSPACE_ROOT, SANDBOX_ROOT, EXTRA_REPOS_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT]
         try:
             # Ensure the sandbox directories exist and are writable by the sandbox user.
             mkdir_result = container.exec_run(["mkdir", "-p", "--", *sandbox_dirs], user="root")
@@ -651,7 +652,7 @@ class SandboxDockerSession:
         if to_dir_norm in {"", "/"}:
             raise ValueError("Refusing to extract an archive into the container root directory")
 
-        # Confine the destination to WORKSPACE_ROOT (SANDBOX_ROOT/SKILLS_ROOT/SCRATCH_ROOT all live
+        # Confine the destination to WORKSPACE_ROOT (SANDBOX_ROOT/EXTRA_REPOS_ROOT/SKILLS_ROOT/SCRATCH_ROOT all live
         # under it, so the single /workspace prefix subsumes them). Validate lexically through the
         # shared validator so a `..`/NUL/newline in `dest` is rejected at this boundary rather than
         # relying on every caller pre-validating. allow_root=True permits a bare-root dest.

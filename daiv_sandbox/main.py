@@ -48,12 +48,14 @@ from daiv_sandbox.schemas import (
     RunRequest,
     RunResponse,
     RunResult,
+    SeedSessionResponse,
     StartSessionRequest,
     StartSessionResponse,
 )
 from daiv_sandbox.sessions import (
     DAIV_SANDBOX_TYPE_LABEL,
     EGRESS_SESSION_LABEL,
+    EXTRA_REPOS_ROOT,
     SANDBOX_HOME,
     SANDBOX_ROOT,
     SKILLS_ROOT,
@@ -337,14 +339,20 @@ async def start_session(
     return StartSessionResponse(session_id=cmd_executor.session_id)
 
 
-@app.post("/session/{session_id}/seed/", responses=common_responses, name="Seed initial session state")
+@app.post(
+    "/session/{session_id}/seed/",
+    responses=common_responses,
+    name="Seed initial session state",
+    response_model=SeedSessionResponse,
+)
 async def seed_session(
     http_request: Request,
     session_id: Annotated[str, FastAPIPath(title="The ID of the session to seed.")],
     repo_archive: UploadFile | None = None,
     skills_archive: UploadFile | None = None,
+    repos_archive: UploadFile | None = None,
     api_key: str = Depends(get_api_key),
-) -> Response:
+) -> SeedSessionResponse:
     """
     Establish the initial state of a freshly-started session.
 
@@ -352,13 +360,18 @@ async def seed_session(
       * ``repo_archive``    — tar (auto-detected compression: gzip, bzip2, xz, zstd, or plain)
                               extracted into ``/workspace/repo``.
       * ``skills_archive``  — tar (same compression options) extracted into ``/workspace/skills``.
+      * ``repos_archive``   — tar (same compression options) extracted into ``/workspace/repos``;
+                              members are ``<repository slug>/<path>``.
+
+    Responds 200 with the archives extracted, in order: ``repo``, ``skills``, ``repos``. A sandbox that
+    predates ``repos_archive`` ignores the field and answers 204 instead.
 
     One-shot per session: subsequent calls return 409.
     """
-    if repo_archive is None and skills_archive is None:
+    if repo_archive is None and skills_archive is None and repos_archive is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="At least one of repo_archive or skills_archive must be provided",
+            detail="At least one of repo_archive, skills_archive or repos_archive must be provided",
         )
 
     async with _workspace_executor(http_request, session_id) as cmd_executor:
@@ -368,27 +381,24 @@ async def seed_session(
         if check.exit_code == 0:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session already seeded")
 
-        if repo_archive is not None:
+        seeded: list[Literal["repo", "skills", "repos"]] = []
+        for kind, archive, dest in (
+            ("repo", repo_archive, SANDBOX_ROOT),
+            ("skills", skills_archive, SKILLS_ROOT),
+            ("repos", repos_archive, EXTRA_REPOS_ROOT),
+        ):
+            if archive is None:
+                continue
             try:
                 await asyncio.to_thread(
-                    cmd_executor.copy_to_container, repo_archive.file, dest=SANDBOX_ROOT, clear_before_copy=False
+                    cmd_executor.copy_to_container, archive.file, dest=dest, clear_before_copy=False
                 )
             except ValueError as exc:
-                logger.warning("seed_session: invalid repo_archive for session %s: %s", session_id, exc)
+                logger.warning("seed_session: invalid %s_archive for session %s: %s", kind, session_id, exc)
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"repo_archive is invalid: {exc}"
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{kind}_archive is invalid: {exc}"
                 ) from exc
-
-        if skills_archive is not None:
-            try:
-                await asyncio.to_thread(
-                    cmd_executor.copy_to_container, skills_archive.file, dest=SKILLS_ROOT, clear_before_copy=False
-                )
-            except ValueError as exc:
-                logger.warning("seed_session: invalid skills_archive for session %s: %s", session_id, exc)
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"skills_archive is invalid: {exc}"
-                ) from exc
+            seeded.append(kind)
 
         marker_result = await asyncio.to_thread(
             cmd_executor.container.exec_run, ["/bin/sh", "-c", f"touch {SEED_MARKER}"], user="root"
@@ -400,7 +410,7 @@ async def seed_session(
                 detail="Failed to mark session as seeded. Check logs.",
             )
 
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return SeedSessionResponse(seeded=seeded)
 
 
 @app.post("/session/{session_id}/", responses=common_responses, name="Run commands on a session")

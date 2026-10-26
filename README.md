@@ -90,7 +90,7 @@ All settings are configurable via environment variables. The available settings 
 `daiv-sandbox` provides a REST API to interact with. Here is a quick overview of the available endpoints:
 
 - `POST /session/`: Start a sandbox session.
-- `POST /session/{session_id}/seed/`: Seed the initial `/workspace/repo` and/or `/workspace/skills` state from tar archives (one-shot per session).
+- `POST /session/{session_id}/seed/`: Seed the initial `/workspace/repo`, `/workspace/skills` and/or `/workspace/repos` state from tar archives (one-shot per session); answers `200` with the archives extracted.
 - `POST /session/{session_id}/fs/{op}`: Python-free file operations across `/workspace` (`ls`, `read`, `grep`, `glob`, `write`, `edit`, `delete`).
 - `POST /session/{session_id}/`: Run commands on the sandbox session.
 - `GET /session/{session_id}/`: Check session status — `204` if it exists (restarting it if stopped), else `404`.
@@ -156,27 +156,34 @@ print(resp["session_id"])
 
 ### Seeding a Session
 
-A freshly-started session has empty `/workspace/repo` and `/workspace/skills` directories. Before running commands or operating on files, seed the workspace by calling `POST /session/{session_id}/seed/` with one or both archives as `multipart/form-data` fields. `repo_archive` is extracted into `/workspace/repo` (e.g. a repository snapshot) and `skills_archive` is extracted into `/workspace/skills` (auxiliary tooling, prompts, etc.).
+A freshly-started session has empty `/workspace/repo`, `/workspace/repos` and `/workspace/skills` directories. Before running commands or operating on files, seed the workspace by calling `POST /session/{session_id}/seed/` with one or more archives as `multipart/form-data` fields. `repo_archive` is extracted into `/workspace/repo` (the main repository snapshot), `skills_archive` is extracted into `/workspace/skills` (auxiliary tooling, prompts, etc.) and `repos_archive` is extracted into `/workspace/repos` (additional repositories, one directory per repository).
 
-Both fields are optional individually, but **at least one must be provided** — a request with neither returns `422`. Seeding is **one-shot per session** — a second call returns `409 Conflict`.
+All fields are optional individually, but **at least one must be provided** — a request with none returns `422`. Seeding is **one-shot per session** — a second call returns `409 Conflict`.
 
 Archives may be plain `tar` or compressed with gzip, bzip2, xz, or zstd; the compression is auto-detected. They are sanitised and streamed into the container without being fully buffered in memory.
 
-| Parameter        | Description                                                        | Required          | Valid Values                     |
-| ---------------- | ------------------------------------------------------------------ | ----------------- | -------------------------------- |
-| `repo_archive`   | Tar archive that becomes the initial state of `/workspace/repo`.   | At least one of   | `tar` (optionally gz/bz2/xz/zst) |
-| `skills_archive` | Tar archive that becomes the initial state of `/workspace/skills`. | `repo_archive` or | `tar` (optionally gz/bz2/xz/zst) |
-|                  |                                                                    | `skills_archive`  |                                  |
+| Parameter        | Description                                                                            | Required        | Valid Values                     |
+| ---------------- | -------------------------------------------------------------------------------------- | --------------- | -------------------------------- |
+| `repo_archive`   | Tar archive that becomes the initial state of `/workspace/repo`.                       | At least one of | `tar` (optionally gz/bz2/xz/zst) |
+| `skills_archive` | Tar archive that becomes the initial state of `/workspace/skills`.                     | the three       | `tar` (optionally gz/bz2/xz/zst) |
+| `repos_archive`  | Tar archive extracted into `/workspace/repos`; members are `<repository slug>/<path>`. |                 | `tar` (optionally gz/bz2/xz/zst) |
 
 ```sh
 $ curl -X POST \
   -H "X-API-Key: notsosecret" \
   -F "repo_archive=@django-webhooks-master.tar.gz" \
   -F "skills_archive=@skills.tar.gz" \
+  -F "repos_archive=@extra-repos.tar.gz" \
   http://localhost:8000/api/v1/session/550e8400-e29b-41d4-a716-446655440000/seed/
 ```
 
-The response is an empty body with status `204`.
+The response has status `200` and lists the archives that were extracted, in order (`repo`, `skills`, `repos`):
+
+```json
+{ "seeded": ["repo", "skills", "repos"] }
+```
+
+A sandbox that predates `repos_archive` ignores the field and answers `204` with an empty body, so a client can tell whether the extra repositories were seeded by checking for `"repos"` in `seeded`.
 
 ### Workspace File Operations
 
@@ -302,7 +309,7 @@ session_id = (
     .json()["session_id"]
 )
 
-# 2. Seed /workspace/repo (and optionally /workspace/skills) from tar archives via multipart upload.
+# 2. Seed /workspace/repo (and optionally /workspace/skills and /workspace/repos) from tar archives via multipart upload.
 tarstream = io.BytesIO()
 with tarfile.open(fileobj=tarstream, mode="w:gz") as tar:
     # Add files to tar...
@@ -312,7 +319,7 @@ httpx.post(
     f"{API}/session/{session_id}/seed/",
     headers=HEADERS,
     files={"repo_archive": ("repo.tar.gz", tarstream, "application/gzip")},
-).raise_for_status()
+).raise_for_status()  # 200 {"seeded": ["repo"]}
 
 # 3. Run commands. Changes mutate the container workspace in place.
 resp = (

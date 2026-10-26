@@ -28,6 +28,10 @@ class StartSessionResponse(BaseModel):
     session_id: str = Field(description="Unique identifier for the session.")
 
 
+class SeedSessionResponse(BaseModel):
+    seeded: list[Literal["repo", "skills", "repos"]] = Field(description="The archives that were extracted, in order.")
+
+
 class RunRequest(BaseModel):
     commands: list[str] = Field(description="List of bash commands to be executed in the sandbox.")
     fail_fast: bool = Field(
