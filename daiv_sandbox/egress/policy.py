@@ -23,6 +23,7 @@ logger = logging.getLogger("daiv_sandbox.egress")
 # infer their literal type so they satisfy BlockReason.code's Literal[...] at the construction sites.
 REASON_HOST_NOT_LISTED: Final = "host-not-listed"
 REASON_METHOD_NOT_ALLOWED: Final = "method-not-allowed"
+REASON_HOST_HEADER_MISMATCH: Final = "host-header-mismatch"
 
 
 @dataclass(frozen=True)
@@ -33,11 +34,13 @@ class BlockReason:
     echo that rule's host glob and the methods it currently permits — what an operator would extend.
     ``host-not-listed``: no rule host matched at all (the deny came from ``default=deny``), so there is no
     rule to point at and both are None.
+    ``host-header-mismatch``: set by the addon, not the evaluator — a request that would carry a secret
+    named another host in its Host header; both are None.
     """
 
-    # The two literals are the REASON_* constants above; kept as literals here because Literal[] cannot
-    # reference the names. mypy then checks both construction sites and narrows the code at the consumer.
-    code: Literal["host-not-listed", "method-not-allowed"]
+    # The literals are the REASON_* constants above; kept as literals here because Literal[] cannot
+    # reference the names. mypy then checks the construction sites and narrows the code at the consumer.
+    code: Literal["host-not-listed", "method-not-allowed", "host-header-mismatch"]
     host: str | None = None
     methods: tuple[str, ...] | None = None
 
