@@ -528,3 +528,35 @@ def test_method_not_allowed_cites_only_rules_matching_the_path():
 def test_from_config_rejects_invalid_path_prefix(prefix):
     with pytest.raises(ValueError):
         _scoped({"host": "gitlab.com", "path_prefix": prefix})
+
+
+DOT_SEGMENT_PATHS = [
+    "/g/mod.git/../app.git/git-receive-pack",
+    "/g/mod.git/./info/refs",
+    "/g/mod.git/%2e%2e/app.git/x",
+    "/g/mod.git/%2E%2e/app.git/x",
+    "/g/mod.git/..%2fapp.git/x",
+    "/g/mod.git/..%5Capp.git/x",
+    "/g/mod.git/..\\app.git/x",
+]
+
+
+@pytest.mark.parametrize("path", DOT_SEGMENT_PATHS)
+def test_dot_segments_do_not_inherit_path_scoped_secret(path):
+    p = _scoped(
+        {"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"},
+        {"host": "gitlab.com", "inject": "main"},
+        secrets=SCOPED_SECRETS,
+    )
+    assert p.evaluate("gitlab.com", "POST", path).inject == ("Authorization", "M")
+
+
+@pytest.mark.parametrize("path", DOT_SEGMENT_PATHS)
+def test_dot_segments_are_denied_on_path_only_host(path):
+    p = _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"}, secrets=SCOPED_SECRETS)
+    assert not p.evaluate("gitlab.com", "GET", path).allow
+
+
+def test_dotted_names_are_not_dot_segments():
+    p = _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"}, secrets=SCOPED_SECRETS)
+    assert p.evaluate("gitlab.com", "GET", "/g/mod.git/.hidden/..a/b..").allow

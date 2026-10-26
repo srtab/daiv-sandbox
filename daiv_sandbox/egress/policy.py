@@ -12,8 +12,10 @@ import hashlib
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Final, Literal
+from urllib.parse import unquote
 
 logger = logging.getLogger("daiv_sandbox.egress")
 
@@ -58,7 +60,13 @@ class _Rule:
     def matches_path(self, path: str | None) -> bool:
         if self.path_prefix is None or path is None:
             return True
+        if _has_dot_segment(path):
+            return False
         return path == self.path_prefix or path.startswith(self.path_prefix + "/")
+
+
+def _has_dot_segment(path: str) -> bool:
+    return any(seg in (".", "..") for seg in re.split(r"[/\\]", unquote(path)))
 
 
 def _valid_path_prefix(prefix: str) -> bool:
