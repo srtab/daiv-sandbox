@@ -9,18 +9,37 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 try:  # works both as `daiv_sandbox.egress.policy` (tests) and flat `policy` (sidecar image, see Dockerfile)
     from daiv_sandbox.egress.constants import CONFIG_PATH, CONFIG_PATH_ENV
-    from daiv_sandbox.egress.policy import REASON_HOST_NOT_LISTED, REASON_METHOD_NOT_ALLOWED, PolicyStore
+    from daiv_sandbox.egress.policy import (
+        REASON_HOST_HEADER_MISMATCH,
+        REASON_HOST_NOT_LISTED,
+        REASON_METHOD_NOT_ALLOWED,
+        BlockReason,
+        PolicyStore,
+    )
 except ImportError:  # pragma: no cover - exercised only inside the sidecar image
     from constants import CONFIG_PATH, CONFIG_PATH_ENV  # type: ignore[no-redef]
-    from policy import REASON_HOST_NOT_LISTED, REASON_METHOD_NOT_ALLOWED, PolicyStore  # type: ignore[no-redef]
+    from policy import (  # type: ignore[no-redef]
+        REASON_HOST_HEADER_MISMATCH,
+        REASON_HOST_NOT_LISTED,
+        REASON_METHOD_NOT_ALLOWED,
+        BlockReason,
+        PolicyStore,
+    )
 
 logger = logging.getLogger("daiv_sandbox.egress")
 
+_AUTHORITY = re.compile(r"(?:\[(?P<ipv6>[0-9A-Fa-f:.]+)\]|(?P<name>[A-Za-z0-9._-]+))(?::[0-9]{1,5})?")
+
 
 def _forbidden(flow) -> None:  # pragma: no cover - thin mitmproxy glue, stubbed in tests
+    if flow.request.stream:
+        # mitmproxy raises on a response set for a request whose body it streams; drop the connection.
+        flow.kill()
+        return
     from mitmproxy.http import Response
 
     flow.response = Response.make(403, b"egress: destination not allowed\n", {"Content-Type": "text/plain"})
@@ -49,6 +68,16 @@ def _deny(flow, log_prefix: str, block) -> None:
     """
     _forbidden(flow)
     logger.warning("egress: blocked %s — %s", log_prefix, _describe_block(block))
+
+
+def _host_header_matches(request) -> bool:
+    """True when the request has no Host/:authority header, or one that is exactly ``host[:port]`` (IPv6
+    bracketed) for the host the request is sent to."""
+    authority = request.host_header
+    if authority is None:
+        return True
+    match = _AUTHORITY.fullmatch(authority)
+    return match is not None and (match["ipv6"] or match["name"]).lower() == request.host.lower()
 
 
 class EgressAddon:
@@ -92,10 +121,15 @@ class EgressAddon:
         if decision.allow and not decision.intercept:
             data.ignore_connection = True
 
-    def request(self, flow) -> None:
-        host = flow.request.pretty_host
+    def requestheaders(self, flow) -> None:
+        """Gate and inject on headers, not in ``request``: mitmproxy forwards a body over
+        ``stream_large_bodies`` (see egress_proxy/Dockerfile) before ``request`` fires."""
+        # `host` is where the connection goes (the CONNECT target inside a tunnel); `pretty_host` is the
+        # client-controlled Host header, so judging by it would hand one host's secret to another.
+        host = flow.request.host
         try:
             decision = self._store.current().evaluate(host, flow.request.method)
+            header_matches = decision.inject is None or _host_header_matches(flow.request)
         except Exception:
             # Fail closed: deny and never fall through to the credential-injection branch.
             logger.exception("egress: error evaluating %s %s; failing closed (deny)", flow.request.method, host)
@@ -103,6 +137,10 @@ class EgressAddon:
             return
         if not decision.allow:
             _deny(flow, f"{flow.request.method} {host}", decision.block)
+            return
+        if not header_matches:
+            prefix = f"{flow.request.method} {host} (Host header {flow.request.host_header!r})"
+            _deny(flow, prefix, BlockReason(REASON_HOST_HEADER_MISMATCH))
             return
         if decision.inject is not None:
             name, value = decision.inject
