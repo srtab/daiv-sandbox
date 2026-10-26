@@ -61,7 +61,7 @@ def test_request_injects_configured_header(tmp_path):
     )
     flow = _flow(host="github.com")
     flow.request.headers["Authorization"] = "attacker-supplied"
-    a.request(flow)
+    a.requestheaders(flow)
     assert flow.request.headers["Authorization"] == "Bearer t"  # stripped + replaced
 
 
@@ -77,42 +77,66 @@ def test_request_to_unlisted_host_with_spoofed_host_header_is_denied(tmp_path, c
     a = EgressAddon(_gitlab_cfg(tmp_path))
     flow = _flow(host="echoprobe", host_header="gitlab.com")
     with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
-        a.request(flow)
+        a.requestheaders(flow)
+    assert flow.response == "FORBIDDEN"
+    assert "Authorization" not in flow.request.headers
+    assert "reason=host-not-listed" in caplog.text
+
+
+def test_request_whose_host_header_names_another_listed_host_goes_out_without_secret(tmp_path):
+    a = EgressAddon(_gitlab_cfg(tmp_path, extra_rules=[{"host": "pypi.org"}]))
+    flow = _flow(host="pypi.org", host_header="gitlab.com")
+    a.requestheaders(flow)
+    assert flow.response is None
+    assert "Authorization" not in flow.request.headers
+
+
+@pytest.mark.parametrize(
+    "host_header",
+    [
+        "echoprobe",
+        "[gitlab.com",
+        "[gitlab.com]",
+        "evil@gitlab.com",
+        "gitlab.com/x",
+        "gitlab.com?x",
+        "gitlab.com#.evil.com",
+        "gitlab.com:junk",
+        "gitlab\t.com",
+    ],
+)
+def test_credentialed_request_with_mismatched_host_header_is_denied(tmp_path, caplog, host_header):
+    a = EgressAddon(_gitlab_cfg(tmp_path))
+    flow = _flow(host="gitlab.com", host_header=host_header)
+    with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
+        a.requestheaders(flow)
     assert flow.response == "FORBIDDEN"
     assert "Authorization" not in flow.request.headers
     assert "reason=host-header-mismatch" in caplog.text
-
-
-def test_request_whose_host_header_names_another_listed_host_is_denied(tmp_path):
-    a = EgressAddon(_gitlab_cfg(tmp_path, extra_rules=[{"host": "pypi.org"}]))
-    flow = _flow(host="pypi.org", host_header="gitlab.com")
-    a.request(flow)
-    assert flow.response == "FORBIDDEN"
-    assert "Authorization" not in flow.request.headers
+    assert not any(record.exc_info for record in caplog.records)
 
 
 @pytest.mark.parametrize("host_header", ["gitlab.com", "GitLab.COM", "gitlab.com:443", None])
 def test_request_with_matching_or_absent_host_header_injects(tmp_path, host_header):
     a = EgressAddon(_gitlab_cfg(tmp_path))
     flow = _flow(host="gitlab.com", host_header=host_header)
-    a.request(flow)
+    a.requestheaders(flow)
     assert flow.response is None
     assert flow.request.headers["Authorization"] == "Bearer secret"
 
 
 def test_request_with_bracketed_ipv6_host_header_matches_its_host(tmp_path):
-    a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "2001:db8::1"}]))
+    a = EgressAddon(
+        _write_cfg(
+            tmp_path,
+            rules=[{"host": "2001:db8::1", "inject": "gl"}],
+            secrets={"gl": {"header": "Authorization", "value": "Bearer secret"}},
+        )
+    )
     flow = _flow(host="2001:db8::1", host_header="[2001:db8::1]:8080")
-    a.request(flow)
+    a.requestheaders(flow)
     assert flow.response is None
-
-
-def test_request_with_malformed_host_header_fails_closed(tmp_path):
-    a = EgressAddon(_gitlab_cfg(tmp_path))
-    flow = _flow(host="gitlab.com", host_header="[gitlab.com")
-    a.request(flow)
-    assert flow.response == "FORBIDDEN"
-    assert "Authorization" not in flow.request.headers
+    assert flow.request.headers["Authorization"] == "Bearer secret"
 
 
 def test_tls_clienthello_passthrough_for_allowed_noncred(tmp_path):
@@ -123,12 +147,12 @@ def test_tls_clienthello_passthrough_for_allowed_noncred(tmp_path):
 
 
 def test_request_denies_disallowed_method_on_method_restricted_host(tmp_path):
-    """The real per-host method limit is enforced post-MITM in request(): a host reachable via CONNECT
+    """The real per-host method limit is enforced post-MITM in requestheaders(): a host reachable via CONNECT
     (methods:["GET"]) must still have a POST blocked at the request phase. This is the actual
     enforcement point for method limits — the policy-layer test alone does not exercise it."""
     a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "api.github.com", "methods": ["GET"]}]))
     flow = _flow(host="api.github.com", method="POST")
-    a.request(flow)
+    a.requestheaders(flow)
     assert flow.response == "FORBIDDEN"
 
 
@@ -148,7 +172,7 @@ def test_blocked_request_logs_method_not_allowed_with_matched_rule(tmp_path, cap
     its currently-allowed methods — the data needed to extend that rule."""
     a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "*.github.com", "methods": ["GET", "POST"]}]))
     with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
-        a.request(_flow(host="api.github.com", method="DELETE"))
+        a.requestheaders(_flow(host="api.github.com", method="DELETE"))
     msg = caplog.text
     assert "DELETE" in msg and "api.github.com" in msg
     assert "method-not-allowed" in msg
@@ -162,7 +186,7 @@ def test_blocked_request_on_unlisted_host_logs_host_not_listed(tmp_path, caplog)
     (there is no rule to cite), so _describe_block emits only the static reason string."""
     a = EgressAddon(_write_cfg(tmp_path))
     with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
-        a.request(_flow(host="evil.example", method="POST"))
+        a.requestheaders(_flow(host="evil.example", method="POST"))
     msg = caplog.text
     assert "POST" in msg and "evil.example" in msg
     assert "host-not-listed" in msg
@@ -171,7 +195,7 @@ def test_blocked_request_on_unlisted_host_logs_host_not_listed(tmp_path, caplog)
 def test_request_allows_permitted_method_on_method_restricted_host(tmp_path):
     a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "api.github.com", "methods": ["GET"]}]))
     flow = _flow(host="api.github.com", method="GET")
-    a.request(flow)
+    a.requestheaders(flow)
     assert flow.response is None
 
 
@@ -200,7 +224,7 @@ def test_http_connect_fails_closed_when_evaluation_raises(tmp_path, monkeypatch)
 
 
 def test_request_fails_closed_when_evaluation_raises(tmp_path, monkeypatch):
-    """A raise in request() must deny AND never reach the credential-injection branch — not fall open."""
+    """A raise in requestheaders() must deny AND never reach the credential-injection branch — not fall open."""
     a = EgressAddon(
         _write_cfg(
             tmp_path,
@@ -211,12 +235,14 @@ def test_request_fails_closed_when_evaluation_raises(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(a._store, "current", _raise)
     flow = _flow(host="github.com")
-    a.request(flow)
+    a.requestheaders(flow)
     assert flow.response == "FORBIDDEN"
     assert "Authorization" not in flow.request.headers  # credential never injected on the error path
 
 
-@pytest.mark.parametrize("hook", [EgressAddon.request, EgressAddon.http_connect], ids=["request", "http_connect"])
+@pytest.mark.parametrize(
+    "hook", [EgressAddon.requestheaders, EgressAddon.http_connect], ids=["requestheaders", "http_connect"]
+)
 def test_hooks_commit_deny_before_formatting_reason(tmp_path, monkeypatch, hook):
     """Hardening: both deny paths route through _deny, which attaches the 403 BEFORE formatting the reason,
     so a formatting bug can never leave the flow un-denied. mitmproxy fails OPEN on an un-denied hook, so
