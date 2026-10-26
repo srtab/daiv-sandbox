@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Egress rules accept `path_prefix`: the sidecar injects a rule's secret only for requests under that path, so one host can carry a different secret per path (DAIV uses it to give each repository in a session its own git token). Matching is on whole path segments, the query string is ignored, and the first matching rule wins, so list path-scoped rules before a host-wide one. A path containing a `.` or `..` segment (also percent-encoded) never matches a path-scoped rule. A host with any path-scoped rule is always intercepted (MITM'd), regardless of the `intercept` mode. **Upgrade note:** update the egress sidecar image together with the service; the default `:latest` sidecar image is pulled only when missing locally, and an older sidecar ignores `path_prefix`, applying a path-scoped rule to every path on that host.
+- `POST /session/{id}/seed/` accepts `repos_archive`, extracted into `/workspace/repos` (members are `<repository slug>/<path>`), for sessions spanning several repositories. It now answers `200` with `{"seeded": [...]}` listing the archives it extracted (`"repo"`, `"skills"`, `"repos"`) instead of `204`. **Breaking change:** clients that expect `204` must accept `200`.
+
 ### Fixed
 
 - Requests to `localhost`, `127.0.0.1` and `::1` inside an egress sandbox no longer go through the proxy. The sidecar cannot reach the sandbox's own loopback, so a local call (a test server, a dev server) came back as a `502` from mitmproxy. Exec environments now set `NO_PROXY`/`no_proxy` for those hosts.
