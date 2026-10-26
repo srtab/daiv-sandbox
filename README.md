@@ -389,11 +389,11 @@ Pass an `egress` block in the `POST /session/` body to route the session through
 
 - **`policy.default`** — `"deny"` (allowlist; only hosts with a matching rule are reachable) or `"allow"` (denylist; all hosts are reachable unless blocked).
 - **`policy.intercept`** — `"all"` (MITM every connection) or `"credentialed"` (MITM only hosts that inject credentials or carry a `methods` restriction; tunnel the rest untouched).
-- **`policy.rules`** — list of per-host rules. `host` is a glob (e.g. `*.github.com`), matched case-insensitively. `methods` restricts which HTTP methods are permitted (`["*"]` allows all). `inject` names a secret (from `secrets`) whose configured header is set on requests to this host.
+- **`policy.rules`** — list of per-host rules. `host` is a glob (e.g. `*.github.com`), matched case-insensitively. `methods` restricts which HTTP methods are permitted (`["*"]` allows all). `inject` names a secret (from `secrets`) whose configured header is set on requests to this host. `path_prefix` (optional, e.g. `/group/app.git`) limits the rule to request paths under that prefix, matched on whole path segments with the query string ignored; rules are evaluated in order and the first match wins, so list path-scoped rules before a host-wide rule for the same host.
 - **`secrets`** — named `{ "header", "value" }` pairs injected by the sidecar. Keys are referenced from `inject` in rules; the header name is arbitrary (e.g. `Authorization`, `PRIVATE-TOKEN`), and values are redacted in logs and never forwarded to the sandbox.
 
 > [!NOTE]
-> A rule with `methods` set to anything other than `["*"]` causes that host to be intercepted (MITM'd) regardless of the `intercept` mode, so the method can be enforced after TLS termination. Such hosts require the shared CA, which is installed into every egress sandbox automatically.
+> A rule with `methods` set to anything other than `["*"]` causes that host to be intercepted (MITM'd) regardless of the `intercept` mode, so the method can be enforced after TLS termination; the same holds for any host with a `path_prefix` rule, so the path can be matched. Such hosts require the shared CA, which is installed into every egress sandbox automatically.
 
 #### Refreshing egress policy on a live session
 

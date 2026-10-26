@@ -95,7 +95,7 @@ class EgressAddon:
     def request(self, flow) -> None:
         host = flow.request.pretty_host
         try:
-            decision = self._store.current().evaluate(host, flow.request.method)
+            decision = self._store.current().evaluate(host, flow.request.method, flow.request.path)
         except Exception:
             # Fail closed: deny and never fall through to the credential-injection branch.
             logger.exception("egress: error evaluating %s %s; failing closed (deny)", flow.request.method, host)

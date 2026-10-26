@@ -449,3 +449,82 @@ def test_policy_store_missing_from_the_start_does_not_warn(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
         store.current()
     assert caplog.text == ""
+
+
+SCOPED_SECRETS = {"main": {"header": "Authorization", "value": "M"}, "mod": {"header": "Authorization", "value": "S"}}
+
+
+def _scoped(*rules, secrets=None, intercept="all"):
+    cfg = _cfg(intercept=intercept, rules=list(rules), secrets=secrets or {})
+    return PolicyEvaluator.from_config(cfg)
+
+
+def test_path_scoped_rule_wins_for_its_repo():
+    p = _scoped(
+        {"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"},
+        {"host": "gitlab.com", "inject": "main"},
+        secrets=SCOPED_SECRETS,
+    )
+    assert p.evaluate("gitlab.com", "GET", "/g/mod.git/info/refs").inject == ("Authorization", "S")
+    assert p.evaluate("gitlab.com", "POST", "/g/app.git/git-receive-pack").inject == ("Authorization", "M")
+
+
+def test_path_prefix_matches_whole_segments_only():
+    p = _scoped(
+        {"host": "gitlab.com", "path_prefix": "/g/app.git", "inject": "mod"},
+        {"host": "gitlab.com", "inject": "main"},
+        secrets=SCOPED_SECRETS,
+    )
+    assert p.evaluate("gitlab.com", "GET", "/g/app.git-old/info/refs").inject == ("Authorization", "M")
+    assert p.evaluate("gitlab.com", "GET", "/g/app.git").inject == ("Authorization", "S")
+
+
+def test_path_prefix_ignores_query_string():
+    p = _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"}, secrets=SCOPED_SECRETS)
+    assert p.evaluate("gitlab.com", "GET", "/g/mod.git/info/refs?service=git-upload-pack").allow
+    assert p.evaluate("gitlab.com", "GET", "/g/mod.git?x=/y").allow
+    assert not p.evaluate("gitlab.com", "GET", "/g/other.git?x=/g/mod.git").allow
+
+
+def test_connect_reaches_host_with_only_path_scoped_rules():
+    p = _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"}, secrets=SCOPED_SECRETS)
+    decision = p.evaluate("gitlab.com", "CONNECT")
+    assert decision.allow and decision.intercept
+
+
+def test_connect_intercepts_when_path_scoped_rule_precedes_host_wide_injecting_rule_under_credentialed():
+    p = _scoped(
+        {"host": "gitlab.com", "path_prefix": "/g/mod.git"},
+        {"host": "gitlab.com", "inject": "main"},
+        secrets=SCOPED_SECRETS,
+        intercept="credentialed",
+    )
+    decision = p.evaluate("gitlab.com", "CONNECT")
+    assert decision.allow and decision.intercept
+
+
+def test_connect_without_path_scoped_rules_keeps_credentialed_passthrough():
+    p = _scoped({"host": "gitlab.com"}, intercept="credentialed")
+    decision = p.evaluate("gitlab.com", "CONNECT")
+    assert decision.allow and not decision.intercept
+
+
+def test_unmatched_path_on_path_only_host_falls_to_default():
+    p = _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"}, secrets=SCOPED_SECRETS)
+    decision = p.evaluate("gitlab.com", "GET", "/g/other.git/info/refs")
+    assert not decision.allow and decision.block.code == "host-not-listed"
+
+
+def test_method_not_allowed_cites_only_rules_matching_the_path():
+    p = _scoped(
+        {"host": "gitlab.com", "path_prefix": "/g/mod.git", "methods": ["GET"]},
+        {"host": "gitlab.com", "path_prefix": "/g/app.git", "methods": ["GET", "POST"]},
+    )
+    decision = p.evaluate("gitlab.com", "POST", "/g/mod.git/git-receive-pack")
+    assert decision.block.code == "method-not-allowed" and decision.block.methods == ("GET",)
+
+
+@pytest.mark.parametrize("prefix", ["g/mod.git", "", "/g/mod.git/", "/g/mod.git?x", "/g/mod git"])
+def test_from_config_rejects_invalid_path_prefix(prefix):
+    with pytest.raises(ValueError):
+        _scoped({"host": "gitlab.com", "path_prefix": prefix})

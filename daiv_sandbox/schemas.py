@@ -235,6 +235,13 @@ class EgressRule(BaseModel):
     host: str = Field(description="Destination host glob (e.g. 'github.com', '*.githubusercontent.com').")
     methods: list[str] = Field(default_factory=lambda: ["*"], description="Allowed HTTP methods, or ['*'] for any.")
     inject: str | None = Field(default=None, description="Name of the secret whose header is injected for this host.")
+    path_prefix: str | None = Field(
+        default=None,
+        description=(
+            "Request path prefix this rule is limited to, matched on whole path segments "
+            "(e.g. '/group/app.git'); None matches every path."
+        ),
+    )
 
     @field_validator("host", mode="after")
     @classmethod
@@ -244,6 +251,22 @@ class EgressRule(BaseModel):
         # malformed rule. Reject it here rather than letting it silently no-op (cf. EgressSecret's guards).
         if not value or any(c.isspace() or ord(c) < 0x20 for c in value):
             raise ValueError("host must be a non-empty glob without whitespace or control characters")
+        return value
+
+    @field_validator("path_prefix", mode="after")
+    @classmethod
+    def _valid_path_prefix(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if (
+            not value.startswith("/")
+            or value.endswith("/")
+            or any(c.isspace() or ord(c) < 0x20 or c in "?#" for c in value)
+        ):
+            raise ValueError(
+                "path_prefix must start with '/', not end with '/', and contain no whitespace, "
+                "control characters, '?' or '#'"
+            )
         return value
 
     @field_validator("methods", mode="after")

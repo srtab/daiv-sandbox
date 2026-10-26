@@ -84,3 +84,19 @@ def test_to_sidecar_config_unwraps_secrets_and_dumps_policy():
     assert cfg["secrets"]["gh"] == {"header": "Authorization", "value": "Bearer t"}
     assert cfg["policy"]["rules"][0]["host"] == "github.com"
     assert cfg["policy"]["default"] == "deny"
+
+
+def test_rule_path_prefix_defaults_to_none():
+    assert EgressRule(host="gitlab.com").path_prefix is None
+
+
+@pytest.mark.parametrize(
+    "prefix", ["", "group/app.git", "/g/app.git?x", "/g/app .git", "/g/app.git/", "/g/app#x", "/g/a\x00"]
+)
+def test_rule_rejects_invalid_path_prefix(prefix):
+    with pytest.raises(ValidationError):
+        EgressRule(host="gitlab.com", path_prefix=prefix)
+
+
+def test_rule_accepts_valid_path_prefix():
+    assert EgressRule(host="gitlab.com", path_prefix="/g/app.git").path_prefix == "/g/app.git"

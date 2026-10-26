@@ -53,6 +53,20 @@ class _Rule:
     host: str
     methods: tuple[str, ...]
     inject: str | None
+    path_prefix: str | None = None
+
+    def matches_path(self, path: str | None) -> bool:
+        if self.path_prefix is None or path is None:
+            return True
+        return path == self.path_prefix or path.startswith(self.path_prefix + "/")
+
+
+def _valid_path_prefix(prefix: str) -> bool:
+    return (
+        prefix.startswith("/")
+        and not prefix.endswith("/")
+        and not any(c.isspace() or ord(c) < 0x20 or c in "?#" for c in prefix)
+    )
 
 
 class PolicyEvaluator:
@@ -99,7 +113,10 @@ class PolicyEvaluator:
             inject = r.get("inject")
             if inject is not None and inject not in secrets:
                 raise ValueError(f"egress: rule for host {r.get('host')!r} references unknown secret {inject!r}")
-            rules.append(_Rule(host=r["host"].lower(), methods=methods, inject=inject))
+            path_prefix = r.get("path_prefix")
+            if path_prefix is not None and not (isinstance(path_prefix, str) and _valid_path_prefix(path_prefix)):
+                raise ValueError(f"egress: rule for host {r.get('host')!r} has invalid path_prefix {path_prefix!r}")
+            rules.append(_Rule(host=r["host"].lower(), methods=methods, inject=inject, path_prefix=path_prefix))
         # Unknown default/intercept values are a misconfiguration: fail closed (deny / full MITM) and warn
         # rather than relying on `== "allow"`/`== "all"` to accidentally do the safe thing for a typo.
         default = policy.get("default", "deny")
@@ -118,8 +135,10 @@ class PolicyEvaluator:
             f"default={self._default} intercept={self._intercept} rules={len(self._rules)} secrets={len(self._secrets)}"
         )
 
-    def _match(self, host: str, method: str) -> tuple[_Rule | None, _Rule | None]:
-        """Return (rule allowing host+method, first rule whose host matched at all).
+    def _match(self, host: str, method: str, path: str | None) -> tuple[_Rule | None, _Rule | None]:
+        """Return (rule allowing host+method+path, first rule whose host and path matched at all).
+
+        `path` is None at the CONNECT phase, where every path-scoped rule still matches.
 
         `host` is already lower-cased and `method` already upper-cased by evaluate(); rule hosts are
         lower-cased in from_config, so fnmatchcase (which skips the redundant os.path.normcase that
@@ -129,7 +148,7 @@ class PolicyEvaluator:
         """
         host_match: _Rule | None = None
         for rule in self._rules:
-            if fnmatch.fnmatchcase(host, rule.host):
+            if fnmatch.fnmatchcase(host, rule.host) and rule.matches_path(path):
                 if host_match is None:
                     host_match = rule  # first host glob that matched — the rule to cite on a method deny
                 # CONNECT is a host-reachability check: the TLS tunnel hasn't been established yet, so
@@ -139,14 +158,21 @@ class PolicyEvaluator:
                     return rule, host_match
         return None, host_match
 
-    def evaluate(self, host: str, method: str) -> Decision:
+    def _host_has_path_scoped_rule(self, host: str) -> bool:
+        return any(r.path_prefix is not None and fnmatch.fnmatchcase(host, r.host) for r in self._rules)
+
+    def evaluate(self, host: str, method: str, path: str | None = None) -> Decision:
         host = host.lower()  # case-insensitive host matching; rule hosts are lower-cased in from_config
         method = method.upper()
-        rule, host_match = self._match(host, method)
+        if path is not None:
+            path = path.split("?", 1)[0]
+        rule, host_match = self._match(host, method, path)
         if rule is not None:
             inject = self._secrets.get(rule.inject) if rule.inject else None
             method_restricted = "*" not in rule.methods
             intercept = self._intercept == "all" or inject is not None or method_restricted
+            if method == "CONNECT" and self._host_has_path_scoped_rule(host):
+                intercept = True
             return Decision(allow=True, intercept=intercept, inject=inject)
         # No rule allows host+method. If the host IS listed in a rule but this (non-CONNECT) method
         # isn't permitted, the operator constrained that host -> deny regardless of `default`

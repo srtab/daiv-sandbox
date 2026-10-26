@@ -25,9 +25,9 @@ def _write_cfg(tmp_path, **kw):
     return str(path)
 
 
-def _flow(host="github.com", method="GET"):
+def _flow(host="github.com", method="GET", path="/"):
     headers = {}
-    request = types.SimpleNamespace(pretty_host=host, host=host, method=method, headers=headers)
+    request = types.SimpleNamespace(pretty_host=host, host=host, method=method, headers=headers, path=path)
     return types.SimpleNamespace(request=request, response=None)
 
 
@@ -230,3 +230,25 @@ def test_tls_clienthello_does_not_passthrough_denied_host(tmp_path):
     data = types.SimpleNamespace(client_hello=types.SimpleNamespace(sni="evil.example"), ignore_connection=False)
     a.tls_clienthello(data)
     assert data.ignore_connection is False
+
+
+def test_request_passes_path_to_policy(tmp_path):
+    a = EgressAddon(
+        _write_cfg(
+            tmp_path,
+            rules=[
+                {"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"},
+                {"host": "gitlab.com", "inject": "main"},
+            ],
+            secrets={
+                "main": {"header": "Authorization", "value": "M"},
+                "mod": {"header": "Authorization", "value": "S"},
+            },
+        )
+    )
+    scoped = _flow(host="gitlab.com", path="/g/mod.git/info/refs?service=git-upload-pack")
+    a.request(scoped)
+    other = _flow(host="gitlab.com", path="/g/app.git/info/refs?service=git-upload-pack")
+    a.request(other)
+    assert scoped.request.headers["Authorization"] == "S"
+    assert other.request.headers["Authorization"] == "M"
