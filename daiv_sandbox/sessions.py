@@ -130,12 +130,15 @@ EXIT_CODE_TIMEOUT = 124  # matches timeout(1)
 
 _EXEC_MARKER_ENV = "DAIV_SANDBOX_EXEC_ID"
 _KILL_GRACE_SECONDS = 3
+_KILL_WAIT_SECONDS = 5.0
+_KILL_NO_GREP_EXIT = 3
 # Docker keeps an exec's output stream open for up to 2s after its process exits.
 _OUTPUT_DRAIN_SECONDS = 3.0
 _READER_STOP_WAIT_SECONDS = 1.0
 
 _KILL_TREE_SCRIPT = r"""
 exec 2>/dev/null
+command -v grep >/dev/null || exit 3
 entry=$1
 grace=$2
 scan() {
@@ -637,6 +640,7 @@ class SandboxDockerSession:
             command=["-lc", "sleep infinity"],  # long-lived; reaper owns the lifetime
             detach=True,
             tty=True,
+            init=True,
             runtime=settings.RUNTIME,
             user=self._get_user(),
             **kwargs,
@@ -692,8 +696,8 @@ class SandboxDockerSession:
         Stop the container without removing it, preserving its writable layer for warm reuse.
 
         Idempotent: a missing container is logged and ignored; an already-stopped container is a
-        Docker no-op. PID 1 is ``sleep``, which ignores SIGTERM, so ``stop`` waits the (small)
-        ``STOP_TIMEOUT_SECONDS`` and then SIGKILLs — the filesystem is preserved either way.
+        Docker no-op. ``stop`` sends SIGTERM (which a pre-init container's PID 1 ``sleep`` ignores) and
+        SIGKILLs after the (small) ``STOP_TIMEOUT_SECONDS`` — the filesystem is preserved either way.
 
         A container that vanished between the lookup and the stop counts as already-stopped. Any
         other Docker error (daemon busy, stop conflict) is raised as ``SessionUnavailableError`` so
@@ -860,7 +864,8 @@ class SandboxDockerSession:
 
     def _exec_with_timeout(self, argv: list[str], workdir: str, timeout: float) -> _ExecOutcome:
         """
-        Run *argv* and, once *timeout* passes, kill it and every process it started.
+        Run *argv* and, once *timeout* passes, kill it and every process it started. The timeout counts from
+        before the exec is set up, and the kill is waited on for at most ``_KILL_WAIT_SECONDS``.
 
         Output is read on a helper thread as it arrives, so what the command printed survives the kill.
         Each exec carries a random marker variable that every process it starts inherits;
@@ -868,6 +873,7 @@ class SandboxDockerSession:
         ``exec_inspect`` is a host PID that does not map into a gVisor sandbox. If the stream is still open
         after the kill, it is closed from this end so the reader thread never outlives the call.
         """
+        deadline = time.monotonic() + timeout
         api = self.client.api
         marker = secrets.token_hex(16)
         exec_id = api.exec_create(
@@ -880,10 +886,23 @@ class SandboxDockerSession:
         stream = api.exec_start(exec_id, stream=True)
         reader = _OutputReader(stream)
         reader.start()
-        reader.join(timeout)
+        reader.join(max(0.0, deadline - time.monotonic()))
         timed_out = reader.is_alive()
         if timed_out:
-            self._kill_command_tree(f"{_EXEC_MARKER_ENV}={marker}")
+            killer = threading.Thread(
+                target=self._kill_command_tree,
+                args=(f"{_EXEC_MARKER_ENV}={marker}",),
+                name="daiv-sandbox-exec-kill",
+                daemon=True,
+            )
+            killer.start()
+            killer.join(_KILL_WAIT_SECONDS)
+            if killer.is_alive():
+                logger.error(
+                    "Killing the timed-out command in %s took over %.0fs; returning without waiting for it",
+                    self.container.short_id,
+                    _KILL_WAIT_SECONDS,
+                )
             reader.join(_OUTPUT_DRAIN_SECONDS)
 
         with suppress(OSError, DockerException):
@@ -918,7 +937,9 @@ class SandboxDockerSession:
         except Exception:
             logger.exception("Failed to kill the timed-out command in %s", self.container.short_id)
             return
-        if result.exit_code != 0:
+        if result.exit_code == _KILL_NO_GREP_EXIT:
+            logger.warning("Cannot kill the timed-out command in %s: the image has no grep", self.container.short_id)
+        elif result.exit_code != 0:
             logger.warning(
                 "Processes of the timed-out command in %s survived SIGKILL (kill script exit %s)",
                 self.container.short_id,

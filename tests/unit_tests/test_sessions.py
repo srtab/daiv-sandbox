@@ -12,6 +12,7 @@ from docker.models.images import Image
 from daiv_sandbox.config import settings
 from daiv_sandbox.sessions import (
     _GREP_BAD_PATTERN_EXIT,
+    _KILL_NO_GREP_EXIT,
     _KILL_TREE_SCRIPT,
     _PATH_ABSENT_EXIT,
     _PATH_DENIED_EXIT,
@@ -103,6 +104,7 @@ def test__start_container(mock_docker_client):
         command=["-lc", "sleep infinity"],
         detach=True,
         tty=True,
+        init=True,
         runtime=settings.RUNTIME,
         user=f"{settings.RUN_UID}:{settings.RUN_GID}",
     )
@@ -566,6 +568,46 @@ def test_execute_command_timeout_closes_a_stream_the_kill_left_open(mock_docker_
     assert result.output.startswith("before\n")
     assert stream.closed
     assert _reader_threads() == []
+
+
+def test_execute_command_timeout_does_not_wait_on_a_stuck_kill(mock_docker_client, monkeypatch):
+    monkeypatch.setattr("daiv_sandbox.sessions._KILL_WAIT_SECONDS", 0.1)
+    monkeypatch.setattr("daiv_sandbox.sessions._OUTPUT_DRAIN_SECONDS", 0.1)
+    stream = _FakeExecStream([b"before\n"], block=True)
+    session = _timed_session(mock_docker_client, stream)
+    kill_released = threading.Event()
+    session.container.exec_run.side_effect = lambda *a, **k: kill_released.wait(10)
+
+    started = time.monotonic()
+    result = session.execute_command("sleep 300", timeout=0.2)
+    kill_released.set()
+
+    assert time.monotonic() - started < 2
+    assert result.timed_out
+    assert stream.closed
+
+
+def test_execute_command_timeout_counts_exec_setup(mock_docker_client, monkeypatch):
+    stream = _FakeExecStream([], block=True)
+    session = _timed_session(mock_docker_client, stream)
+    session.container.exec_run.side_effect = lambda *a, **k: (stream.released.set(), ExecResult(0, b""))[1]
+    environment = session._get_exec_environment()
+    monkeypatch.setattr(session, "_get_exec_environment", lambda: (time.sleep(0.5), environment)[1])
+
+    started = time.monotonic()
+    result = session.execute_command("sleep 300", timeout=0.5)
+
+    assert result.timed_out
+    assert time.monotonic() - started < 0.9
+
+
+def test_kill_command_tree_warns_when_the_image_has_no_grep(mock_docker_client, caplog):
+    assert f"command -v grep >/dev/null || exit {_KILL_NO_GREP_EXIT}" in _KILL_TREE_SCRIPT
+    session = SandboxDockerSession(session_id="test-session-id")
+    session.container = MagicMock()
+    session.container.exec_run.return_value = ExecResult(exit_code=_KILL_NO_GREP_EXIT, output=b"")
+    session._kill_command_tree("DAIV_SANDBOX_EXEC_ID=x")
+    assert "has no grep" in caplog.text
 
 
 def test_execute_command_with_timeout_raises_a_stream_error(mock_docker_client):

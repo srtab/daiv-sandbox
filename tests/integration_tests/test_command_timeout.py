@@ -1,3 +1,4 @@
+import functools
 import time
 from typing import TYPE_CHECKING
 
@@ -18,16 +19,15 @@ _PROCESS_SCAN = (
 )
 
 
-def _available_runtimes() -> list:
-    runtimes = docker.from_env().info().get("Runtimes", {})
-    return [
-        pytest.param(name, marks=pytest.mark.skipif(name not in runtimes, reason=f"{name} runtime not installed"))
-        for name in ("runc", "runsc")
-    ]
+@functools.cache
+def _docker_runtimes() -> frozenset[str]:
+    return frozenset(docker.from_env().info().get("Runtimes", {}))
 
 
-@pytest.fixture(params=_available_runtimes())
+@pytest.fixture(params=["runc", "runsc"])
 def runtime(request, monkeypatch) -> str:
+    if request.param not in _docker_runtimes():
+        pytest.skip(f"{request.param} runtime not installed")
     monkeypatch.setattr(settings, "RUNTIME", request.param)
     return request.param
 
@@ -40,10 +40,14 @@ def _run(client: TestClient, session_id: str, command: str, timeout: int) -> dic
     return results[0]
 
 
-def _live_processes_matching(client: TestClient, session_id: str, needle: str) -> list[str]:
+def _processes(client: TestClient, session_id: str) -> list[str]:
     scan = _run(client, session_id, _PROCESS_SCAN, timeout=0)
     assert scan["exit_code"] == 0, scan
-    return [line for line in scan["output"].splitlines() if needle in line and not line.startswith("Z ")]
+    return scan["output"].splitlines()
+
+
+def _live_processes_matching(client: TestClient, session_id: str, needle: str) -> list[str]:
+    return [line for line in _processes(client, session_id) if needle in line and not line.startswith("Z ")]
 
 
 def test_timeout_returns_partial_output_and_kills_the_command(
@@ -70,7 +74,9 @@ def test_timeout_kills_child_processes(
     result = _run(client, session_id, "sleep 3017 & sleep 3017", timeout=2)
 
     assert result["timed_out"] is True
-    assert _live_processes_matching(client, session_id, "sleep 3017") == []
+    processes = _processes(client, session_id)
+    assert [line for line in processes if "sleep 3017" in line] == []
+    assert [line for line in processes if line.startswith("Z ")] == []
 
 
 def test_timeout_kills_children_that_left_the_session_or_cleared_their_environment(
