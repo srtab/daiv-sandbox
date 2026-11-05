@@ -136,30 +136,32 @@ _KILL_NO_GREP_EXIT = 3
 _OUTPUT_DRAIN_SECONDS = 3.0
 _READER_STOP_WAIT_SECONDS = 1.0
 
-_KILL_TREE_SCRIPT = r"""
-exec 2>/dev/null
-command -v grep >/dev/null || exit 3
+_KILL_TREE_SCRIPT = (
+    f"exec 2>/dev/null\ncommand -v grep >/dev/null || exit {_KILL_NO_GREP_EXIT}\n"
+    + r"""
 entry=$1
 grace=$2
+nl='
+'
 scan() {
   pids=
-  leaders=" "
+  marked=" "
   for f in $(grep -lF -e "$entry" /proc/[0-9]*/environ); do
     p=${f#/proc/}
-    p=${p%/environ}
-    read -r stat < "/proc/$p/stat" || continue
-    set -- ${stat##*) }
-    [ "$1" = Z ] && continue
-    pids="$pids $p"
-    if [ "$3" = "$p" ] || [ "$4" = "$p" ]; then leaders="$leaders$p "; fi
+    marked="$marked${p%/environ} "
   done
-  [ "$leaders" = " " ] && return
-  for f in /proc/[0-9]*/stat; do
-    read -r stat < "$f" || continue
-    set -- ${stat##*) }
+  [ "$marked" = " " ] && return
+  stats=$(grep -h '' /proc/[0-9]*/stat)
+  set -f
+  IFS=$nl
+  for line in $stats; do
+    IFS=' '
+    set -- ${line##*) }
     [ "$1" = Z ] && continue
-    case "$leaders" in *" $3 "* | *" $4 "*) p=${f#/proc/}; pids="$pids ${p%/stat}" ;; esac
+    case "$marked" in *" ${line%% *} "* | *" $3 "* | *" $4 "*) pids="$pids ${line%% *}" ;; esac
   done
+  unset IFS
+  set +f
 }
 if sleep 0.01; then step=0.2 ticks=$((grace * 5)); else step=1 ticks=$grace; fi
 scan
@@ -179,6 +181,7 @@ for _ in 1 2 3 4 5; do
 done
 exit 1
 """
+)
 
 
 class _ExecOutcome(NamedTuple):
@@ -838,16 +841,10 @@ class SandboxDockerSession:
                 command_workdir,
                 timeout,
             )
-            separator = "\n" if output and not output.endswith("\n") else ""
-            return RunResult(
-                command=command,
-                output=f"{output}{separator}Command timed out after {timeout:.0f}s and was killed.",
-                exit_code=outcome.exit_code,
-                timed_out=True,
-                workdir=command_workdir,
-            )
-
-        if logger.isEnabledFor(logging.DEBUG):
+            if output and not output.endswith("\n"):
+                output += "\n"
+            output += f"Command timed out after {timeout:.0f}s and was killed."
+        elif logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "Command in %s:%s exited with code %s: %s",
                 self.container.short_id,
@@ -860,18 +857,21 @@ class SandboxDockerSession:
                 "Command in %s:%s exited with code %s", self.container.short_id, command_workdir, outcome.exit_code
             )
 
-        return RunResult(command=command, output=output, exit_code=outcome.exit_code, workdir=command_workdir)
+        return RunResult(
+            command=command,
+            output=output,
+            exit_code=outcome.exit_code,
+            timed_out=outcome.timed_out,
+            workdir=command_workdir,
+        )
 
     def _exec_with_timeout(self, argv: list[str], workdir: str, timeout: float) -> _ExecOutcome:
         """
         Run *argv* and, once *timeout* passes, kill it and every process it started. The timeout counts from
         before the exec is set up, and the kill is waited on for at most ``_KILL_WAIT_SECONDS``.
 
-        Output is read on a helper thread as it arrives, so what the command printed survives the kill.
-        Each exec carries a random marker variable that every process it starts inherits;
-        ``_kill_command_tree`` finds them by it from inside the container, because the PID from
-        ``exec_inspect`` is a host PID that does not map into a gVisor sandbox. If the stream is still open
-        after the kill, it is closed from this end so the reader thread never outlives the call.
+        Processes are found by a random marker variable they all inherit, not by ``exec_inspect``'s PID, which
+        is a host PID that does not map into a gVisor sandbox.
         """
         deadline = time.monotonic() + timeout
         api = self.client.api
@@ -889,9 +889,9 @@ class SandboxDockerSession:
         reader.join(max(0.0, deadline - time.monotonic()))
         timed_out = reader.is_alive()
         if timed_out:
+            killed: list[bool] = []
             killer = threading.Thread(
-                target=self._kill_command_tree,
-                args=(f"{_EXEC_MARKER_ENV}={marker}",),
+                target=lambda: killed.append(self._kill_command_tree(f"{_EXEC_MARKER_ENV}={marker}")),
                 name="daiv-sandbox-exec-kill",
                 daemon=True,
             )
@@ -903,7 +903,8 @@ class SandboxDockerSession:
                     self.container.short_id,
                     _KILL_WAIT_SECONDS,
                 )
-            reader.join(_OUTPUT_DRAIN_SECONDS)
+            if killed == [True]:
+                reader.join(_OUTPUT_DRAIN_SECONDS)
 
         with suppress(OSError, DockerException):
             stream.close()
@@ -919,15 +920,15 @@ class SandboxDockerSession:
             raise reader.error
         return _ExecOutcome(reader.output(), api.exec_inspect(exec_id)["ExitCode"], timed_out=False)
 
-    def _kill_command_tree(self, marker_entry: str) -> None:
+    def _kill_command_tree(self, marker_entry: str) -> bool:
         """
         SIGTERM every process of a timed-out command, then SIGKILL whatever is left after the grace period.
 
         ``_KILL_TREE_SCRIPT`` targets the processes whose environment holds *marker_entry*, plus every member
-        of a session or process group one of them leads, which catches children that replaced their
-        environment. It runs as the sandbox user: reading another user's ``/proc/<pid>/environ`` needs
-        CAP_SYS_PTRACE, which Docker does not grant by default. Failures are logged, never raised, so the
-        caller still returns the partial output.
+        of a session or process group whose ID is one of theirs (a live PID used as a session or group ID is
+        that session's or group's leader), which catches children that replaced their environment. It runs as
+        the sandbox user: reading another user's ``/proc/<pid>/environ`` needs CAP_SYS_PTRACE, which Docker
+        does not grant by default. Returns whether everything is gone; failures are logged, never raised.
         """
         try:
             result = self.container.exec_run(
@@ -936,7 +937,7 @@ class SandboxDockerSession:
             )
         except Exception:
             logger.exception("Failed to kill the timed-out command in %s", self.container.short_id)
-            return
+            return False
         if result.exit_code == _KILL_NO_GREP_EXIT:
             logger.warning("Cannot kill the timed-out command in %s: the image has no grep", self.container.short_id)
         elif result.exit_code != 0:
@@ -945,6 +946,7 @@ class SandboxDockerSession:
                 self.container.short_id,
                 result.exit_code,
             )
+        return result.exit_code == 0
 
     def _run_path_guarded(self, path: str, body: str, *, require: str | None = None) -> RunResult:
         """Run *body* only if *path* exists (and, when *require* is given, has the expected type and

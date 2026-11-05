@@ -56,12 +56,12 @@ def test_timeout_returns_partial_output_and_kills_the_command(
     session_id = sandbox_session(base_image="alpine:latest")
 
     started = time.monotonic()
-    result = _run(client, session_id, "echo before; sleep 3017", timeout=2)
+    result = _run(client, session_id, "echo before; sleep 3017", timeout=1)
 
-    assert time.monotonic() - started < 2 + 10
+    assert time.monotonic() - started < 1 + 10
     assert result["exit_code"] == 124
     assert result["timed_out"] is True
-    assert result["output"] == "before\nCommand timed out after 2s and was killed."
+    assert result["output"] == "before\nCommand timed out after 1s and was killed."
     assert _live_processes_matching(client, session_id, "sleep 3017") == []
 
 
@@ -71,7 +71,7 @@ def test_timeout_kills_child_processes(
 ):
     session_id = sandbox_session(base_image=base_image)
 
-    result = _run(client, session_id, "sleep 3017 & sleep 3017", timeout=2)
+    result = _run(client, session_id, "sleep 3017 & sleep 3017", timeout=1)
 
     assert result["timed_out"] is True
     processes = _processes(client, session_id)
@@ -84,15 +84,18 @@ def test_timeout_kills_children_that_left_the_session_or_cleared_their_environme
 ):
     session_id = sandbox_session(base_image="alpine:latest")
 
-    result = _run(client, session_id, "setsid sleep 3017 & env -i sleep 3017 & sleep 3017", timeout=2)
+    result = _run(client, session_id, "setsid sleep 3017 & env -i sleep 3017 & sleep 3017", timeout=1)
 
     assert result["timed_out"] is True
     assert _live_processes_matching(client, session_id, "sleep 3017") == []
 
 
-def test_next_request_does_not_overlap_the_killed_command(client: TestClient, sandbox_session: Callable[..., str]):
+def test_next_request_does_not_overlap_the_killed_command(
+    client: TestClient, sandbox_session: Callable[..., str], monkeypatch
+):
     """The killed command ignores SIGTERM, so only the SIGKILL after the grace period stops it; the next
     request must still see it fully stopped rather than running alongside it."""
+    monkeypatch.setattr("daiv_sandbox.sessions._KILL_GRACE_SECONDS", 1)
     session_id = sandbox_session(base_image="alpine:latest")
     ticker = "trap '' TERM; while :; do echo tick >> /workspace/tmp/ticks; sleep 0.1; done"
 
@@ -104,7 +107,7 @@ def test_next_request_does_not_overlap_the_killed_command(client: TestClient, sa
     check = _run(
         client,
         session_id,
-        "a=$(wc -l < /workspace/tmp/ticks); sleep 1; b=$(wc -l < /workspace/tmp/ticks); echo $a $b",
+        "a=$(wc -l < /workspace/tmp/ticks); sleep 0.5; b=$(wc -l < /workspace/tmp/ticks); echo $a $b",
         0,
     )
     before, after = check["output"].split()
