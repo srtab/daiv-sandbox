@@ -41,7 +41,8 @@ class RunRequest(BaseModel):
         default=None,
         ge=0,
         description=(
-            "Maximum execution time in seconds for each command. "
+            "Maximum execution time in seconds for each command. A command that exceeds it is killed, "
+            "along with every process it started, and the remaining commands are skipped. "
             "Overrides the server default (DAIV_SANDBOX_COMMAND_TIMEOUT). "
             "0 means no timeout."
         ),
@@ -52,6 +53,13 @@ class RunResult(BaseModel):
     command: str = Field(description="Command that was executed.")
     output: str = Field(description="Output of the command.")
     exit_code: int = Field(description="Exit code of the command.")
+    timed_out: bool = Field(
+        default=False,
+        description=(
+            "True when the command exceeded its timeout and was killed with every process it started. "
+            "`exit_code` is then 124 and `output` holds what it printed before it was killed."
+        ),
+    )
     workdir: str = Field(description="Working directory of the command.", exclude=True)
 
 

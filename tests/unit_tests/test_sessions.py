@@ -1,16 +1,18 @@
 import io
 import tarfile
+import threading
 import time
 from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
-from docker.errors import APIError, ImageNotFound, NotFound
+from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from docker.models.containers import ExecResult
 from docker.models.images import Image
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.sessions import (
     _GREP_BAD_PATTERN_EXIT,
+    _KILL_TREE_SCRIPT,
     _PATH_ABSENT_EXIT,
     _PATH_DENIED_EXIT,
     _PATH_WRONG_TYPE_EXIT,
@@ -442,6 +444,134 @@ def test_execute_command_pipefail_propagates_exit_code(mock_docker_client):
         user=f"{settings.RUN_UID}:{settings.RUN_GID}",
         environment=EXPECTED_EXEC_ENV,
     )
+
+
+class _FakeExecStream:
+    """Stands in for docker's CancellableStream: yields *chunks*, then, if *block*, waits until released."""
+
+    def __init__(self, chunks: list[bytes], *, block: bool = False, error: Exception | None = None):
+        self._chunks = chunks
+        self._block = block
+        self._error = error
+        self.released = threading.Event()
+        self.closed = False
+
+    def __iter__(self):
+        yield from self._chunks
+        if self._error is not None:
+            raise self._error
+        if self._block:
+            self.released.wait(10)
+
+    def close(self):
+        self.closed = True
+        self.released.set()
+
+
+def _timed_session(mock_docker_client, stream: _FakeExecStream, exit_code: int = 0) -> SandboxDockerSession:
+    session = SandboxDockerSession(session_id="test-session-id")
+    session.container = MagicMock(id="container-id")
+    mock_docker_client.api.exec_create.return_value = {"Id": "exec-id"}
+    mock_docker_client.api.exec_start.return_value = stream
+    mock_docker_client.api.exec_inspect.return_value = {"ExitCode": exit_code}
+    return session
+
+
+def _exec_marker(mock_docker_client) -> str:
+    return mock_docker_client.api.exec_create.call_args.kwargs["environment"]["DAIV_SANDBOX_EXEC_ID"]
+
+
+def _reader_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "daiv-sandbox-exec-output"]
+
+
+def test_execute_command_with_timeout_matches_untimed_result(mock_docker_client):
+    """A command that finishes in time keeps the untimed contract: same argv, workdir, user, env (plus the
+    marker), UTF-8 decoding with replacement, and the exit code from exec_inspect. Nothing is killed."""
+    stream = _FakeExecStream([b"a\xff", b"b\n"])
+    session = _timed_session(mock_docker_client, stream, exit_code=3)
+
+    result = session.execute_command("false | true", timeout=30)
+
+    assert (result.output, result.exit_code, result.timed_out) == ("a\ufffdb\n", 3, False)
+    create = mock_docker_client.api.exec_create.call_args
+    assert create.args == ("container-id", ["/bin/sh", "-c", PIPEFAIL_WRAPPER, "--", "false | true"])
+    assert create.kwargs["workdir"] == SANDBOX_ROOT
+    assert create.kwargs["user"] == f"{settings.RUN_UID}:{settings.RUN_GID}"
+    environment = dict(create.kwargs["environment"])
+    assert len(environment.pop("DAIV_SANDBOX_EXEC_ID")) == 32
+    assert environment == EXPECTED_EXEC_ENV
+    session.container.exec_run.assert_not_called()
+    assert stream.closed
+    assert _reader_threads() == []
+
+
+def test_execute_command_uses_a_fresh_marker_per_exec(mock_docker_client):
+    session = _timed_session(mock_docker_client, _FakeExecStream([]))
+    session.execute_command("true", timeout=30)
+    first = _exec_marker(mock_docker_client)
+    mock_docker_client.api.exec_start.return_value = _FakeExecStream([])
+    session.execute_command("true", timeout=30)
+    assert _exec_marker(mock_docker_client) != first
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected"),
+    [
+        ([b"before\n"], "before\nCommand timed out after 0s and was killed."),
+        ([b"no newline"], "no newline\nCommand timed out after 0s and was killed."),
+        ([], "Command timed out after 0s and was killed."),
+    ],
+)
+def test_execute_command_timeout_kills_tree_and_keeps_partial_output(mock_docker_client, chunks, expected):
+    stream = _FakeExecStream(chunks, block=True)
+    session = _timed_session(mock_docker_client, stream)
+
+    def kill(*args, **kwargs):
+        stream.released.set()
+        return ExecResult(exit_code=0, output=b"")
+
+    session.container.exec_run.side_effect = kill
+
+    result = session.execute_command("echo before; sleep 300", timeout=0.2)
+
+    assert (result.output, result.exit_code, result.timed_out) == (expected, 124, True)
+    session.container.exec_run.assert_called_once_with(
+        ["/bin/sh", "-c", _KILL_TREE_SCRIPT, "--", f"DAIV_SANDBOX_EXEC_ID={_exec_marker(mock_docker_client)}", "3"],
+        user=f"{settings.RUN_UID}:{settings.RUN_GID}",
+    )
+    mock_docker_client.api.exec_inspect.assert_not_called()
+    assert _reader_threads() == []
+
+
+@pytest.mark.parametrize(
+    "kill_outcome", [ExecResult(exit_code=1, output=b""), APIError("exec failed")], ids=["survivors", "kill-exec-error"]
+)
+def test_execute_command_timeout_closes_a_stream_the_kill_left_open(mock_docker_client, monkeypatch, kill_outcome):
+    """If the stream is still open after the kill, it is closed from our end: the call returns within its
+    bound with the partial output, and no reader thread is left blocked."""
+    monkeypatch.setattr("daiv_sandbox.sessions._OUTPUT_DRAIN_SECONDS", 0.1)
+    stream = _FakeExecStream([b"before\n"], block=True)
+    session = _timed_session(mock_docker_client, stream)
+    if isinstance(kill_outcome, Exception):
+        session.container.exec_run.side_effect = kill_outcome
+    else:
+        session.container.exec_run.return_value = kill_outcome
+
+    started = time.monotonic()
+    result = session.execute_command("sleep 300", timeout=0.2)
+
+    assert time.monotonic() - started < 2
+    assert result.timed_out
+    assert result.output.startswith("before\n")
+    assert stream.closed
+    assert _reader_threads() == []
+
+
+def test_execute_command_with_timeout_raises_a_stream_error(mock_docker_client):
+    session = _timed_session(mock_docker_client, _FakeExecStream([b"x"], error=DockerException("stream broke")))
+    with pytest.raises(DockerException, match="stream broke"):
+        session.execute_command("echo x", timeout=30)
 
 
 def test_copy_to_container_with_relative_dest(mock_docker_client):
