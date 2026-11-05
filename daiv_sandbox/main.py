@@ -73,8 +73,6 @@ logger = logging.getLogger(__name__)
 
 HEADER_API_KEY_NAME = "X-API-Key"
 
-EXIT_CODE_TIMEOUT = 124  # matches timeout(1) convention
-
 # One-shot seed guard marker. Lives in the sandbox home (outside /workspace) so it is container-local
 # and not reachable through the fs/* endpoints; written/read via exec as root.
 SEED_MARKER = f"{SANDBOX_HOME}/.daiv-seeded"
@@ -419,26 +417,10 @@ async def run_on_session(
 
         results: list[RunResult] = []
         for command in request.commands:
-            try:
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(cmd_executor.execute_command, command), timeout=effective_timeout
-                )
-            except TimeoutError:
-                # The underlying OS thread running exec_run cannot be interrupted and continues
-                # until the Docker command finishes. Container state is indeterminate, so we stop
-                # executing further commands. Resources are reclaimed when the session is closed.
-                results.append(
-                    RunResult(
-                        command=command,
-                        output=f"Command timed out after {effective_timeout:.0f}s",
-                        exit_code=EXIT_CODE_TIMEOUT,
-                        workdir=SANDBOX_ROOT,
-                    )
-                )
-                break
+            result = await asyncio.to_thread(cmd_executor.execute_command, command, timeout=effective_timeout)
             results.append(result)
 
-            if request.fail_fast and result.exit_code != 0:
+            if result.timed_out or (request.fail_fast and result.exit_code != 0):
                 break
 
         return RunResponse(results=results)

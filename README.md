@@ -249,7 +249,7 @@ To run commands on a sandbox session, call `POST /session/{session_id}/` using t
 
 By default, all commands are executed sequentially regardless of their exit codes. Set `fail_fast` to `true` to stop on the first non-zero exit code. Pipelines run with `pipefail`, so a failing stage in `cmd1 | cmd2` correctly propagates a non-zero exit code.
 
-Set `timeout` (seconds) to cap each command's wall-clock time. A command that exceeds the timeout is terminated with exit code `124` and any remaining commands in the request are skipped. Omitting `timeout` falls back to the server default (`DAIV_SANDBOX_COMMAND_TIMEOUT`, `0` = no timeout).
+Set `timeout` (seconds) to cap each command's wall-clock time. A command that exceeds the timeout is killed along with every process it started (background jobs, test workers, servers): they get `SIGTERM`, then `SIGKILL` after a 3-second grace period. Its result has `timed_out: true` and exit code `124`, and its `output` holds what it printed before it was killed, followed by a `Command timed out after {N}s and was killed.` line. Any remaining commands in the request are skipped. The response is sent, and the session lock released, only once those processes are gone, which adds up to about 10 seconds past the timeout. Omitting `timeout` falls back to the server default (`DAIV_SANDBOX_COMMAND_TIMEOUT`, `0` = no timeout).
 
 Commands mutate the container workspace in place. To recover the changes made during a session, run git (or any diff tool) inside `/workspace/repo` — e.g. `git diff` / `git status` — through this same endpoint; the workspace is the single source of truth.
 
@@ -277,11 +277,19 @@ The response will be a JSON object with the following structure:
     {
       "command": "ls -la",
       "output": "total 12\ndrwxr-xr-x 3 root root 4096 Nov 20 20:28 .\ndrwxrwxrwt 1 root root 4096 Nov 20 20:28 ..\ndrwxrwxr-x 3 root root 4096 Nov 14 14:39 django-webhooks-master\n",
-      "exit_code": 0
+      "exit_code": 0,
+      "timed_out": false
     }
   ]
 }
 ```
+
+| Field       | Description                                                                                                                                 |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`   | The command that was run.                                                                                                                   |
+| `output`    | Combined stdout and stderr, decoded as UTF-8 (invalid bytes become `U+FFFD`).                                                               |
+| `exit_code` | The command's exit code; `124` when it timed out.                                                                                           |
+| `timed_out` | `true` when the command exceeded `timeout` and was killed. Check this field rather than `exit_code`, since a command can exit `124` itself. |
 
 Here is an example using `python` that seeds a session and then runs commands:
 

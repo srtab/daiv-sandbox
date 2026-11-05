@@ -4,21 +4,24 @@ import fnmatch
 import io
 import logging
 import posixpath
+import secrets
 import tarfile
 import tempfile
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import IO, TYPE_CHECKING, NamedTuple
 
 from docker import DockerClient, from_env
-from docker.errors import APIError, ImageNotFound, NotFound
+from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.schemas import RunResult
 
 if TYPE_CHECKING:
     from docker.models.containers import Container
+    from docker.types import CancellableStream
 
 logger = logging.getLogger("daiv_sandbox")
 
@@ -122,6 +125,90 @@ _PATH_DENIED_EXIT = 9
 # natural exit 6 from grep/xargs can never survive to the Python-side check below. 6 is also outside
 # the path-guard sentinel range (7/8/9), so the two sentinel schemes don't overlap.
 _GREP_BAD_PATTERN_EXIT = 6
+
+EXIT_CODE_TIMEOUT = 124  # matches timeout(1)
+
+_EXEC_MARKER_ENV = "DAIV_SANDBOX_EXEC_ID"
+_KILL_GRACE_SECONDS = 3
+_KILL_WAIT_SECONDS = 5.0
+_KILL_NO_GREP_EXIT = 3
+# Docker keeps an exec's output stream open for up to 2s after its process exits.
+_OUTPUT_DRAIN_SECONDS = 3.0
+_READER_STOP_WAIT_SECONDS = 1.0
+
+_KILL_TREE_SCRIPT = (
+    f"exec 2>/dev/null\ncommand -v grep >/dev/null || exit {_KILL_NO_GREP_EXIT}\n"
+    + r"""
+entry=$1
+grace=$2
+nl='
+'
+scan() {
+  pids=
+  marked=" "
+  for f in $(grep -lF -e "$entry" /proc/[0-9]*/environ); do
+    p=${f#/proc/}
+    marked="$marked${p%/environ} "
+  done
+  [ "$marked" = " " ] && return
+  stats=$(grep -h '' /proc/[0-9]*/stat)
+  set -f
+  IFS=$nl
+  for line in $stats; do
+    IFS=' '
+    set -- ${line##*) }
+    [ "$1" = Z ] && continue
+    case "$marked" in *" ${line%% *} "* | *" $3 "* | *" $4 "*) pids="$pids ${line%% *}" ;; esac
+  done
+  unset IFS
+  set +f
+}
+if sleep 0.01; then step=0.2 ticks=$((grace * 5)); else step=1 ticks=$grace; fi
+scan
+[ -n "$pids" ] || exit 0
+kill -TERM $pids
+while [ "$ticks" -gt 0 ]; do
+  sleep "$step"
+  scan
+  [ -n "$pids" ] || exit 0
+  ticks=$((ticks - 1))
+done
+for _ in 1 2 3 4 5; do
+  kill -KILL $pids
+  sleep "$step"
+  scan
+  [ -n "$pids" ] || exit 0
+done
+exit 1
+"""
+)
+
+
+class _ExecOutcome(NamedTuple):
+    output: bytes
+    exit_code: int
+    timed_out: bool
+
+
+class _OutputReader(threading.Thread):
+    """Collect an exec's output stream on its own thread, so the caller can stop waiting at a deadline
+    and still have everything the command printed up to then."""
+
+    def __init__(self, stream: CancellableStream):
+        super().__init__(name="daiv-sandbox-exec-output", daemon=True)
+        self._stream = stream
+        self._chunks: list[bytes] = []
+        self.error: Exception | None = None
+
+    def run(self) -> None:
+        try:
+            for chunk in self._stream:
+                self._chunks.append(chunk)
+        except Exception as exc:
+            self.error = exc
+
+    def output(self) -> bytes:
+        return b"".join(self._chunks.copy())
 
 
 def _sh_quote(value: str) -> str:
@@ -556,6 +643,7 @@ class SandboxDockerSession:
             command=["-lc", "sleep infinity"],  # long-lived; reaper owns the lifetime
             detach=True,
             tty=True,
+            init=True,
             runtime=settings.RUNTIME,
             user=self._get_user(),
             **kwargs,
@@ -611,8 +699,8 @@ class SandboxDockerSession:
         Stop the container without removing it, preserving its writable layer for warm reuse.
 
         Idempotent: a missing container is logged and ignored; an already-stopped container is a
-        Docker no-op. PID 1 is ``sleep``, which ignores SIGTERM, so ``stop`` waits the (small)
-        ``STOP_TIMEOUT_SECONDS`` and then SIGKILLs — the filesystem is preserved either way.
+        Docker no-op. ``stop`` sends SIGTERM (which a pre-init container's PID 1 ``sleep`` ignores) and
+        SIGKILLs after the (small) ``STOP_TIMEOUT_SECONDS`` — the filesystem is preserved either way.
 
         A container that vanished between the lookup and the stop counts as already-stopped. Any
         other Docker error (daemon busy, stop conflict) is raised as ``SessionUnavailableError`` so
@@ -715,46 +803,150 @@ class SandboxDockerSession:
         if result.exit_code != 0:
             raise RuntimeError(f"egress: update-ca-certificates failed (exit {result.exit_code}): {result.output!r}")
 
-    def execute_command(self, command: str, workdir: str | None = None) -> RunResult:
+    def execute_command(self, command: str, workdir: str | None = None, *, timeout: float | None = None) -> RunResult:
         """
         Execute a command in the container.
 
         Args:
             command (str): The command to execute.
             workdir (str | None): The working directory of the command. Defaults to SANDBOX_ROOT.
+            timeout (float | None): Seconds the command may run before it is killed along with every process it
+                started. None waits for it to finish.
 
         Returns:
-            RunResult: The result of the command.
+            RunResult: The result of the command. A timed-out command has ``timed_out`` set, exit code 124, and
+                the output it printed before it was killed.
         """
         command_workdir = _resolve_under_root(workdir)
 
         logger.info("Executing command in %s:%s -> '%s'", self.container.short_id, command_workdir, command)
 
-        result = self.container.exec_run(
-            ["/bin/sh", "-c", PIPEFAIL_WRAPPER, "--", command],
-            workdir=command_workdir,
-            user=self._get_user(),
-            environment=self._get_exec_environment(),
-        )
+        argv = ["/bin/sh", "-c", PIPEFAIL_WRAPPER, "--", command]
+        if timeout is None:
+            result = self.container.exec_run(
+                argv, workdir=command_workdir, user=self._get_user(), environment=self._get_exec_environment()
+            )
+            outcome = _ExecOutcome(result.output, result.exit_code, timed_out=False)
+        else:
+            outcome = self._exec_with_timeout(argv, command_workdir, timeout)
 
         # Decode the output to UTF-8, replacing invalid characters with U+FFFD. This is to avoid raising an exception
         # when the output contains invalid characters.
-        output = result.output.decode("utf-8", errors="replace")
+        output = outcome.output.decode("utf-8", errors="replace")
 
-        if logger.isEnabledFor(logging.DEBUG):
+        if outcome.timed_out:
+            logger.warning(
+                "Command in %s:%s timed out after %.0fs and was killed",
+                self.container.short_id,
+                command_workdir,
+                timeout,
+            )
+            if output and not output.endswith("\n"):
+                output += "\n"
+            output += f"Command timed out after {timeout:.0f}s and was killed."
+        elif logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "Command in %s:%s exited with code %s: %s",
                 self.container.short_id,
                 command_workdir,
-                result.exit_code,
+                outcome.exit_code,
                 output,
             )
-        elif result.exit_code != 0:
+        elif outcome.exit_code != 0:
             logger.warning(
-                "Command in %s:%s exited with code %s", self.container.short_id, command_workdir, result.exit_code
+                "Command in %s:%s exited with code %s", self.container.short_id, command_workdir, outcome.exit_code
             )
 
-        return RunResult(command=command, output=output, exit_code=result.exit_code, workdir=command_workdir)
+        return RunResult(
+            command=command,
+            output=output,
+            exit_code=outcome.exit_code,
+            timed_out=outcome.timed_out,
+            workdir=command_workdir,
+        )
+
+    def _exec_with_timeout(self, argv: list[str], workdir: str, timeout: float) -> _ExecOutcome:
+        """
+        Run *argv* and, once *timeout* passes, kill it and every process it started. The timeout counts from
+        before the exec is set up, and the kill is waited on for at most ``_KILL_WAIT_SECONDS``.
+
+        Processes are found by a random marker variable they all inherit, not by ``exec_inspect``'s PID, which
+        is a host PID that does not map into a gVisor sandbox.
+        """
+        deadline = time.monotonic() + timeout
+        api = self.client.api
+        marker = secrets.token_hex(16)
+        exec_id = api.exec_create(
+            self.container.id,
+            argv,
+            workdir=workdir,
+            user=self._get_user(),
+            environment={**self._get_exec_environment(), _EXEC_MARKER_ENV: marker},
+        )["Id"]
+        stream = api.exec_start(exec_id, stream=True)
+        reader = _OutputReader(stream)
+        reader.start()
+        reader.join(max(0.0, deadline - time.monotonic()))
+        timed_out = reader.is_alive()
+        if timed_out:
+            killed: list[bool] = []
+            killer = threading.Thread(
+                target=lambda: killed.append(self._kill_command_tree(f"{_EXEC_MARKER_ENV}={marker}")),
+                name="daiv-sandbox-exec-kill",
+                daemon=True,
+            )
+            killer.start()
+            killer.join(_KILL_WAIT_SECONDS)
+            if killer.is_alive():
+                logger.error(
+                    "Killing the timed-out command in %s took over %.0fs; returning without waiting for it",
+                    self.container.short_id,
+                    _KILL_WAIT_SECONDS,
+                )
+            if killed == [True]:
+                reader.join(_OUTPUT_DRAIN_SECONDS)
+
+        with suppress(OSError, DockerException):
+            stream.close()
+        reader.join(_READER_STOP_WAIT_SECONDS)
+        if reader.is_alive():
+            logger.error(
+                "Output reader for an exec in %s did not stop after its stream was closed", self.container.short_id
+            )
+
+        if timed_out:
+            return _ExecOutcome(reader.output(), EXIT_CODE_TIMEOUT, timed_out=True)
+        if reader.error is not None:
+            raise reader.error
+        return _ExecOutcome(reader.output(), api.exec_inspect(exec_id)["ExitCode"], timed_out=False)
+
+    def _kill_command_tree(self, marker_entry: str) -> bool:
+        """
+        SIGTERM every process of a timed-out command, then SIGKILL whatever is left after the grace period.
+
+        ``_KILL_TREE_SCRIPT`` targets the processes whose environment holds *marker_entry*, plus every member
+        of a session or process group whose ID is one of theirs (a live PID used as a session or group ID is
+        that session's or group's leader), which catches children that replaced their environment. It runs as
+        the sandbox user: reading another user's ``/proc/<pid>/environ`` needs CAP_SYS_PTRACE, which Docker
+        does not grant by default. Returns whether everything is gone; failures are logged, never raised.
+        """
+        try:
+            result = self.container.exec_run(
+                ["/bin/sh", "-c", _KILL_TREE_SCRIPT, "--", marker_entry, str(_KILL_GRACE_SECONDS)],
+                user=self._get_user(),
+            )
+        except Exception:
+            logger.exception("Failed to kill the timed-out command in %s", self.container.short_id)
+            return False
+        if result.exit_code == _KILL_NO_GREP_EXIT:
+            logger.warning("Cannot kill the timed-out command in %s: the image has no grep", self.container.short_id)
+        elif result.exit_code != 0:
+            logger.warning(
+                "Processes of the timed-out command in %s survived SIGKILL (kill script exit %s)",
+                self.container.short_id,
+                result.exit_code,
+            )
+        return result.exit_code == 0
 
     def _run_path_guarded(self, path: str, body: str, *, require: str | None = None) -> RunResult:
         """Run *body* only if *path* exists (and, when *require* is given, has the expected type and
