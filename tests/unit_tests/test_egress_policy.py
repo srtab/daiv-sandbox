@@ -5,7 +5,14 @@ import os
 
 import pytest
 
-from daiv_sandbox.egress.policy import REASON_HOST_NOT_LISTED, REASON_METHOD_NOT_ALLOWED, PolicyEvaluator, PolicyStore
+from daiv_sandbox.egress.policy import (
+    REASON_HOST_NOT_LISTED,
+    REASON_METHOD_NOT_ALLOWED,
+    BlockReason,
+    PolicyEvaluator,
+    PolicyStore,
+    valid_path_prefix,
+)
 
 
 def _cfg(default="deny", intercept="all", rules=None, secrets=None):
@@ -449,3 +456,145 @@ def test_policy_store_missing_from_the_start_does_not_warn(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
         store.current()
     assert caplog.text == ""
+
+
+SCOPED_SECRETS = {"main": {"header": "Authorization", "value": "M"}, "mod": {"header": "Authorization", "value": "S"}}
+
+
+MOD_RULE = {"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"}
+MAIN_RULE = {"host": "gitlab.com", "inject": "main"}
+
+
+def _scoped(*rules, intercept="all"):
+    return PolicyEvaluator.from_config(_cfg(intercept=intercept, rules=list(rules), secrets=SCOPED_SECRETS))
+
+
+def test_path_scoped_rule_wins_for_its_repo():
+    p = _scoped(MOD_RULE, MAIN_RULE)
+    assert p.evaluate("gitlab.com", "GET", "/g/mod.git/info/refs").inject == ("Authorization", "S")
+    assert p.evaluate("gitlab.com", "POST", "/g/app.git/git-receive-pack").inject == ("Authorization", "M")
+
+
+def test_path_prefix_matches_whole_segments_only():
+    p = _scoped({"host": "gitlab.com", "path_prefix": "/g/app.git", "inject": "mod"}, MAIN_RULE)
+    assert p.evaluate("gitlab.com", "GET", "/g/app.git-old/info/refs").inject == ("Authorization", "M")
+    assert p.evaluate("gitlab.com", "GET", "/g/app.git").inject == ("Authorization", "S")
+
+
+def test_path_prefix_ignores_query_string():
+    p = _scoped(MOD_RULE)
+    assert p.evaluate("gitlab.com", "GET", "/g/mod.git/info/refs?service=git-upload-pack").allow
+    assert p.evaluate("gitlab.com", "GET", "/g/mod.git?x=/y").allow
+    assert not p.evaluate("gitlab.com", "GET", "/g/other.git?x=/g/mod.git").allow
+
+
+def test_connect_reaches_host_with_only_path_scoped_rules():
+    assert _scoped(MOD_RULE).evaluate("gitlab.com", "CONNECT").allow
+
+
+def test_connect_intercepts_when_path_scoped_rule_precedes_host_wide_injecting_rule_under_credentialed():
+    p = _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git"}, MAIN_RULE, intercept="credentialed")
+    decision = p.evaluate("gitlab.com", "CONNECT")
+    assert decision.allow and decision.intercept
+
+
+def test_connect_without_path_scoped_rules_keeps_credentialed_passthrough():
+    p = _scoped({"host": "gitlab.com"}, intercept="credentialed")
+    decision = p.evaluate("gitlab.com", "CONNECT")
+    assert decision.allow and not decision.intercept
+
+
+def test_connect_intercepts_when_a_later_host_rule_injects_under_credentialed():
+    p = _scoped({"host": "gitlab.com"}, MAIN_RULE, intercept="credentialed")
+    decision = p.evaluate("gitlab.com", "CONNECT")
+    assert decision.allow and decision.intercept
+
+
+def test_connect_method_with_a_path_is_matched_on_that_path():
+    p = _scoped(MOD_RULE, MAIN_RULE)
+    assert p.evaluate("gitlab.com", "CONNECT", "/g/app.git/info/refs").inject == ("Authorization", "M")
+
+
+def test_unmatched_path_on_path_only_host_reports_path_not_listed():
+    p = _scoped(MOD_RULE)
+    decision = p.evaluate("gitlab.com", "GET", "/g/other.git/info/refs?x=1")
+    assert not decision.allow
+    assert decision.block == BlockReason("path-not-listed", path="/g/other.git/info/refs")
+
+
+@pytest.mark.parametrize("methods", [["GET"], ["GET", "POST"], ["POST"]])
+def test_from_config_rejects_path_prefix_combined_with_methods(methods):
+    with pytest.raises(ValueError, match="path_prefix"):
+        _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "methods": methods})
+
+
+def test_from_config_accepts_path_prefix_with_wildcard_methods():
+    p = _scoped({"host": "gitlab.com", "path_prefix": "/g/mod.git", "methods": ["*"]})
+    assert p.evaluate("gitlab.com", "POST", "/g/mod.git/x").allow
+
+
+def test_policy_store_path_prefix_with_methods_is_deny_all(tmp_path):
+    path = tmp_path / "config.json"
+    cfg = _cfg(default="allow", rules=[{"host": "gitlab.com", "path_prefix": "/g/mod.git", "methods": ["GET"]}])
+    path.write_text(json.dumps(cfg))
+    assert not PolicyStore(str(path)).current().evaluate("example.com", "GET", "/").allow
+
+
+def test_missing_path_does_not_match_a_path_scoped_rule_for_a_request():
+    p = _scoped(MOD_RULE)
+    decision = p.evaluate("gitlab.com", "GET")
+    assert not decision.allow and decision.block.code == "path-not-listed"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "",
+        "g/mod.git",
+        "/g/mod.git/",
+        "/g/mod.git?x",
+        "/g/mod#x",
+        "/g/mod git",
+        "/g/a\x00",
+        "/g/mod\x7f.git",
+        "/g/./mod.git",
+        "/g/../mod.git",
+        "/g/%2e%2E/x",
+        "/g\\..\\x",
+    ],
+)
+def test_valid_path_prefix_rejects(prefix):
+    assert not valid_path_prefix(prefix)
+
+
+def test_from_config_rejects_invalid_path_prefix():
+    with pytest.raises(ValueError, match="invalid path_prefix"):
+        _scoped({"host": "gitlab.com", "path_prefix": "/g/../mod.git"})
+
+
+DOT_SEGMENT_PATHS = [
+    "/g/mod.git/../app.git/git-receive-pack",
+    "/g/mod.git/./info/refs",
+    "/g/mod.git/%2e%2e/app.git/x",
+    "/g/mod.git/%2E%2e/app.git/x",
+    "/g/mod.git/..%2fapp.git/x",
+    "/g/mod.git/..%5Capp.git/x",
+    "/g/mod.git/..\\app.git/x",
+]
+
+
+@pytest.mark.parametrize("path", DOT_SEGMENT_PATHS)
+def test_dot_segments_do_not_inherit_path_scoped_secret(path):
+    p = _scoped(MOD_RULE, MAIN_RULE)
+    assert p.evaluate("gitlab.com", "POST", path).inject == ("Authorization", "M")
+
+
+@pytest.mark.parametrize("path", DOT_SEGMENT_PATHS)
+def test_dot_segments_are_denied_on_path_only_host(path):
+    p = _scoped(MOD_RULE)
+    assert not p.evaluate("gitlab.com", "GET", path).allow
+
+
+def test_dotted_names_are_not_dot_segments():
+    p = _scoped(MOD_RULE)
+    assert p.evaluate("gitlab.com", "GET", "/g/mod.git/.hidden/..a/b..").allow

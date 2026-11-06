@@ -25,8 +25,8 @@ def _write_cfg(tmp_path, **kw):
     return str(path)
 
 
-def _flow(host="github.com", method="GET", **request_fields):
-    request = types.SimpleNamespace(host=host, host_header=host, method=method, headers={})
+def _flow(host="github.com", method="GET", path="/", **request_fields):
+    request = types.SimpleNamespace(host=host, host_header=host, method=method, headers={}, path=path)
     vars(request).update(request_fields)
     return types.SimpleNamespace(request=request, response=None)
 
@@ -172,12 +172,28 @@ def test_blocked_request_logs_method_not_allowed_with_matched_rule(tmp_path, cap
     its currently-allowed methods — the data needed to extend that rule."""
     a = EgressAddon(_write_cfg(tmp_path, rules=[{"host": "*.github.com", "methods": ["GET", "POST"]}]))
     with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
-        a.requestheaders(_flow(host="api.github.com", method="DELETE"))
+        a.requestheaders(_flow(host="api.github.com", method="DELETE", path="/services/hunter2"))
     msg = caplog.text
     assert "DELETE" in msg and "api.github.com" in msg
     assert "method-not-allowed" in msg
     assert "*.github.com" in msg  # matched rule host glob
     assert "GET" in msg and "POST" in msg  # currently-allowed methods
+    assert "hunter2" not in msg
+
+
+def test_blocked_request_on_path_only_host_logs_path_not_listed(tmp_path, caplog):
+    a = EgressAddon(
+        _write_cfg(
+            tmp_path,
+            rules=[{"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"}],
+            secrets={"mod": {"header": "Authorization", "value": "S"}},
+        )
+    )
+    with caplog.at_level(logging.WARNING, logger="daiv_sandbox.egress"):
+        a.requestheaders(_flow(host="gitlab.com", path="/g/other.git/info/refs?token=hunter2"))
+    assert "reason=path-not-listed" in caplog.text
+    assert "'/g/other.git/info/refs'" in caplog.text
+    assert "hunter2" not in caplog.text
 
 
 def test_blocked_request_on_unlisted_host_logs_host_not_listed(tmp_path, caplog):
@@ -306,3 +322,25 @@ def test_tls_clienthello_does_not_passthrough_denied_host(tmp_path):
     data = types.SimpleNamespace(client_hello=types.SimpleNamespace(sni="evil.example"), ignore_connection=False)
     a.tls_clienthello(data)
     assert data.ignore_connection is False
+
+
+def test_request_passes_path_to_policy(tmp_path):
+    a = EgressAddon(
+        _write_cfg(
+            tmp_path,
+            rules=[
+                {"host": "gitlab.com", "path_prefix": "/g/mod.git", "inject": "mod"},
+                {"host": "gitlab.com", "inject": "main"},
+            ],
+            secrets={
+                "main": {"header": "Authorization", "value": "M"},
+                "mod": {"header": "Authorization", "value": "S"},
+            },
+        )
+    )
+    scoped = _flow(host="gitlab.com", path="/g/mod.git/info/refs?service=git-upload-pack")
+    a.requestheaders(scoped)
+    other = _flow(host="gitlab.com", path="/g/app.git/info/refs?service=git-upload-pack")
+    a.requestheaders(other)
+    assert scoped.request.headers["Authorization"] == "S"
+    assert other.request.headers["Authorization"] == "M"

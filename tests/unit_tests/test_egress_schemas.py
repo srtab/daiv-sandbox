@@ -84,3 +84,30 @@ def test_to_sidecar_config_unwraps_secrets_and_dumps_policy():
     assert cfg["secrets"]["gh"] == {"header": "Authorization", "value": "Bearer t"}
     assert cfg["policy"]["rules"][0]["host"] == "github.com"
     assert cfg["policy"]["default"] == "deny"
+
+
+def test_rule_path_prefix_defaults_to_none():
+    assert EgressRule(host="gitlab.com").path_prefix is None
+
+
+def test_rule_rejects_invalid_path_prefix():
+    with pytest.raises(ValidationError, match="path_prefix"):
+        EgressRule(host="gitlab.com", path_prefix="/g/../app.git")
+
+
+def test_rule_accepts_valid_path_prefix():
+    assert EgressRule(host="gitlab.com", path_prefix="/g/app.git").path_prefix == "/g/app.git"
+
+
+@pytest.mark.parametrize("methods", [["GET"], ["get", "POST"]])
+def test_rule_rejects_path_prefix_combined_with_methods(methods):
+    with pytest.raises(ValidationError, match="path_prefix"):
+        EgressRule(host="gitlab.com", path_prefix="/g/app.git", methods=methods)
+
+
+def test_rule_accepts_path_prefix_with_wildcard_methods():
+    assert EgressRule(host="gitlab.com", path_prefix="/g/app.git", methods=["*"]).methods == ["*"]
+
+
+def test_rule_accepts_methods_without_path_prefix():
+    assert EgressRule(host="gitlab.com", methods=["GET"]).methods == ["GET"]
