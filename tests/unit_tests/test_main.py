@@ -270,24 +270,40 @@ def test_run_commands_single_command_fail_fast_true(mock_session, client):  # no
     assert mock_session.execute_command.call_count == 1
 
 
-def test_run_commands_timeout_returns_124(mock_session, client):
-    """A command that exceeds its timeout is reported with exit code 124 and a 'timed out' message.
+def _timed_out(command: str, output: str) -> RunResult:
+    return RunResult(command=command, output=output, exit_code=124, timed_out=True, workdir="/workspace/repo")
 
-    `execute_command` raising TimeoutError stands in for the wall-clock timeout: asyncio.wait_for
-    propagates it into the same handler that a real timeout hits."""
-    mock_session.execute_command.side_effect = TimeoutError
-    resp = client.post(f"/session/{mock_session.session_id}/", json={"commands": ["sleep 99"], "timeout": 5})
+
+def test_run_commands_timeout_returns_124(mock_session, client):
+    """A timed-out command comes back with exit 124, `timed_out`, and the output it printed before the kill."""
+    output = "before\nCommand timed out after 5s and was killed."
+    mock_session.execute_command.return_value = _timed_out("echo before; sleep 99", output)
+    resp = client.post(
+        f"/session/{mock_session.session_id}/", json={"commands": ["echo before; sleep 99"], "timeout": 5}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["results"] == [
+        {"command": "echo before; sleep 99", "output": output, "exit_code": 124, "timed_out": True}
+    ]
+    mock_session.execute_command.assert_called_once_with("echo before; sleep 99", timeout=5.0)
+
+
+def test_run_commands_exit_124_alone_does_not_stop_the_sequence(mock_session, client):
+    """Only `timed_out` marks a timeout: a command that itself exits 124 is an ordinary result."""
+    mock_session.execute_command.return_value = RunResult(
+        command="echo", output="ok", exit_code=124, workdir="/workspace/repo"
+    )
+    resp = client.post(f"/session/{mock_session.session_id}/", json={"commands": ["echo", "next"], "timeout": 5})
     assert resp.status_code == 200, resp.text
     results = resp.json()["results"]
-    assert len(results) == 1
-    assert results[0]["exit_code"] == 124
-    assert "timed out after 5s" in results[0]["output"].lower()
+    assert [r["timed_out"] for r in results] == [False, False]
+    assert mock_session.execute_command.call_count == 2
 
 
 def test_run_commands_timeout_stops_remaining_commands(mock_session, client):
     """A timeout terminates the sequence: later commands in the same request are not executed."""
     mock_session.execute_command.side_effect = [
-        TimeoutError,
+        _timed_out("cmd1", "Command timed out after 3s and was killed."),
         RunResult(command="cmd2", output="should not run", exit_code=0, workdir="/workspace/repo"),
     ]
     resp = client.post(f"/session/{mock_session.session_id}/", json={"commands": ["cmd1", "cmd2"], "timeout": 3})
@@ -301,19 +317,19 @@ def test_run_commands_timeout_stops_remaining_commands(mock_session, client):
 def test_run_commands_request_timeout_overrides_server_default(mock_session, client, monkeypatch):
     """The request `timeout` wins over the server default (DAIV_SANDBOX_COMMAND_TIMEOUT)."""
     monkeypatch.setattr(settings, "COMMAND_TIMEOUT", 99)
-    mock_session.execute_command.side_effect = TimeoutError
+    mock_session.execute_command.return_value = _timed_out("x", "")
     resp = client.post(f"/session/{mock_session.session_id}/", json={"commands": ["x"], "timeout": 5})
     assert resp.status_code == 200, resp.text
-    assert "timed out after 5s" in resp.json()["results"][0]["output"].lower()
+    mock_session.execute_command.assert_called_once_with("x", timeout=5.0)
 
 
 def test_run_commands_uses_server_default_timeout_when_unset(mock_session, client, monkeypatch):
     """Omitting `timeout` falls back to the server default."""
     monkeypatch.setattr(settings, "COMMAND_TIMEOUT", 7)
-    mock_session.execute_command.side_effect = TimeoutError
+    mock_session.execute_command.return_value = _timed_out("x", "")
     resp = client.post(f"/session/{mock_session.session_id}/", json={"commands": ["x"]})
     assert resp.status_code == 200, resp.text
-    assert "timed out after 7s" in resp.json()["results"][0]["output"].lower()
+    mock_session.execute_command.assert_called_once_with("x", timeout=7.0)
 
 
 def test_run_commands_zero_timeout_disables_timeout(mock_session, client, monkeypatch):
@@ -329,6 +345,7 @@ def test_run_commands_zero_timeout_disables_timeout(mock_session, client, monkey
     assert len(results) == 1
     assert results[0]["exit_code"] == 0
     assert results[0]["output"] == "ok"
+    mock_session.execute_command.assert_called_once_with("echo", timeout=None)
 
 
 def test_run_commands_returns_conflict_when_session_is_locked(mock_session, client, monkeypatch):
