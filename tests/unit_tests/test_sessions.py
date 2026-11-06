@@ -33,6 +33,8 @@ from daiv_sandbox.sessions import (
     _validate_sandbox_path,
 )
 
+EXPECTED_SANDBOX_DIRS = (WORKSPACE_ROOT, SANDBOX_ROOT, EXTRA_REPOS_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT)
+
 EXPECTED_EXEC_ENV = {
     "HOME": SANDBOX_HOME,
     "XDG_CACHE_HOME": f"{SANDBOX_HOME}/.cache",
@@ -115,23 +117,9 @@ def test__start_container(mock_docker_client):
     assert session.container.id == mock_docker_client.containers.run.return_value.id
     assert session.session_id == mock_docker_client.containers.run.return_value.id
     # Should create sandbox directories and chown them
+    mock_container.exec_run.assert_any_call(["mkdir", "-p", "--", *EXPECTED_SANDBOX_DIRS], user="root")
     mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, EXTRA_REPOS_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
-        user="root",
-    )
-    mock_container.exec_run.assert_any_call(
-        [
-            "chown",
-            f"{settings.RUN_UID}:{settings.RUN_GID}",
-            "--",
-            WORKSPACE_ROOT,
-            SANDBOX_ROOT,
-            EXTRA_REPOS_ROOT,
-            SANDBOX_HOME,
-            SKILLS_ROOT,
-            SCRATCH_ROOT,
-        ],
-        user="root",
+        ["chown", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", *EXPECTED_SANDBOX_DIRS], user="root"
     )
 
 
@@ -1311,24 +1299,10 @@ def test_start_container_creates_skills_root(mock_docker_client):
     session._start_container("alpine:latest")
 
     # mkdir -p was called including SKILLS_ROOT alongside the other roots.
-    mock_container.exec_run.assert_any_call(
-        ["mkdir", "-p", "--", WORKSPACE_ROOT, SANDBOX_ROOT, EXTRA_REPOS_ROOT, SANDBOX_HOME, SKILLS_ROOT, SCRATCH_ROOT],
-        user="root",
-    )
+    mock_container.exec_run.assert_any_call(["mkdir", "-p", "--", *EXPECTED_SANDBOX_DIRS], user="root")
     # chown was called for SKILLS_ROOT alongside the other roots.
     mock_container.exec_run.assert_any_call(
-        [
-            "chown",
-            f"{settings.RUN_UID}:{settings.RUN_GID}",
-            "--",
-            WORKSPACE_ROOT,
-            SANDBOX_ROOT,
-            EXTRA_REPOS_ROOT,
-            SANDBOX_HOME,
-            SKILLS_ROOT,
-            SCRATCH_ROOT,
-        ],
-        user="root",
+        ["chown", f"{settings.RUN_UID}:{settings.RUN_GID}", "--", *EXPECTED_SANDBOX_DIRS], user="root"
     )
 
 

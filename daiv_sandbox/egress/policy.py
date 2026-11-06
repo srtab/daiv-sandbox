@@ -118,7 +118,7 @@ class PolicyEvaluator:
         rules = []
         for r in policy.get("rules", []):
             # Hostnames are case-insensitive (RFC 4343): normalise the rule host to lower-case so host
-            # matching cannot be bypassed by varying the case of the requested host (see _match/evaluate).
+            # matching cannot be bypassed by varying the case of the requested host (see evaluate).
             methods = tuple(m.upper() for m in r.get("methods", ["*"]))
             # Re-enforce the wire schema's invariant (EgressRule._upper) independently: an empty methods
             # list yields a host reachable via CONNECT but blocking every request. The config file is the

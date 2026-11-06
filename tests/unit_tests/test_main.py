@@ -736,6 +736,7 @@ def test_seed_session_invalid_archive_returns_422(mock_session, client, kind):
     )
     assert resp.status_code == 422
     assert resp.json()["detail"].startswith(f"{kind}_archive is invalid:")
+    assert mock_session.container.exec_run.call_count == 1, "the seeded marker must not be written"
 
 
 def test_seed_session_marker_write_failure_returns_500(mock_session, client):
