@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import glob
 import json
 import logging
@@ -7,24 +8,39 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import sentry_sdk
 from docker.errors import NotFound
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, UploadFile, status
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, Security, UploadFile, WebSocket, status
 from fastapi import Path as FastAPIPath
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
+from pydantic import ValidationError
 from redis.asyncio import Redis
 
 from daiv_sandbox import __version__
 from daiv_sandbox.activity import NoopSessionActivityTracker, RedisSessionActivityTracker
+from daiv_sandbox.browser import (
+    BROWSER_USER,
+    DEVTOOLS_PORT,
+    BrowserImageUnavailableError,
+    BrowserManager,
+    BrowserNotReadyError,
+    ExtensionInvalidError,
+    ExtensionMissingError,
+    probe_browser_image,
+)
 from daiv_sandbox.config import settings
 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, SessionBusyError
 from daiv_sandbox.logs import LOGGING_CONFIG
 from daiv_sandbox.reaper import start_reaper
+from daiv_sandbox.relay import open_exec_stream
 from daiv_sandbox.schemas import (
+    BrowserStartRequest,
+    BrowserStartResponse,
+    BrowserStopResponse,
     EgressConfigRequest,
     ErrorMessage,
     FsDeleteRequest,
@@ -48,6 +64,7 @@ from daiv_sandbox.schemas import (
     RunRequest,
     RunResponse,
     RunResult,
+    SandboxCapabilities,
     SeedKind,
     SeedSessionResponse,
     StartSessionRequest,
@@ -141,12 +158,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.session_lock_manager = NoopSessionLockManager()
         app.state.session_activity = NoopSessionActivityTracker()
 
+    browser_image_task = await probe_browser_image(app)
     reaper_task = start_reaper(app)
     try:
         yield
     finally:
         if reaper_task is not None:
             reaper_task.cancel()
+        if browser_image_task is not None:
+            browser_image_task.cancel()
         if redis_client is not None:
             await redis_client.aclose()
 
@@ -165,6 +185,8 @@ app = FastAPI(
 app.state.redis = None
 app.state.session_lock_manager = NoopSessionLockManager()
 app.state.session_activity = NoopSessionActivityTracker()
+app.state.browser_manager = BrowserManager()
+app.state.browser_available = False
 
 
 @app.exception_handler(SessionBusyError)
@@ -197,7 +219,7 @@ async def get_api_key(api_key_header: str | None = Security(api_key_header)) -> 
     return api_key_header
 
 
-common_responses = {
+common_responses: dict[int | str, dict[str, Any]] = {
     status.HTTP_403_FORBIDDEN: {
         "content": {"application/json": {"example": {"detail": "Invalid API Key"}}},
         "model": ErrorMessage,
@@ -463,6 +485,17 @@ async def close_session(
             container = None
         token = egress_token(container)
 
+        # Before the sandbox and the egress triad: the browser saves its tabs while it still runs, and it is
+        # a member of the session's egress network, which suspend and teardown take down.
+        browser_manager: BrowserManager = request.app.state.browser_manager
+        try:
+            if force:
+                await browser_manager.remove(session_id)
+            else:
+                await browser_manager.stop(session_id)
+        except Exception:
+            logger.exception("Browser: failed to close the browser of session %s", session_id)
+
         if force:
             await asyncio.to_thread(cmd_executor.remove_container)
         else:
@@ -564,6 +597,173 @@ async def version() -> dict[Literal["version"], str]:
     Get the version of the application.
     """
     return {"version": __version__}
+
+
+@app.get(
+    "/-/capabilities/",
+    responses={200: {"content": {"application/json": {"example": {"browser": True}}}}},
+    name="Service capabilities",
+)
+async def capabilities(request: Request) -> SandboxCapabilities:
+    """
+    Report what this service can do beyond running commands. ``browser`` is true once the browser image is present.
+    """
+    return SandboxCapabilities(browser=request.app.state.browser_available)
+
+
+# --- browser endpoints ----------------------------------------------------------------------------
+
+
+@app.post("/session/{session_id}/browser/", responses=common_responses, name="Start the session's browser")
+async def start_browser(
+    http_request: Request,
+    session_id: Annotated[str, FastAPIPath(title="The ID of the session whose browser to start.")],
+    request: Annotated[str, Form(description="JSON BrowserStartRequest.")],
+    extension_archive: UploadFile | None = None,
+    api_key: str = Depends(get_api_key),
+) -> BrowserStartResponse:
+    """
+    Start the session's browser container, or create it on the session's first call, and launch Chromium on the
+    session's browser profile. Idempotent while the browser runs (``started: false``).
+
+    Multipart fields: ``request`` (JSON ``BrowserStartRequest``) and ``extension_archive`` (the Stagehand extension
+    zip, which may be omitted once a start has installed the same ``extension_sha256``).
+
+    Responds 404 for an unknown session, 409 when the extension is missing or the session is busy, 422 for an
+    invalid request or extension archive, 503 when the browser image is unavailable or Chromium is not ready in
+    time, and 500 otherwise.
+    """
+    try:
+        start_request = BrowserStartRequest.model_validate_json(request)
+    except ValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="request is invalid") from exc
+    if not http_request.app.state.browser_available:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="browser image unavailable")
+    archive = await extension_archive.read() if extension_archive is not None else None
+
+    browser_manager: BrowserManager = http_request.app.state.browser_manager
+    async with _workspace_executor(http_request, session_id) as cmd_executor:
+        try:
+            return await browser_manager.start(cmd_executor.container, start_request, archive)
+        except ExtensionMissingError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="extension missing") from exc
+        except ExtensionInvalidError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        except BrowserImageUnavailableError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="browser image unavailable"
+            ) from exc
+        except BrowserNotReadyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="browser not ready in time"
+            ) from exc
+        except HTTPException, SessionUnavailableError:
+            raise
+        except Exception as exc:
+            logger.exception("Browser: failed to start the browser of session %s", session_id)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="browser failed to start"
+            ) from exc
+
+
+@app.delete("/session/{session_id}/browser/", responses=common_responses, name="Stop the session's browser")
+async def stop_browser(
+    http_request: Request,
+    session_id: Annotated[str, FastAPIPath(title="The ID of the session whose browser to stop.")],
+    force: bool = False,
+    api_key: str = Depends(get_api_key),
+) -> BrowserStopResponse:
+    """
+    Save the open tabs' URLs to the browser profile, close Chromium and stop the browser container, keeping the
+    profile. ``?force=true`` removes the container and its profile instead. A session or browser that is already
+    gone answers 200 with empty values.
+    """
+    browser_manager: BrowserManager = http_request.app.state.browser_manager
+    async with http_request.app.state.session_lock_manager.acquire(session_id):
+        try:
+            return await browser_manager.stop(session_id, force=force)
+        except Exception as exc:
+            logger.exception("Browser: failed to stop the browser of session %s", session_id)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="browser failed to stop"
+            ) from exc
+
+
+_CDP_ACTIVITY_SECONDS = 30
+WS_CLOSE_FORBIDDEN = 4403
+WS_CLOSE_NOT_FOUND = 4404
+
+
+@app.websocket("/session/{session_id}/browser/cdp")
+async def browser_cdp(websocket: WebSocket, session_id: str) -> None:
+    """
+    One raw TCP stream to the browser's DevTools port, as binary frames both ways. The key is checked before the
+    handshake is accepted; an unknown session or a browser that is not running closes with 4404.
+    """
+    if websocket.headers.get(HEADER_API_KEY_NAME) != settings.API_KEY.get_secret_value():
+        await websocket.close(code=WS_CLOSE_FORBIDDEN)
+        return
+    browser_manager: BrowserManager = websocket.app.state.browser_manager
+    browser = await asyncio.to_thread(browser_manager.find, session_id)
+    await websocket.accept()
+    if browser is None or browser.status != "running":
+        await websocket.close(code=WS_CLOSE_NOT_FOUND)
+        return
+    try:
+        stream = await open_exec_stream(
+            browser_manager.client, browser.id, ["daiv-relay", "connect", str(DEVTOOLS_PORT)], user=BROWSER_USER
+        )
+    except Exception:
+        logger.exception("Browser: cannot open a CDP tunnel to the browser of session %s", session_id)
+        await websocket.close(code=1011)
+        return
+
+    tunnel = asyncio.create_task(_pump_cdp(websocket, stream, session_id))
+    browser_manager.track_tunnel(session_id, tunnel)
+    try:
+        await tunnel
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await stream.close()
+        with contextlib.suppress(Exception):
+            await websocket.close(code=1000)
+
+
+async def _pump_cdp(websocket: WebSocket, stream, session_id: str) -> None:
+    activity = websocket.app.state.session_activity
+
+    async def client_to_browser() -> None:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            if message.get("text") is not None:
+                await websocket.close(code=1003)
+                return
+            if message.get("bytes"):
+                await stream.write(message["bytes"])
+
+    async def browser_to_client() -> None:
+        async for chunk in stream.stdout_chunks():
+            await websocket.send_bytes(chunk)
+
+    async def keep_session_alive() -> None:
+        while True:
+            await activity.touch(session_id)
+            await asyncio.sleep(_CDP_ACTIVITY_SECONDS)
+
+    jobs = (client_to_browser, browser_to_client, keep_session_alive)
+    tasks = [asyncio.create_task(job(), name=job.__name__) for job in jobs]
+    try:
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            error = None if task.cancelled() else task.exception()
+            logger.debug("Browser: CDP tunnel of session %s closed by %s (%r)", session_id, task.get_name(), error)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # --- /workspace file-op endpoints -------------------------------------------

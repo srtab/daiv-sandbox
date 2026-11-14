@@ -15,6 +15,8 @@ on:
       - "Dockerfile"
       - "egress_proxy/Dockerfile"
       - "daiv_sandbox/egress/**"
+      - "browser/**"
+      - "relay/**"
       - "uv.lock"
       - ".github/workflows/docker.yml"
 
@@ -29,6 +31,8 @@ jobs:
             file: Dockerfile
           - image: ghcr.io/srtab/daiv-sandbox-egress
             file: egress_proxy/Dockerfile
+          - image: ghcr.io/srtab/daiv-sandbox-browser
+            file: browser/Dockerfile
     steps:
       - name: Docker meta
         id: meta

@@ -1,5 +1,7 @@
+import asyncio
 import base64
 import io
+import json
 import uuid
 from contextlib import AbstractAsyncContextManager, contextmanager
 from unittest.mock import AsyncMock, Mock, patch
@@ -7,12 +9,19 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from docker.errors import APIError, NotFound
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from daiv_sandbox import __version__
+from daiv_sandbox.browser import (
+    BrowserImageUnavailableError,
+    BrowserNotReadyError,
+    ExtensionInvalidError,
+    ExtensionMissingError,
+)
 from daiv_sandbox.config import settings
 from daiv_sandbox.locks import SessionBusyError
 from daiv_sandbox.main import app
-from daiv_sandbox.schemas import RunResult
+from daiv_sandbox.schemas import BrowserStartRequest, BrowserStartResponse, BrowserStopResponse, RunResult
 from daiv_sandbox.sessions import EXTRA_REPOS_ROOT, SANDBOX_ROOT, SKILLS_ROOT, SessionUnavailableError
 
 # Minimal egress payload used across egress-enabled start_session tests.
@@ -1913,3 +1922,226 @@ def test_close_session_clears_activity_record(client, monkeypatch):
         assert client.delete("/session/cmd-executor-id/").status_code == 204
 
     assert activity.forgotten == ["cmd-executor-id"]
+
+
+# --- browser ------------------------------------------------------------------------------------------
+
+_BROWSER_REQUEST = json.dumps({"memory_bytes": 1 << 30, "cpus": 1.0, "extension_sha256": "a" * 64})
+_BROWSER_STARTED = BrowserStartResponse(
+    started=True, profile="empty", restored_urls=[], devtools_port=39222, browser_ws_path="/devtools/browser/x"
+)
+
+
+@pytest.fixture
+def browser_available():
+    app.state.browser_available = True
+    yield
+    app.state.browser_available = False
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_capabilities_report_the_browser_without_a_key(client, available):
+    app.state.browser_available = available
+    client.headers = {}
+    try:
+        response = client.get("/-/capabilities/")
+    finally:
+        app.state.browser_available = False
+    assert response.status_code == 200
+    assert response.json() == {"browser": available}
+
+
+def test_start_browser_passes_the_request_and_extension_to_the_manager(
+    mock_session, client, browser_manager, browser_available
+):
+    browser_manager.start.return_value = _BROWSER_STARTED
+
+    response = client.post(
+        f"/session/{mock_session.session_id}/browser/",
+        data={"request": _BROWSER_REQUEST},
+        files={"extension_archive": ("extension.zip", b"PK-zip", "application/zip")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == _BROWSER_STARTED.model_dump()
+    container, request, archive = browser_manager.start.await_args.args
+    assert container is mock_session.container
+    assert request == BrowserStartRequest.model_validate_json(_BROWSER_REQUEST)
+    assert archive == b"PK-zip"
+
+
+def test_start_browser_without_an_archive_passes_none(mock_session, client, browser_manager, browser_available):
+    browser_manager.start.return_value = _BROWSER_STARTED
+    response = client.post(f"/session/{mock_session.session_id}/browser/", data={"request": _BROWSER_REQUEST})
+    assert response.status_code == 200, response.text
+    assert browser_manager.start.await_args.args[2] is None
+
+
+def test_start_browser_rejects_an_invalid_request(mock_session, client, browser_manager, browser_available):
+    response = client.post(f"/session/{mock_session.session_id}/browser/", data={"request": '{"cpus": 1}'})
+    assert response.status_code == 422
+    browser_manager.start.assert_not_called()
+
+
+def test_start_browser_is_unavailable_without_the_browser_image(mock_session, client, browser_manager):
+    response = client.post(f"/session/{mock_session.session_id}/browser/", data={"request": _BROWSER_REQUEST})
+    assert response.status_code == 503
+    assert response.json() == {"detail": "browser image unavailable"}
+    browser_manager.start.assert_not_called()
+
+
+def test_start_browser_of_an_unknown_session_is_404(client, browser_manager, browser_available):
+    with patch("daiv_sandbox.main.SandboxDockerSession") as session_cls:
+        session_cls.return_value.container = None
+        response = client.post("/session/missing/browser/", data={"request": _BROWSER_REQUEST})
+    assert response.status_code == 404
+    browser_manager.start.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("error", "status_code", "detail"),
+    [
+        (ExtensionMissingError("extension missing"), 409, "extension missing"),
+        (BrowserNotReadyError("slow"), 503, "browser not ready in time"),
+        (BrowserImageUnavailableError("gone"), 503, "browser image unavailable"),
+        (RuntimeError("docker said: /var/run/docker.sock refused"), 500, "browser failed to start"),
+    ],
+)
+def test_start_browser_maps_failures_to_short_reasons(
+    mock_session, client, browser_manager, browser_available, error, status_code, detail
+):
+    browser_manager.start.side_effect = error
+    response = client.post(f"/session/{mock_session.session_id}/browser/", data={"request": _BROWSER_REQUEST})
+    assert response.status_code == status_code
+    assert response.json() == {"detail": detail}
+
+
+def test_start_browser_rejects_an_invalid_extension_archive(mock_session, client, browser_manager, browser_available):
+    browser_manager.start.side_effect = ExtensionInvalidError("extension archive is not a zip file")
+    response = client.post(f"/session/{mock_session.session_id}/browser/", data={"request": _BROWSER_REQUEST})
+    assert response.status_code == 422
+    assert response.json() == {"detail": "extension archive is not a zip file"}
+
+
+def test_start_browser_returns_conflict_when_session_is_locked(mock_session, client, monkeypatch, browser_available):
+    monkeypatch.setattr(app.state, "session_lock_manager", BusySessionLockManager())
+    response = client.post(f"/session/{mock_session.session_id}/browser/", data={"request": _BROWSER_REQUEST})
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Session is busy"}
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_stop_browser_returns_what_the_manager_saved(client, browser_manager, force):
+    browser_manager.stop.return_value = BrowserStopResponse(saved_urls=["http://localhost:5173/"], oom_killed=True)
+    response = client.delete(f"/session/sbx/browser/?force={str(force).lower()}")
+    assert response.status_code == 200
+    assert response.json() == {"saved_urls": ["http://localhost:5173/"], "oom_killed": True}
+    browser_manager.stop.assert_awaited_once_with("sbx", force=force)
+
+
+def test_stop_browser_failure_is_a_short_500(client, browser_manager):
+    browser_manager.stop.side_effect = APIError("boom")
+    response = client.delete("/session/sbx/browser/")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "browser failed to stop"}
+
+
+def test_stop_browser_returns_conflict_when_session_is_locked(client, monkeypatch):
+    monkeypatch.setattr(app.state, "session_lock_manager", BusySessionLockManager())
+    assert client.delete("/session/sbx/browser/").status_code == 409
+
+
+def test_close_session_stops_the_browser_before_the_sandbox(client, browser_manager):
+    calls = []
+    browser_manager.stop.side_effect = lambda session_id: calls.append(("browser", session_id))
+    with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
+        cls.return_value.client.containers.get.return_value = Mock(labels={})
+        cls.return_value.stop_container.side_effect = lambda: calls.append(("sandbox", None))
+        assert client.delete("/session/sbx/").status_code == 204
+    assert calls == [("browser", "sbx"), ("sandbox", None)]
+    browser_manager.remove.assert_not_called()
+
+
+def test_force_close_removes_the_browser(client, browser_manager):
+    with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
+        cls.return_value.client.containers.get.return_value = Mock(labels={})
+        assert client.delete("/session/sbx/?force=true").status_code == 204
+    browser_manager.remove.assert_awaited_once_with("sbx")
+    browser_manager.stop.assert_not_called()
+
+
+def test_a_failed_browser_close_still_closes_the_sandbox(client, browser_manager):
+    browser_manager.stop.side_effect = APIError("browser stuck")
+    with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
+        cls.return_value.client.containers.get.return_value = Mock(labels={})
+        assert client.delete("/session/sbx/").status_code == 204
+        cls.return_value.stop_container.assert_called_once()
+
+
+class _EchoStream:
+    """A CDP exec stream whose browser echoes every byte back."""
+
+    def __init__(self):
+        self.written: list[bytes] = []
+        self.closed = False
+        self._queue: asyncio.Queue | None = None
+
+    def _q(self) -> asyncio.Queue:
+        if self._queue is None:
+            self._queue = asyncio.Queue()
+        return self._queue
+
+    async def write(self, data: bytes) -> None:
+        self.written.append(data)
+        await self._q().put(data)
+
+    async def stdout_chunks(self):
+        while True:
+            yield await self._q().get()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def running_browser(browser_manager):
+    browser_manager.find.return_value = Mock(id="browser-id", status="running")
+    stream = _EchoStream()
+    with patch("daiv_sandbox.main.open_exec_stream", new=AsyncMock(return_value=stream)) as opener:
+        yield stream, opener
+
+
+def test_cdp_tunnel_carries_binary_frames_both_ways(client, running_browser, browser_manager):
+    stream, opener = running_browser
+    with client.websocket_connect("/session/sbx/browser/cdp") as ws:
+        ws.send_bytes(b"GET /json/version HTTP/1.1\r\n\r\n")
+        assert ws.receive_bytes() == b"GET /json/version HTTP/1.1\r\n\r\n"
+    assert opener.await_args.args[1:] == ("browser-id", ["daiv-relay", "connect", "39222"])
+    assert opener.await_args.kwargs == {"user": "1000:1000"}
+    browser_manager.track_tunnel.assert_called_once()
+    assert stream.closed
+
+
+def test_cdp_tunnel_closes_on_a_text_frame(client, running_browser):
+    with client.websocket_connect("/session/sbx/browser/cdp") as ws:
+        ws.send_text("hello")
+        with pytest.raises(WebSocketDisconnect) as exc:
+            ws.receive_bytes()
+    assert exc.value.code == 1003
+
+
+@pytest.mark.parametrize("headers", [{"X-API-Key": "wrong"}, {}])
+def test_cdp_tunnel_refuses_a_bad_key_before_accepting(client, running_browser, headers):
+    client.headers = headers
+    with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/session/sbx/browser/cdp"):
+        pass
+    assert exc.value.code == 4403
+    running_browser[1].assert_not_called()
+
+
+@pytest.mark.parametrize("browser", [None, Mock(id="b", status="exited")])
+def test_cdp_tunnel_closes_4404_without_a_running_browser(client, browser_manager, browser):
+    browser_manager.find.return_value = browser
+    with client.websocket_connect("/session/sbx/browser/cdp") as ws, pytest.raises(WebSocketDisconnect) as exc:
+        ws.receive_bytes()
+    assert exc.value.code == 4404

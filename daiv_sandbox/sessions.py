@@ -38,6 +38,9 @@ DAIV_SANDBOX_TYPE_LABEL = "daiv.sandbox.type"
 TYPE_CMD_EXECUTOR = "cmd_executor"
 TYPE_EGRESS_PROXY = "egress_proxy"
 TYPE_EGRESS_NETWORK = "egress_network"
+TYPE_BROWSER = "browser"
+# On a browser container: the id of the sandbox container (the session id) it serves.
+BROWSER_SESSION_LABEL = "daiv.sandbox.session"
 # Links a sandbox to its egress proxy + network (all three carry the same token value).
 EGRESS_SESSION_LABEL = "daiv.sandbox.egress"
 
