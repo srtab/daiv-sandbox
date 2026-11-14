@@ -194,7 +194,7 @@ def test_start_proxy_removes_created_container_on_failure(monkeypatch):
 def test_teardown_removes_proxy_and_network():
     client = MagicMock()
     proxy, net = MagicMock(), MagicMock()
-    client.containers.list.return_value = [proxy]
+    client.containers.list.side_effect = [[proxy], []]
     client.networks.list.return_value = [net]
     EgressProxyManager(client).teardown("tok123")
     proxy.remove.assert_called_once_with(force=True, v=True)
@@ -206,7 +206,7 @@ def test_teardown_suppresses_notfound_on_proxy_remove():
     client = MagicMock()
     proxy, net = MagicMock(), MagicMock()
     proxy.remove.side_effect = NotFound("already gone")
-    client.containers.list.return_value = [proxy]
+    client.containers.list.side_effect = [[proxy], []]
     client.networks.list.return_value = [net]
     EgressProxyManager(client).teardown("tok123")  # must not raise
     net.remove.assert_called_once()
@@ -219,7 +219,7 @@ def test_teardown_logs_and_continues_when_proxy_remove_errors():
     client = MagicMock()
     proxy, net = MagicMock(), MagicMock()
     proxy.remove.side_effect = APIError("daemon busy")
-    client.containers.list.return_value = [proxy]
+    client.containers.list.side_effect = [[proxy], []]
     client.networks.list.return_value = [net]
     EgressProxyManager(client).teardown("tok123")  # must not raise
     net.remove.assert_called_once()  # network still cleaned up despite the proxy failure
@@ -234,7 +234,7 @@ def test_suspend_stops_proxy_and_drops_network_but_keeps_both_containers():
 
     client = MagicMock()
     proxy, executor, net = MagicMock(), MagicMock(), MagicMock()
-    client.containers.list.side_effect = [[proxy], [executor]]
+    client.containers.list.side_effect = [[proxy], [executor], []]
     client.networks.list.return_value = [net]
 
     EgressProxyManager(client).suspend("tok123")
@@ -254,7 +254,7 @@ def test_suspend_disconnects_members_before_removing_the_network():
     assert the sequence, not just the calls."""
     client = MagicMock()
     proxy, executor, net = MagicMock(), MagicMock(), MagicMock()
-    client.containers.list.side_effect = [[proxy], [executor]]
+    client.containers.list.side_effect = [[proxy], [executor], []]
     client.networks.list.return_value = [net]
     calls = []
     net.disconnect.side_effect = lambda member, **kw: calls.append(("disconnect", member))
@@ -270,7 +270,7 @@ def test_suspend_suppresses_notfound():
     client = MagicMock()
     proxy = MagicMock()
     proxy.stop.side_effect = NotFound("already gone")
-    client.containers.list.side_effect = [[proxy], []]
+    client.containers.list.side_effect = [[proxy], [], []]
     client.networks.list.return_value = []
     EgressProxyManager(client).suspend("tok123")  # must not raise
     proxy.stop.assert_called_once()  # the swallow happened at the intended call site, not by skipping it
@@ -282,7 +282,7 @@ def test_suspend_logs_and_swallows_other_errors():
     client = MagicMock()
     proxy = MagicMock()
     proxy.stop.side_effect = APIError("daemon busy")
-    client.containers.list.side_effect = [[proxy], []]
+    client.containers.list.side_effect = [[proxy], [], []]
     client.networks.list.return_value = []
     EgressProxyManager(client).suspend("tok123")  # must not raise
     proxy.stop.assert_called_once()  # the swallow happened at the intended call site, not by skipping it
@@ -293,13 +293,45 @@ def test_suspend_still_removes_the_network_when_a_disconnect_fails():
     suspend, so one bad member is logged and skipped rather than aborting the cleanup."""
     client = MagicMock()
     proxy, net = MagicMock(), MagicMock()
-    client.containers.list.side_effect = [[proxy], []]
+    client.containers.list.side_effect = [[proxy], [], []]
     client.networks.list.return_value = [net]
     net.disconnect.side_effect = APIError("daemon busy")
 
     EgressProxyManager(client).suspend("tok123")  # must not raise
 
     net.remove.assert_called_once()
+
+
+def test_teardown_removes_the_sessions_browser_before_the_network():
+    """A browser container left on the internal network would make the network's removal fail."""
+    client = MagicMock()
+    proxy, browser, net = MagicMock(), MagicMock(), MagicMock()
+    client.containers.list.side_effect = [[proxy], [browser]]
+    client.networks.list.return_value = [net]
+    calls = []
+    browser.remove.side_effect = lambda **kw: calls.append("browser")
+    net.remove.side_effect = lambda: calls.append("network")
+
+    EgressProxyManager(client).teardown("tok123")
+
+    assert calls == ["browser", "network"]
+    assert client.containers.list.call_args_list[1].kwargs["filters"]["label"] == [
+        "daiv.sandbox.type=browser",
+        "daiv.sandbox.egress=tok123",
+    ]
+
+
+def test_suspend_disconnects_the_sessions_browser_too():
+    """The browser stays stopped on the network between runs; left attached, it could never start again."""
+    client = MagicMock()
+    proxy, executor, browser, net = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    client.containers.list.side_effect = [[proxy], [executor], [browser]]
+    client.networks.list.return_value = [net]
+
+    EgressProxyManager(client).suspend("tok123")
+
+    assert [c.args[0] for c in net.disconnect.call_args_list] == [proxy, executor, browser]
+    browser.remove.assert_not_called()
 
 
 def _network(name: str = "daiv-egress-tok123", net_id: str = "net-new") -> MagicMock:
@@ -321,7 +353,7 @@ def test_resume_recreates_the_network_when_it_is_gone():
     name before anything tries to start."""
     client = MagicMock()
     client.networks.list.return_value = []
-    client.containers.list.side_effect = [[], []]
+    client.containers.list.side_effect = [[], [], []]
     client.networks.get.return_value = _network()
 
     assert EgressProxyManager(client).resume("tok123") == "daiv-egress-tok123"
@@ -336,11 +368,23 @@ def test_resume_reattaches_both_members_before_either_starts():
     net = _network()
     client.networks.list.return_value = [net]
     proxy, executor = _member(), _member()
-    client.containers.list.side_effect = [[proxy], [executor]]
+    client.containers.list.side_effect = [[proxy], [executor], []]
 
     EgressProxyManager(client).resume("tok123")
 
     assert [c.args[0] for c in net.connect.call_args_list] == [proxy, executor]
+
+
+def test_resume_reattaches_the_sessions_browser():
+    client = MagicMock()
+    net = _network()
+    client.networks.list.return_value = [net]
+    proxy, executor, browser = _member(), _member(), _member()
+    client.containers.list.side_effect = [[proxy], [executor], [browser]]
+
+    EgressProxyManager(client).resume("tok123")
+
+    assert [c.args[0] for c in net.connect.call_args_list] == [proxy, executor, browser]
 
 
 def test_resume_is_a_noop_for_members_already_on_the_live_network():
@@ -350,7 +394,7 @@ def test_resume_is_a_noop_for_members_already_on_the_live_network():
     net = _network(net_id="net-live")
     client.networks.list.return_value = [net]
     attached = _member("daiv-egress-tok123", net_id="net-live")
-    client.containers.list.side_effect = [[attached], []]
+    client.containers.list.side_effect = [[attached], [], []]
 
     EgressProxyManager(client).resume("tok123")
 
@@ -366,7 +410,7 @@ def test_resume_clears_a_stale_endpoint_before_reconnecting():
     net = _network(net_id="net-new")
     client.networks.list.return_value = [net]
     stale = _member("daiv-egress-tok123", net_id="net-old-and-removed")
-    client.containers.list.side_effect = [[stale], []]
+    client.containers.list.side_effect = [[stale], [], []]
 
     EgressProxyManager(client).resume("tok123")
 

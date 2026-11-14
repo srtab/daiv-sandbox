@@ -128,6 +128,10 @@ class Settings(BaseSettings):
         sessions require it; there is no direct-network attach to a sandbox."""
         return bool(self.EGRESS_CA_CERT_FILE and self.EGRESS_CA_KEY_FILE)
 
+    # Browser beside a session's sandbox. /-/capabilities/ reports the browser only once this image is present.
+    BROWSER_IMAGE: str = "ghcr.io/srtab/daiv-sandbox-browser:0.6.0"
+    BROWSER_START_TIMEOUT_SECONDS: int = Field(default=20, gt=0)
+
     # Session locking
     REDIS_URL: str | None = None
     SESSION_LOCK_TTL_SECONDS: int = 900

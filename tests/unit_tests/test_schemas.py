@@ -2,6 +2,9 @@ import pytest
 from pydantic import ValidationError
 
 from daiv_sandbox.schemas import (
+    BrowserStartRequest,
+    BrowserStartResponse,
+    BrowserStopResponse,
     EgressConfigRequest,
     EgressPolicy,
     EgressRule,
@@ -10,6 +13,7 @@ from daiv_sandbox.schemas import (
     FsErrorCode,
     FsWriteResponse,
     RunRequest,
+    SandboxCapabilities,
     StartSessionRequest,
 )
 
@@ -71,3 +75,33 @@ def test_egress_allow_default_with_no_rules_is_allowed():
 def test_egress_deny_default_with_a_rule_is_allowed():
     req = EgressConfigRequest(policy=EgressPolicy(default="deny", rules=[EgressRule(host="pypi.org")]))
     assert req.policy.rules[0].host == "pypi.org"
+
+
+_SHA = "a" * 64
+
+
+def test_sandbox_capabilities_default_to_no_browser():
+    assert SandboxCapabilities().browser is False
+    assert SandboxCapabilities.model_validate({"browser": True}).browser is True
+
+
+@pytest.mark.parametrize("digest", ["", "A" * 64, "a" * 63, "../" + "a" * 61, "g" * 64])
+def test_browser_start_request_rejects_a_digest_that_is_not_lowercase_sha256(digest):
+    """The digest names a directory in the browser container, so anything but 64 hex characters is refused."""
+    with pytest.raises(ValidationError):
+        BrowserStartRequest(memory_bytes=1, cpus=1.0, extension_sha256=digest)
+
+
+@pytest.mark.parametrize(("memory_bytes", "cpus"), [(0, 1.0), (1, 0.0), (-1, 1.0), (1, -0.5)])
+def test_browser_start_request_rejects_non_positive_limits(memory_bytes, cpus):
+    with pytest.raises(ValidationError):
+        BrowserStartRequest(memory_bytes=memory_bytes, cpus=cpus, extension_sha256=_SHA)
+
+
+def test_browser_start_response_rejects_an_unknown_profile_state():
+    with pytest.raises(ValidationError):
+        BrowserStartResponse(started=True, profile="kept", devtools_port=39222, browser_ws_path="/devtools/browser/x")
+
+
+def test_browser_stop_response_defaults_to_nothing_saved():
+    assert BrowserStopResponse().model_dump() == {"saved_urls": [], "oom_killed": False}

@@ -69,6 +69,8 @@ All settings are configurable via environment variables. The available settings 
 | **DAIV_SANDBOX_EGRESS_PROXY_CPUS**                | CPU quota for the sidecar container.                                                                                                                                                                                                                                                                                                                       | Optional                                                                    |
 | **DAIV_SANDBOX_EGRESS_CA_CERT_FILE**              | Path to the shared egress CA certificate. Installed into every egress sandbox automatically. Required to enable network egress; set both or neither.                                                                                                                                                                                                       | Required to enable network egress (set both, or neither)                    |
 | **DAIV_SANDBOX_EGRESS_CA_KEY_FILE**               | Path to the shared egress CA private key. Provided only to sidecars, never to the sandbox. Required to enable network egress; set both or neither.                                                                                                                                                                                                         | Required to enable network egress (set both, or neither)                    |
+| **DAIV_SANDBOX_BROWSER_IMAGE**                    | Image of the browser container run beside a session's sandbox. `GET /-/capabilities/` reports `browser: true` only once this image is present; a missing image is pulled in the background at startup.                                                                                                                                                     | Default: `ghcr.io/srtab/daiv-sandbox-browser:0.6.0`                         |
+| **DAIV_SANDBOX_BROWSER_START_TIMEOUT_SECONDS**    | How long a browser start waits for Chromium's DevTools port before answering `503`.                                                                                                                                                                                                                                                                        | Default: 20                                                                 |
 | **DAIV_SANDBOX_FS_PRUNE_DIRS**                    | Comma-separated directory basenames/globs pruned by default from `fs/glob`/`fs/grep` (caches/metadata/build output). Excludes dependency-source dirs so agents can read deps. Setting this replaces the baseline entirely.                                                                                                                                 | Default: `.git,__pycache__,…`                                               |
 | **DAIV_SANDBOX_COMMAND_TIMEOUT**                  | Default per-command timeout in seconds. `0` disables the default. Overridable per request via `timeout`.                                                                                                                                                                                                                                                   | Default: 0                                                                  |
 | **DAIV_SANDBOX_REDIS_URL**                        | Redis URL used for cross-replica per-session locking. When unset, an in-process lock is used.                                                                                                                                                                                                                                                              | Optional                                                                    |
@@ -96,6 +98,10 @@ All settings are configurable via environment variables. The available settings 
 - `GET /session/{session_id}/`: Check session status — `204` if it exists (restarting it if stopped), else `404`.
 - `DELETE /session/{session_id}/`: Close the sandbox session (stops the container by default; `?force=true` removes it).
 - `PUT /session/{session_id}/egress/`: Refresh an egress session's policy and secrets without recreating the container (`204` success / `404` no session / `409` session has no egress proxy / `422` invalid policy body / `503` proxy sidecar not running, retryable).
+- `POST /session/{session_id}/browser/`: Start the session's browser (see [Browser](#browser)).
+- `DELETE /session/{session_id}/browser/`: Stop the session's browser, keeping its profile (`?force=true` removes it).
+- `WS /session/{session_id}/browser/cdp`: A raw byte tunnel to the browser's DevTools port.
+- `GET /-/capabilities/`: What the service can do beyond running commands (`{"browser": true}`); needs no key.
 - `GET /-/health/`: Healthcheck endpoint.
 - `GET /-/version/`: Current application version.
 
@@ -437,6 +443,64 @@ Then set:
 - **Cert-pinned clients** will fail — the proxy terminates and re-signs TLS, so any client that pins the upstream certificate will reject it.
 - **SSH-based git** and other non-HTTP(S) protocols are not proxied and are blocked by the internal network isolation.
 - **Non-HTTP egress** (raw TCP, UDP, etc.) is out of scope.
+
+### Browser
+
+A session can have a headless Chromium beside its sandbox, for DAIV's browser tools. It runs in a **browser
+container** of its own, created on the session's first browser start:
+
+- **Isolation.** It uses the sandbox's runtime (`runc` or `runsc`), runs as a non-root user, and has its own memory
+  and CPU limits, given on each start. A page that outgrows the browser's memory limit kills the browser alone; the
+  sandbox, its commands and its dev servers keep running. Downloads are blocked by a managed Chromium policy.
+- **Reach.** Chromium's only proxy is `daiv-relay`, a static binary in the browser image. Loopback destinations
+  (`localhost`, `*.localhost`, `127.0.0.1`, `[::1]`) go to the sandbox's own loopback, over a relay the service runs
+  between the two containers as exec streams, so `http://localhost:5173` reaches the agent's dev server under both
+  runtimes and on network-isolated sessions. Every other destination goes through the session's egress proxy, or is
+  refused when the session has none. The browser's reach is therefore the sandbox's.
+- **DevTools.** Chromium listens on `127.0.0.1:39222` inside the browser container, and accepts DevTools
+  WebSockets only from its extension's origin, so pages cannot drive it. Clients reach it through
+  `WS /session/{id}/browser/cdp`.
+- **Profile.** Cookies, site storage and the open tabs' URLs live in the browser container's writable layer, so they
+  survive a stop and come back on the session's next start. The browser container is stopped with its sandbox and
+  removed with it (force close, the reaper, and a sweep for browsers whose sandbox is gone).
+- **Resources.** About 300 MB per running browser on a simple page; size the host for one browser per concurrent run
+  that uses it. The image is published as `ghcr.io/srtab/daiv-sandbox-browser`.
+
+#### Starting and stopping the browser
+
+`POST /session/{id}/browser/` takes multipart fields `request`, a JSON
+`{"memory_bytes": int, "cpus": float, "extension_sha256": str}`, and `extension_archive`, the Stagehand extension zip.
+The archive is cached in the browser container by its digest, so a later start of the same digest may omit it. It
+answers `200` with:
+
+```json
+{
+  "started": true,
+  "profile": "restored",
+  "restored_urls": ["http://localhost:5173/login"],
+  "devtools_port": 39222,
+  "browser_ws_path": "/devtools/browser/4f1c…"
+}
+```
+
+`started` is `false` when the browser was already running. `profile` is `empty` on the session's first start,
+`restored` when the profile came back, and `reset` when it could not be read or the browser container had been
+removed by something other than the service. Errors: `404` unknown session, `409` extension missing (or session
+busy), `422` invalid request or archive, `503` browser image unavailable or Chromium not ready within
+`DAIV_SANDBOX_BROWSER_START_TIMEOUT_SECONDS`, `500` otherwise.
+
+`DELETE /session/{id}/browser/` saves the open tabs' URLs, closes Chromium so its profile is flushed, and stops the
+container, answering `{"saved_urls": [...], "oom_killed": bool}`. `oom_killed` is set when Docker recorded an OOM kill
+in the browser container; under `runsc`, gVisor kills the page's process inside its sandbox and Docker records none,
+so it stays `false`. A session or browser that is already gone answers `200` with empty values.
+
+#### The CDP tunnel
+
+`WS /session/{id}/browser/cdp` carries one raw TCP stream to the DevTools port, as binary frames in both directions.
+The `X-API-Key` header is checked before the handshake is accepted (a wrong key is refused with `403`). An unknown
+session, or a browser that is not running, closes with `4404`; a text frame closes with `1003`. The tunnel takes no
+session lock and keeps the session from being reaped as idle while it is open. DAIV opens one WebSocket per local TCP
+connection, so a CDP client connects to a local port as it would to a local Chrome.
 
 ## Contributing
 
