@@ -55,8 +55,9 @@ make build-egress-proxy  # builds the mitmproxy sidecar image
   prefix — `_validate_sandbox_path` is lexical and does not resolve symlinks.
 - **Error-status contract is deliberate.** Missing session → `404`; Docker fault on
   restart/stop → `503` (`SessionUnavailableError`, retryable, **not** masked as 404); lock contention
-  → `409`; auth → `403`; `egress` block without server-side CA → `400`; empty deny-default policy
-  → `422`. Per-op `fs/*` outcomes (e.g. `not_found`, `is_a_directory`) live in the 200 body, not
+  → `409`, and nothing else is `409` on an endpoint that takes the lock (a browser start whose
+  extension archive is missing is `412`); auth → `403`; `egress` block without server-side CA →
+  `400`; empty deny-default policy → `422`. Per-op `fs/*` outcomes (e.g. `not_found`, `is_a_directory`) live in the 200 body, not
   the HTTP status.
 - **Run commands pipe through a portable `pipefail` wrapper** so pipeline exits aren't masked; per-
   command timeout is enforced via `asyncio.wait_for` (timed-out → exit `124`, remaining skipped).

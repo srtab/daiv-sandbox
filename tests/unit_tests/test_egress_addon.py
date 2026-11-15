@@ -125,6 +125,45 @@ def test_request_with_matching_or_absent_host_header_injects(tmp_path, host_head
     assert flow.request.headers["Authorization"] == "Bearer secret"
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Sec-Fetch-Site": "cross-site"},
+        {"Sec-Fetch-Site": "same-site"},
+        {"Origin": "https://evil.example"},
+        {"Origin": "https://gitlab.com:8443"},
+        {"Origin": "null"},
+        {"Sec-Fetch-Site": "same-origin", "Origin": "http://gitlab.com"},
+    ],
+    ids=["cross-site", "same-site", "other-origin", "other-port", "opaque-origin", "other-scheme"],
+)
+def test_a_request_another_origins_page_sent_goes_out_without_the_secret(tmp_path, caplog, headers):
+    a = EgressAddon(_gitlab_cfg(tmp_path))
+    flow = _flow(host="gitlab.com", scheme="https", port=443, headers={**headers, "Authorization": "page-supplied"})
+    with caplog.at_level(logging.INFO, logger="daiv_sandbox.egress"):
+        a.requestheaders(flow)
+    assert flow.response is None
+    assert "Authorization" not in flow.request.headers
+    assert "did not inject Authorization for gitlab.com" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("headers", "port"),
+    [
+        ({}, 443),
+        ({"Sec-Fetch-Site": "none"}, 443),
+        ({"Sec-Fetch-Site": "same-origin", "Origin": "https://gitlab.com"}, 443),
+        ({"Origin": "https://GitLab.com:8443"}, 8443),
+    ],
+    ids=["not-a-browser", "typed-navigation", "same-origin", "same-origin-on-its-port"],
+)
+def test_a_request_from_its_own_origin_or_no_browser_gets_the_secret(tmp_path, headers, port):
+    a = EgressAddon(_gitlab_cfg(tmp_path))
+    flow = _flow(host="gitlab.com", scheme="https", port=port, headers=dict(headers))
+    a.requestheaders(flow)
+    assert flow.request.headers["Authorization"] == "Bearer secret"
+
+
 def test_request_with_bracketed_ipv6_host_header_matches_its_host(tmp_path):
     a = EgressAddon(
         _write_cfg(

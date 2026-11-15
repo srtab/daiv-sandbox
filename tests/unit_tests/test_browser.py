@@ -94,7 +94,8 @@ class FakeContainer:
 
     def exec_run(self, cmd, user=None, demux=False):
         self.exec_calls.append((cmd, user))
-        key = PurePosixPath(cmd[1]).name + (":probe" if "--probe" in cmd else "")
+        script = next(part for part in cmd if part.endswith(".py"))
+        key = PurePosixPath(script).name + (":probe" if "--probe" in cmd else "")
         exit_code, stdout, stderr = self.exec_results.get(key, (3, b"", b""))
         return Mock(exit_code=exit_code, output=(stdout, stderr))
 
@@ -243,7 +244,8 @@ async def test_first_start_creates_an_empty_browser_and_relays_to_the_sandbox(cl
     assert (relay.mode, relay.uid) == (0o755, settings.RUN_UID)
     assert SANDBOX_BROWSER_MARKER in sandbox.files
     pump.return_value.start.assert_awaited_once_with(egress_proxy=None)
-    launch_cmd = next(cmd for cmd, _ in browser.exec_calls if cmd[1].endswith("launch.py") and "--probe" not in cmd)
+    launch_cmd = next(cmd for cmd, _ in browser.exec_calls if "/opt/daiv/launch.py" in cmd and "--probe" not in cmd)
+    assert launch_cmd[:3] == ["python3", "-I", "/opt/daiv/launch.py"]
     assert launch_cmd[launch_cmd.index("--extension") + 1] == f"{EXTENSION_ROOT}/{DIGEST}"
     assert "--ca" not in launch_cmd
 
@@ -298,7 +300,7 @@ async def test_start_is_idempotent_while_the_browser_runs(client, pump):
     assert response.started is False
     assert response.profile == "restored"
     assert response.restored_urls == ["http://localhost:3000/"]
-    assert [cmd for cmd, _ in browser.exec_calls[launches:]] == [["python3", "/opt/daiv/launch.py", "--probe"]]
+    assert [cmd for cmd, _ in browser.exec_calls[launches:]] == [["python3", "-I", "/opt/daiv/launch.py", "--probe"]]
 
 
 async def test_a_running_container_whose_chromium_died_is_relaunched(client, pump):
@@ -378,7 +380,7 @@ async def test_stop_saves_the_tabs_then_stops_the_container_keeping_it(client, p
     response = await BrowserManager().stop(SANDBOX_ID)
 
     assert response.model_dump() == {"saved_urls": ["http://localhost:5173/"], "oom_killed": False}
-    assert browser.exec_calls[0] == (["python3", "/opt/daiv/save_tabs.py", "--close"], "1000:1000")
+    assert browser.exec_calls[0] == (["python3", "-I", "/opt/daiv/save_tabs.py", "--close"], "1000:1000")
     browser.stop.assert_called_once_with(timeout=settings.STOP_TIMEOUT_SECONDS)
     browser.remove.assert_not_called()
 

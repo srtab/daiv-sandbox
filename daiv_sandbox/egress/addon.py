@@ -35,6 +35,8 @@ except ImportError:  # pragma: no cover - exercised only inside the sidecar imag
 logger = logging.getLogger("daiv_sandbox.egress")
 
 _AUTHORITY = re.compile(r"(?:\[(?P<ipv6>[0-9A-Fa-f:.]+)\]|(?P<name>[A-Za-z0-9._-]+))(?::[0-9]{1,5})?")
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+_OWN_FETCH_SITES = frozenset({"same-origin", "none"})
 
 
 def _forbidden(flow) -> None:  # pragma: no cover - thin mitmproxy glue, stubbed in tests
@@ -82,6 +84,25 @@ def _host_header_matches(request) -> bool:
         return True
     match = _AUTHORITY.fullmatch(authority)
     return match is not None and (match["ipv6"] or match["name"]).lower() == request.host.lower()
+
+
+def _from_another_origin(request) -> bool:
+    """True when a browser says another origin's page sent the request: a ``Sec-Fetch-Site`` other than
+    ``same-origin`` or ``none`` (a navigation the user started), or an ``Origin`` other than the request's own.
+    Clients that are not browsers (git, package managers) send neither header."""
+    site = request.headers.get("Sec-Fetch-Site")
+    if site is not None and site.strip().lower() not in _OWN_FETCH_SITES:
+        return True
+    origin = request.headers.get("Origin")
+    return origin is not None and origin.strip().lower() != _origin_of(request)
+
+
+def _origin_of(request) -> str:
+    host = request.host.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    port = "" if request.port == _DEFAULT_PORTS.get(request.scheme) else f":{request.port}"
+    return f"{request.scheme}://{host}{port}"
 
 
 class EgressAddon:
@@ -134,6 +155,7 @@ class EgressAddon:
         try:
             decision = self._store.current().evaluate(host, flow.request.method, flow.request.path)
             header_matches = decision.inject is None or _host_header_matches(flow.request)
+            foreign = decision.inject is not None and _from_another_origin(flow.request)
         except Exception:
             # Fail closed: deny and never fall through to the credential-injection branch.
             logger.exception("egress: error evaluating %s %s; failing closed (deny)", flow.request.method, host)
@@ -150,6 +172,9 @@ class EgressAddon:
             name, value = decision.inject
             if name in flow.request.headers:
                 del flow.request.headers[name]
+            if foreign:
+                logger.info("egress: did not inject %s for %s: another origin's page sent the request", name, host)
+                return
             flow.request.headers[name] = value
             logger.info("egress: injected %s for %s", name, host)
 

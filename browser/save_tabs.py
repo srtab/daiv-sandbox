@@ -20,7 +20,7 @@ PROFILE = Path("/profile")
 TABS_FILE = PROFILE / ".daiv-tabs.json"
 DEVTOOLS_PORT = 39222
 CLOSE_WAIT_SECONDS = 5.0
-NOT_RESTORABLE = ("about:", "chrome-extension://", "chrome-error://", "devtools://")
+WEB_SCHEMES = ("http://", "https://")
 
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -31,9 +31,12 @@ def devtools_json(path: str):
 
 
 def restorable_urls(targets: list[dict]) -> list[str]:
-    """Page URLs, least recently active first: /json/list orders by last activity, newest first."""
+    """Web page URLs, least recently active first: /json/list orders by last activity, newest first.
+
+    Any other address (``data:``, ``file:``, ``chrome:``) can carry script or text, so it never reaches a later run.
+    """
     pages = [t.get("url", "") for t in targets if t.get("type") == "page"]
-    return [url for url in reversed(pages) if url and not url.startswith(NOT_RESTORABLE)]
+    return [url for url in reversed(pages) if url.lower().startswith(WEB_SCHEMES)]
 
 
 def save(urls: list[str]) -> None:

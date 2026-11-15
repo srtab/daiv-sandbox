@@ -343,7 +343,7 @@ class BrowserManager:
         return f"{ip}:{settings.EGRESS_PROXY_PORT}"
 
     def _probe(self, browser: Container) -> str | None:
-        result = browser.exec_run(["python3", LAUNCH_SCRIPT, "--probe"], user=BROWSER_USER, demux=True)
+        result = browser.exec_run(["python3", "-I", LAUNCH_SCRIPT, "--probe"], user=BROWSER_USER, demux=True)
         if result.exit_code != 0:
             return None
         stdout, _stderr = result.output
@@ -354,7 +354,7 @@ class BrowserManager:
 
     async def _launch(self, browser: Container, digest: str, *, ca_staged: bool) -> dict:
         timeout = settings.BROWSER_START_TIMEOUT_SECONDS
-        cmd = ["python3", LAUNCH_SCRIPT, "--extension", f"{EXTENSION_ROOT}/{digest}", "--timeout", str(timeout)]
+        cmd = ["python3", "-I", LAUNCH_SCRIPT, "--extension", f"{EXTENSION_ROOT}/{digest}", "--timeout", str(timeout)]
         if ca_staged:
             cmd += ["--ca", BROWSER_CA_PATH]
         try:
@@ -453,7 +453,7 @@ class BrowserManager:
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(
-                    browser.exec_run, ["python3", SAVE_TABS_SCRIPT, "--close"], user=BROWSER_USER, demux=True
+                    browser.exec_run, ["python3", "-I", SAVE_TABS_SCRIPT, "--close"], user=BROWSER_USER, demux=True
                 ),
                 timeout=_SAVE_TABS_TIMEOUT_SECONDS,
             )

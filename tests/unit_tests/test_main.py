@@ -2001,7 +2001,7 @@ def test_start_browser_of_an_unknown_session_is_404(client, browser_manager, bro
 @pytest.mark.parametrize(
     ("error", "status_code", "detail"),
     [
-        (ExtensionMissingError("extension missing"), 409, "extension missing"),
+        (ExtensionMissingError("extension missing"), 412, "extension missing"),
         (BrowserNotReadyError("slow"), 503, "browser not ready in time"),
         (BrowserImageUnavailableError("gone"), 503, "browser image unavailable"),
         (RuntimeError("docker said: /var/run/docker.sock refused"), 500, "browser failed to start"),

@@ -6,6 +6,7 @@ Runs inside the browser container, as the browser user, through a daiv-sandbox e
 import argparse
 import hashlib
 import json
+import shutil
 import socket
 import subprocess
 import sys
@@ -21,6 +22,17 @@ DEVTOOLS_PORT = 39222
 RELAY_PORT = 39223
 TIMEOUT_EXIT = 5
 NOT_RUNNING_EXIT = 3
+WEB_SCHEMES = ("http://", "https://")
+EXECUTABLE_STATE = (
+    "DNR Extension Rules",
+    "Extension Rules",
+    "Extension Scripts",
+    "Extension State",
+    "Local Extension Settings",
+    "Managed Extension Settings",
+    "Service Worker",
+    "Sync Extension Settings",
+)
 
 # Stagehand's own launcher defaults, minus --remote-allow-origins=*, which would let any page drive the browser.
 STAGEHAND_FLAGS = [
@@ -94,7 +106,15 @@ def read_tabs() -> tuple[list[str], str]:
         return [], "unreadable"
     if not isinstance(urls, list) or not all(isinstance(url, str) for url in urls):
         return [], "unreadable"
-    return urls, "ok"
+    return [url for url in urls if url.lower().startswith(WEB_SCHEMES)], "ok"
+
+
+def wipe_executable_state() -> None:
+    """Remove what the profile keeps that could run code in a later run, which may be another person's: the
+    extension's stored scripts, request rules and storage, and the sites' service workers. Cookies and site storage
+    stay."""
+    for name in EXECUTABLE_STATE:
+        shutil.rmtree(PROFILE / "Default" / name, ignore_errors=True)
 
 
 def devtools_version() -> dict | None:
@@ -160,6 +180,7 @@ def main() -> int:
     urls, tabs = read_tabs()
     for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
         (PROFILE / name).unlink(missing_ok=True)
+    wipe_executable_state()
     if not wait_until(deadline, lambda: port_open(RELAY_PORT)):
         print("the relay is not listening", file=sys.stderr)
         return TIMEOUT_EXIT

@@ -629,9 +629,9 @@ async def start_browser(
     Multipart fields: ``request`` (JSON ``BrowserStartRequest``) and ``extension_archive`` (the Stagehand extension
     zip, which may be omitted once a start has installed the same ``extension_sha256``).
 
-    Responds 404 for an unknown session, 409 when the extension is missing or the session is busy, 422 for an
-    invalid request or extension archive, 503 when the browser image is unavailable or Chromium is not ready in
-    time, and 500 otherwise.
+    Responds 404 for an unknown session, 409 when the session is busy, 412 when the archive was left out but the
+    container holds no extension with that digest, 422 for an invalid request or extension archive, 503 when the
+    browser image is unavailable or Chromium is not ready in time, and 500 otherwise.
     """
     try:
         start_request = BrowserStartRequest.model_validate_json(request)
@@ -646,7 +646,7 @@ async def start_browser(
         try:
             return await browser_manager.start(cmd_executor.container, start_request, archive)
         except ExtensionMissingError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="extension missing") from exc
+            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="extension missing") from exc
         except ExtensionInvalidError as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
         except BrowserImageUnavailableError as exc:

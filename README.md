@@ -485,8 +485,8 @@ answers `200` with:
 
 `started` is `false` when the browser was already running. `profile` is `empty` on the session's first start,
 `restored` when the profile came back, and `reset` when it could not be read or the browser container had been
-removed by something other than the service. Errors: `404` unknown session, `409` extension missing (or session
-busy), `422` invalid request or archive, `503` browser image unavailable or Chromium not ready within
+removed by something other than the service. Errors: `404` unknown session, `409` session busy, `412` archive left out
+but no extension with that digest in the container, `422` invalid request or archive, `503` browser image unavailable or Chromium not ready within
 `DAIV_SANDBOX_BROWSER_START_TIMEOUT_SECONDS`, `500` otherwise.
 
 `DELETE /session/{id}/browser/` saves the open tabs' URLs, closes Chromium so its profile is flushed, and stops the

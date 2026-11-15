@@ -214,7 +214,7 @@ async def test_a_browser_recreated_after_an_outside_removal_starts_reset(api):
 async def test_a_start_without_the_archive_of_an_uncached_extension_is_refused(api):
     session_id = api.session()
     response = await asyncio.to_thread(api.start_browser, session_id, archive=False)
-    assert response.status_code == 409
+    assert response.status_code == 412
     assert response.json() == {"detail": "extension missing"}
 
 
