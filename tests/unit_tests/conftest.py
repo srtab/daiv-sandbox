@@ -19,7 +19,6 @@ def browser_manager():
     manager = Mock(spec=BrowserManager)
     manager.start = AsyncMock()
     manager.stop = AsyncMock()
-    manager.remove = AsyncMock()
     manager.find = Mock(return_value=None)
     # Not monkeypatch: its undo deletes a starlette State attribute instead of restoring it.
     original = app.state.browser_manager

@@ -715,6 +715,27 @@ async def test_orphan_browser_sweep_keeps_going_after_a_failed_removal():
     second.remove.assert_called_once_with(force=True, v=True)
 
 
+async def test_reap_once_removes_the_browser_of_a_reaped_sandbox():
+    sandbox = _stopped_container("sbx", "2026-05-31T00:00:00Z")
+    browser = MagicMock(labels={BROWSER_SESSION_LABEL: "sbx"})
+    sandboxes = [sandbox]
+    sandbox.remove.side_effect = lambda **kw: sandboxes.remove(sandbox)
+    client = _egress_client(cmd_execs=sandboxes, browsers=[browser])
+
+    await _reap_once(
+        client,
+        NoopSessionLockManager(),
+        now=NOW,
+        grace_seconds=43200,
+        max_stopped=50,
+        activity=NoopSessionActivityTracker(),
+        idle_seconds=0,
+    )
+
+    sandbox.remove.assert_called_once_with(force=True, v=True)
+    browser.remove.assert_called_once_with(force=True, v=True)
+
+
 async def test_reap_once_sweeps_orphan_browsers_before_orphan_triads():
     client = _egress_client(browsers=[MagicMock(labels={BROWSER_SESSION_LABEL: "gone"})])
     calls = []

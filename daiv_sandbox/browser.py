@@ -36,7 +36,6 @@ from daiv_sandbox.sessions import (
     SANDBOX_HOME,
     TYPE_BROWSER,
     SandboxDockerSession,
-    _normalize_tar_member_name,
     egress_token,
     read_container_file,
 )
@@ -152,16 +151,20 @@ def extension_tar(archive: bytes, digest: str) -> bytes:
             for info in zf.infolist():
                 if info.is_dir():
                     continue
-                try:
-                    name = _normalize_tar_member_name(info.filename)
-                except ValueError:
-                    name = None
-                if name is None or "\\" in info.filename or stat.S_ISLNK(info.external_attr >> 16):
-                    raise ExtensionInvalidError(f"extension archive has an unsafe member: {info.filename!r}")
+                name = info.filename
+                normalized = posixpath.normpath(name)
+                if (
+                    name.startswith("/")
+                    or "\\" in name
+                    or normalized in {".", ".."}
+                    or normalized.startswith("../")
+                    or stat.S_ISLNK(info.external_attr >> 16)
+                ):
+                    raise ExtensionInvalidError(f"extension archive has an unsafe member: {name!r}")
                 total += info.file_size
                 if total > _MAX_EXTENSION_BYTES:
                     raise ExtensionInvalidError("extension archive is too large")
-                files.append((f"{digest}/{name}", zf.read(info), 0o644))
+                files.append((f"{digest}/{normalized}", zf.read(info), 0o644))
     except zipfile.BadZipFile as exc:
         raise ExtensionInvalidError("extension archive is not a zip file") from exc
     if not any(path == f"{digest}/manifest.json" for path, *_ in files):
@@ -241,8 +244,7 @@ class BrowserManager:
                 await asyncio.to_thread(browser.start)
             await self._restart_pump(sandbox, browser)
             launch = await self._launch(browser, request.extension_sha256, ca_staged=ca_staged)
-            if created:
-                await asyncio.to_thread(self._write_marker, sandbox)
+            await asyncio.to_thread(self._write_marker, sandbox)
         except BaseException:
             await self._stop_pump(session_id)
             if created:

@@ -377,6 +377,32 @@ func fakeProxy(t *testing.T, allowedTarget string) (string, chan string) {
 	return ln.Addr().String(), seen
 }
 
+func TestReadConnectReply(t *testing.T) {
+	for _, tc := range []struct {
+		reply string
+		code  int
+	}{
+		{"HTTP/1.1 200 Connection established\r\nVia: mitmproxy\r\n\r\n", 200},
+		{"HTTP/1.1 200\r\n\r\n", 200},
+		{"HTTP/1.0 407 Proxy Authentication Required\r\n\r\n", 407},
+		{"garbage\r\n\r\n", 0},
+		{"HTTP/1.1 2000 Too Long\r\n\r\n", 0},
+		{"SSH-2.0 200 x\r\n\r\n", 0},
+		{"HTTP/1.1 200 OK\r\n", 0},
+	} {
+		code, err := readConnectReply(bufio.NewReader(strings.NewReader(tc.reply)))
+		if tc.code == 0 {
+			if err == nil || errors.Is(err, errRefused) {
+				t.Errorf("%q: got code %d, err %v; want a non-refusal error", tc.reply, code, err)
+			}
+			continue
+		}
+		if err != nil || code != tc.code {
+			t.Errorf("%q: got code %d, err %v; want %d", tc.reply, code, err, tc.code)
+		}
+	}
+}
+
 func TestNonLoopbackGoesThroughTheEgressProxy(t *testing.T) {
 	proxy, seen := fakeProxy(t, "allowed.example:443")
 	relay := startRelay(t, proxy)
