@@ -40,6 +40,19 @@ def test_a_saved_tab_file_restores_only_web_pages(tmp_path, monkeypatch):
     assert launch.read_tabs() == (["http://localhost:5173/"], "ok")
 
 
+def test_the_probe_reads_the_running_chromiums_extension_from_its_command_line(tmp_path):
+    (tmp_path / "self").mkdir()
+    (tmp_path / "7").mkdir()
+    (tmp_path / "7" / "cmdline").write_bytes(b"python3\0-I\0/opt/daiv/launch.py\0--probe\0")
+    (tmp_path / "42").mkdir()
+    (tmp_path / "42" / "cmdline").write_bytes(
+        b"/usr/lib/chromium/chromium\0--load-extension=\0about:blank\0--load-extension=/opt/daiv/extension/ab\0"
+    )
+
+    assert launch.running_extension(tmp_path) == "/opt/daiv/extension/ab"
+    assert launch.running_extension(tmp_path / "self") is None
+
+
 @pytest.mark.parametrize("name", launch.EXECUTABLE_STATE)
 def test_a_launch_wipes_state_that_could_run_code_and_keeps_cookies_and_storage(tmp_path, monkeypatch, name):
     default = tmp_path / "Default"

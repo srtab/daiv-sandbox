@@ -16,10 +16,11 @@ const (
 	frameData     byte = 4
 	frameClose    byte = 5
 	frameReset    byte = 6
+	frameWindow   byte = 7
 
-	headerSize      = 9
-	maxPayload      = 32 * 1024
-	streamQueueSize = 64
+	headerSize   = 9
+	maxPayload   = 32 * 1024
+	streamWindow = 256 * 1024
 )
 
 type frame struct {
@@ -66,6 +67,10 @@ func portPayload(port uint16) []byte {
 	return b
 }
 
+func creditPayload(n int) []byte {
+	return binary.BigEndian.AppendUint32(nil, uint32(n))
+}
+
 // mux carries many TCP streams over one byte pipe; each stream is owned by one conn on this side.
 type mux struct {
 	out     io.Writer
@@ -87,25 +92,30 @@ func (m *mux) send(f frame) error {
 	return writeFrame(m.out, f)
 }
 
+// A stream sends at most streamWindow bytes its peer has not yet written to its conn, and the peer hands that
+// credit back (frameWindow) as it writes, so the demux goroutine never waits on a slow conn.
 type stream struct {
 	id   uint32
 	conn net.Conn
 	m    *mux
 
-	in        chan []byte
-	inClosed  bool
-	done      chan struct{}
 	resetOnce sync.Once
 
 	mu         sync.Mutex
-	localDone  bool
-	remoteDone bool
+	changed    *sync.Cond
+	queue      [][]byte
+	queued     int
+	window     int
+	peerClosed bool
+	readDone   bool
+	writeDone  bool
 	gone       bool
 }
 
 // register makes the stream addressable so frames for it queue up; start begins moving bytes.
 func (m *mux) register(id uint32, conn net.Conn) *stream {
-	s := &stream{id: id, conn: conn, m: m, in: make(chan []byte, streamQueueSize), done: make(chan struct{})}
+	s := &stream{id: id, conn: conn, m: m, window: streamWindow}
+	s.changed = sync.NewCond(&s.mu)
 	m.mu.Lock()
 	m.streams[id] = s
 	m.mu.Unlock()
@@ -132,8 +142,15 @@ func (m *mux) forget(id uint32) {
 func (s *stream) readLoop() {
 	buf := make([]byte, maxPayload)
 	for {
-		n, err := s.conn.Read(buf)
+		room := s.awaitWindow()
+		if room == 0 {
+			return
+		}
+		n, err := s.conn.Read(buf[:room])
 		if n > 0 {
+			s.mu.Lock()
+			s.window -= n
+			s.mu.Unlock()
 			payload := append([]byte(nil), buf[:n]...)
 			if sendErr := s.m.send(frame{kind: frameData, stream: s.id, payload: payload}); sendErr != nil {
 				s.reset(false)
@@ -152,52 +169,105 @@ func (s *stream) readLoop() {
 	}
 }
 
+// awaitWindow waits until the peer has room for more of this stream's bytes and returns how many to read; 0 once
+// the stream is gone.
+func (s *stream) awaitWindow() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.window <= 0 && !s.gone {
+		s.changed.Wait()
+	}
+	if s.gone {
+		return 0
+	}
+	return min(s.window, maxPayload)
+}
+
 func (s *stream) writeLoop() {
 	for {
-		select {
-		case chunk, ok := <-s.in:
-			if !ok {
-				if cw, isTCP := s.conn.(interface{ CloseWrite() error }); isTCP {
-					_ = cw.CloseWrite()
-				}
-				s.finish(false, true)
-				return
+		chunk, ok := s.next()
+		if !ok {
+			return
+		}
+		if chunk == nil {
+			if cw, isTCP := s.conn.(interface{ CloseWrite() error }); isTCP {
+				_ = cw.CloseWrite()
 			}
-			if _, err := s.conn.Write(chunk); err != nil {
-				s.reset(true)
-				return
-			}
-		case <-s.done:
+			s.finish(false, true)
+			return
+		}
+		if _, err := s.conn.Write(chunk); err != nil {
+			s.reset(true)
+			return
+		}
+		if err := s.m.send(frame{kind: frameWindow, stream: s.id, payload: creditPayload(len(chunk))}); err != nil {
+			s.reset(false)
 			return
 		}
 	}
 }
 
-// deliver and remoteClosed run only on the demux goroutine, which is the sole owner of s.in.
-func (s *stream) deliver(payload []byte) {
-	if s.inClosed {
-		return
+// next returns the next chunk to write to the conn, nil once the peer has closed and every chunk is written, and
+// ok false once the stream is gone.
+func (s *stream) next() (chunk []byte, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for len(s.queue) == 0 && !s.peerClosed && !s.gone {
+		s.changed.Wait()
 	}
-	select {
-	case s.in <- payload:
-	case <-s.done:
+	if s.gone {
+		return nil, false
+	}
+	if len(s.queue) == 0 {
+		return nil, true
+	}
+	chunk = s.queue[0]
+	s.queue[0] = nil
+	s.queue = s.queue[1:]
+	s.queued -= len(chunk)
+	return chunk, true
+}
+
+// deliver queues a data frame without blocking; a peer that sends past its window is reset.
+func (s *stream) deliver(payload []byte) {
+	s.mu.Lock()
+	overrun := false
+	if !s.gone && !s.peerClosed {
+		overrun = s.queued+len(payload) > streamWindow
+		if !overrun {
+			s.queue = append(s.queue, payload)
+			s.queued += len(payload)
+			s.changed.Broadcast()
+		}
+	}
+	s.mu.Unlock()
+	if overrun {
+		s.reset(true)
 	}
 }
 
 func (s *stream) remoteClosed() {
-	if !s.inClosed {
-		s.inClosed = true
-		close(s.in)
-	}
+	s.mu.Lock()
+	s.peerClosed = true
+	s.changed.Broadcast()
+	s.mu.Unlock()
 }
 
-func (s *stream) finish(local, remote bool) {
+func (s *stream) grant(credit uint32) {
 	s.mu.Lock()
-	s.localDone = s.localDone || local
-	s.remoteDone = s.remoteDone || remote
-	complete := s.localDone && s.remoteDone && !s.gone
+	s.window = min(s.window+int(credit), streamWindow)
+	s.changed.Broadcast()
+	s.mu.Unlock()
+}
+
+func (s *stream) finish(read, write bool) {
+	s.mu.Lock()
+	s.readDone = s.readDone || read
+	s.writeDone = s.writeDone || write
+	complete := s.readDone && s.writeDone && !s.gone
 	if complete {
 		s.gone = true
+		s.changed.Broadcast()
 	}
 	s.mu.Unlock()
 	if complete {
@@ -210,8 +280,9 @@ func (s *stream) reset(notify bool) {
 	s.resetOnce.Do(func() {
 		s.mu.Lock()
 		s.gone = true
+		s.queue = nil
+		s.changed.Broadcast()
 		s.mu.Unlock()
-		close(s.done)
 		_ = s.conn.Close()
 		s.m.forget(s.id)
 		if notify {
@@ -226,6 +297,10 @@ func (m *mux) dispatch(f frame) bool {
 	case frameData:
 		if s := m.lookup(f.stream); s != nil {
 			s.deliver(f.payload)
+		}
+	case frameWindow:
+		if s := m.lookup(f.stream); s != nil && len(f.payload) == 4 {
+			s.grant(binary.BigEndian.Uint32(f.payload))
 		}
 	case frameClose:
 		if s := m.lookup(f.stream); s != nil {

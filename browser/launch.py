@@ -153,8 +153,26 @@ def wait_until(deadline: float, check) -> bool:
     return False
 
 
-def report(version: dict, urls: list[str], tabs: str) -> None:
-    print(json.dumps({"browser_ws_path": ws_path(version), "restored_urls": urls, "tabs": tabs}))
+def running_extension(proc: Path = Path("/proc")) -> str | None:
+    """The ``--load-extension`` path of the running Chromium, read from its command line. Chromium honours the
+    last occurrence, and Debian's wrapper puts an empty one of its own first."""
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        values = [arg.removeprefix(b"--load-extension=") for arg in argv if arg.startswith(b"--load-extension=")]
+        if values:
+            return values[-1].decode(errors="replace")
+    return None
+
+
+def report(version: dict, urls: list[str], tabs: str, extension: str | None) -> None:
+    print(
+        json.dumps({"browser_ws_path": ws_path(version), "restored_urls": urls, "tabs": tabs, "extension": extension})
+    )
 
 
 def main() -> int:
@@ -169,7 +187,7 @@ def main() -> int:
     if args.probe or version is not None:
         if version is None:
             return NOT_RUNNING_EXIT
-        report(version, [], "running")
+        report(version, [], "running", running_extension())
         return 0
     if not args.extension:
         parser.error("--extension is required to launch")
@@ -197,7 +215,7 @@ def main() -> int:
     while time.monotonic() < deadline:
         version = devtools_version()
         if version is not None:
-            report(version, urls, tabs)
+            report(version, urls, tabs, args.extension)
             return 0
         time.sleep(0.1)
     print("Chromium did not open its DevTools port in time", file=sys.stderr)

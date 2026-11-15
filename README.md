@@ -456,7 +456,9 @@ container** of its own, created on the session's first browser start:
   (`localhost`, `*.localhost`, `127.0.0.1`, `[::1]`) go to the sandbox's own loopback, over a relay the service runs
   between the two containers as exec streams, so `http://localhost:5173` reaches the agent's dev server under both
   runtimes and on network-isolated sessions. Every other destination goes through the session's egress proxy, or is
-  refused when the session has none. The browser's reach is therefore the sandbox's.
+  refused when the session has none. The browser's reach is therefore the sandbox's. The proxy injects a rule's
+  secret into a browser request only when Chromium's `Sec-Fetch-Site` says the page's own origin or the user sent it;
+  Chromium sends that header only to `https` addresses, so the browser gets no secret over plain `http`.
 - **DevTools.** Chromium listens on `127.0.0.1:39222` inside the browser container, and accepts DevTools
   WebSockets only from its extension's origin, so pages cannot drive it. Clients reach it through
   `WS /session/{id}/browser/cdp`.
@@ -483,7 +485,10 @@ answers `200` with:
 }
 ```
 
-`started` is `false` when the browser was already running. `profile` is `empty` on the session's first start,
+`started` is `false` when the browser was already running the requested extension; new memory and CPU limits are
+applied to it in place. A browser running another extension saves its tabs and is relaunched on the requested one
+(`started: true`); if that extension's archive is needed and left out, the start answers `412` and the browser keeps
+running. `profile` is `empty` on the session's first start,
 `restored` when the profile came back, and `reset` when it could not be read or the browser container had been
 removed by something other than the service. Errors: `404` unknown session, `409` session busy, `412` archive left out
 but no extension with that digest in the container, `422` invalid request or archive, `503` browser image unavailable or Chromium not ready within

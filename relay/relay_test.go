@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -169,6 +170,92 @@ func TestLoopbackStreamsAreIndependent(t *testing.T) {
 	b.Close()
 }
 
+// firehoseServer writes to every connection until the write fails, counting the bytes it got out.
+func firehoseServer(t *testing.T) (net.Listener, *atomic.Int64) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	var sent atomic.Int64
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				chunk := make([]byte, maxPayload)
+				for {
+					n, err := conn.Write(chunk)
+					sent.Add(int64(n))
+					if err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return ln, &sent
+}
+
+func waitUntilStalled(t *testing.T, sent *atomic.Int64) {
+	t.Helper()
+	last := int64(-1)
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(300 * time.Millisecond)
+		now := sent.Load()
+		if now == last {
+			return
+		}
+		last = now
+	}
+	t.Fatal("the firehose never stalled")
+}
+
+func TestAStreamNobodyReadsDoesNotStallTheOthers(t *testing.T) {
+	relay := startRelay(t, "")
+	firehose, sent := firehoseServer(t)
+	echo := echoServer(t, "tcp", "127.0.0.1:0")
+
+	unread, code := socksConnect(t, relay, "localhost", portOf(firehose))
+	defer unread.Close()
+	if code != socksSucceeded {
+		t.Fatalf("SOCKS reply %d, want success", code)
+	}
+	waitUntilStalled(t, sent)
+
+	conn, code := socksConnect(t, relay, "localhost", portOf(echo))
+	defer conn.Close()
+	if code != socksSucceeded {
+		t.Fatalf("SOCKS reply %d, want success", code)
+	}
+	assertEcho(t, conn, strings.Repeat("y", 3*maxPayload))
+}
+
+func TestAPeerThatSendsPastItsWindowIsReset(t *testing.T) {
+	var out bytes.Buffer
+	m := newMux(&out)
+	local, remote := net.Pipe()
+	defer remote.Close()
+	s := m.register(9, local)
+	for sent := 0; sent < streamWindow; sent += maxPayload {
+		s.deliver(make([]byte, maxPayload))
+	}
+	if m.lookup(9) == nil {
+		t.Fatal("a peer within its window was reset")
+	}
+	s.deliver([]byte{1})
+	if m.lookup(9) != nil {
+		t.Fatal("a peer past its window was not reset")
+	}
+	if got, err := readFrame(&out); err != nil || got.kind != frameReset || got.stream != 9 {
+		t.Fatalf("got %+v (%v), want a reset for stream 9", got, err)
+	}
+}
+
 func TestDialLoopbackFallsBackToIPv6(t *testing.T) {
 	echo := echoServer(t, "tcp6", "[::1]:0")
 	if c, err := net.Dial("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(portOf(echo))))); err == nil {
@@ -228,7 +315,7 @@ func fakeProxy(t *testing.T, allowedTarget string) (string, chan string) {
 				if err != nil {
 					return
 				}
-				seen <- req.Method + " " + req.Host
+				seen <- req.Method + " " + req.Host + " " + req.Header.Get("X-Daiv-Client")
 				if req.Method != http.MethodConnect || req.Host != allowedTarget {
 					_, _ = io.WriteString(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
 					return
@@ -249,7 +336,7 @@ func TestNonLoopbackGoesThroughTheEgressProxy(t *testing.T) {
 	if code != socksSucceeded {
 		t.Fatalf("allowed host: SOCKS reply %d, want success", code)
 	}
-	if got := <-seen; got != "CONNECT allowed.example:443" {
+	if got := <-seen; got != "CONNECT allowed.example:443 browser" {
 		t.Fatalf("proxy saw %q", got)
 	}
 	assertEcho(t, conn, "through the proxy")

@@ -18,7 +18,7 @@ import stat
 import tarfile
 import zipfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from docker.errors import APIError, ImageNotFound, NotFound
 
@@ -79,6 +79,11 @@ class BrowserNotReadyError(BrowserError):
 
 class BrowserImageUnavailableError(BrowserError):
     pass
+
+
+class RunningBrowser(NamedTuple):
+    ws_path: str
+    extension: str | None
 
 
 def _browser_labels(session_id: str) -> list[str]:
@@ -200,8 +205,9 @@ class BrowserManager:
         session_id = sandbox.id
         existing = await asyncio.to_thread(self.find, session_id)
         if existing is not None and existing.status == "running":
-            ws_path = await asyncio.to_thread(self._probe, existing)
-            if ws_path is not None:
+            running = await asyncio.to_thread(self._probe, existing)
+            if running is not None and running.extension == f"{EXTENSION_ROOT}/{request.extension_sha256}":
+                await asyncio.to_thread(self._apply_limits, existing, request)
                 if not self._pump_alive(session_id):
                     await self._restart_pump(sandbox, existing)
                 known = self._state.get(session_id)
@@ -210,8 +216,12 @@ class BrowserManager:
                     profile=known.profile if known else "restored",
                     restored_urls=known.restored_urls if known else [],
                     devtools_port=DEVTOOLS_PORT,
-                    browser_ws_path=ws_path,
+                    browser_ws_path=running.ws_path,
                 )
+            if running is not None:
+                await asyncio.to_thread(self._ensure_extension, existing, request.extension_sha256, extension_archive)
+                logger.info("Browser: session %s runs another extension; relaunching it", session_id)
+                await self._save_and_close(existing)
 
         created = existing is None
         recreated = False
@@ -342,14 +352,15 @@ class BrowserManager:
         ip = EgressProxyManager(self.client).proxy_internal_ip(token)
         return f"{ip}:{settings.EGRESS_PROXY_PORT}"
 
-    def _probe(self, browser: Container) -> str | None:
+    def _probe(self, browser: Container) -> RunningBrowser | None:
         result = browser.exec_run(["python3", "-I", LAUNCH_SCRIPT, "--probe"], user=BROWSER_USER, demux=True)
         if result.exit_code != 0:
             return None
         stdout, _stderr = result.output
         try:
-            return json.loads(stdout or b"")["browser_ws_path"]
-        except ValueError, KeyError, TypeError:
+            report = json.loads(stdout or b"")
+            return RunningBrowser(ws_path=report["browser_ws_path"], extension=report.get("extension"))
+        except ValueError, KeyError, TypeError, AttributeError:
             return None
 
     async def _launch(self, browser: Container, digest: str, *, ca_staged: bool) -> dict:

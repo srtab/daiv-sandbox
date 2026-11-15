@@ -12,7 +12,7 @@ import os
 import re
 
 try:  # works both as `daiv_sandbox.egress.policy` (tests) and flat `policy` (sidecar image, see Dockerfile)
-    from daiv_sandbox.egress.constants import CONFIG_PATH, CONFIG_PATH_ENV
+    from daiv_sandbox.egress.constants import BROWSER_CLIENT, BROWSER_CLIENT_HEADER, CONFIG_PATH, CONFIG_PATH_ENV
     from daiv_sandbox.egress.policy import (
         REASON_HOST_HEADER_MISMATCH,
         REASON_HOST_NOT_LISTED,
@@ -22,7 +22,7 @@ try:  # works both as `daiv_sandbox.egress.policy` (tests) and flat `policy` (si
         PolicyStore,
     )
 except ImportError:  # pragma: no cover - exercised only inside the sidecar image
-    from constants import CONFIG_PATH, CONFIG_PATH_ENV  # type: ignore[no-redef]
+    from constants import BROWSER_CLIENT, BROWSER_CLIENT_HEADER, CONFIG_PATH, CONFIG_PATH_ENV  # type: ignore[no-redef]
     from policy import (  # type: ignore[no-redef]
         REASON_HOST_HEADER_MISMATCH,
         REASON_HOST_NOT_LISTED,
@@ -86,12 +86,18 @@ def _host_header_matches(request) -> bool:
     return match is not None and (match["ipv6"] or match["name"]).lower() == request.host.lower()
 
 
-def _from_another_origin(request) -> bool:
-    """True when a browser says another origin's page sent the request: a ``Sec-Fetch-Site`` other than
+def _from_another_origin(request, *, from_browser: bool) -> bool:
+    """True when another origin's page may have sent the request: a ``Sec-Fetch-Site`` other than
     ``same-origin`` or ``none`` (a navigation the user started), or an ``Origin`` other than the request's own.
-    Clients that are not browsers (git, package managers) send neither header."""
+
+    Chromium sends ``Sec-Fetch-Site`` only to https, so a browser request without it (plain http) cannot be
+    attributed and counts as another origin's. Clients that are not browsers (git, package managers) send neither
+    header."""
     site = request.headers.get("Sec-Fetch-Site")
-    if site is not None and site.strip().lower() not in _OWN_FETCH_SITES:
+    if site is None:
+        if from_browser:
+            return True
+    elif site.strip().lower() not in _OWN_FETCH_SITES:
         return True
     origin = request.headers.get("Origin")
     return origin is not None and origin.strip().lower() != _origin_of(request)
@@ -108,6 +114,7 @@ def _origin_of(request) -> str:
 class EgressAddon:
     def __init__(self, config_path: str | None = None):
         self._store = PolicyStore(config_path or os.environ.get(CONFIG_PATH_ENV, CONFIG_PATH))
+        self._browser_clients: set[str] = set()
 
     def http_connect(self, flow) -> None:
         """CONNECT fires before TLS — enforce reachability here so deny works even in passthrough.
@@ -117,6 +124,8 @@ class EgressAddon:
         """
         host = flow.request.host
         try:
+            if flow.request.headers.get(BROWSER_CLIENT_HEADER) == BROWSER_CLIENT:
+                self._browser_clients.add(flow.client_conn.id)
             decision = self._store.current().evaluate(host, "CONNECT")
         except Exception:
             logger.exception("egress: error evaluating CONNECT to %s; failing closed (deny)", host)
@@ -124,6 +133,9 @@ class EgressAddon:
             return
         if not decision.allow:
             _deny(flow, f"CONNECT {host}", decision.block)
+
+    def client_disconnected(self, client) -> None:
+        self._browser_clients.discard(client.id)
 
     def tls_clienthello(self, data) -> None:
         """For allowed-but-not-intercepted hosts, tunnel TLS untouched (no MITM).
@@ -155,7 +167,9 @@ class EgressAddon:
         try:
             decision = self._store.current().evaluate(host, flow.request.method, flow.request.path)
             header_matches = decision.inject is None or _host_header_matches(flow.request)
-            foreign = decision.inject is not None and _from_another_origin(flow.request)
+            foreign = decision.inject is not None and _from_another_origin(
+                flow.request, from_browser=flow.client_conn.id in self._browser_clients
+            )
         except Exception:
             # Fail closed: deny and never fall through to the credential-injection branch.
             logger.exception("egress: error evaluating %s %s; failing closed (deny)", flow.request.method, host)
@@ -173,7 +187,7 @@ class EgressAddon:
             if name in flow.request.headers:
                 del flow.request.headers[name]
             if foreign:
-                logger.info("egress: did not inject %s for %s: another origin's page sent the request", name, host)
+                logger.info("egress: did not inject %s for %s: another origin's page may have sent it", name, host)
                 return
             flow.request.headers[name] = value
             logger.info("egress: injected %s for %s", name, host)

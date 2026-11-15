@@ -175,7 +175,9 @@ func dialThroughProxy(proxy, host string, port uint16) (net.Conn, []byte, error)
 	}
 	_ = upstream.SetDeadline(time.Now().Add(handshakeTimeout))
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
-	if _, err := fmt.Fprintf(upstream, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+	// The marker makes the egress proxy require Fetch metadata before it injects a credential (see addon.py).
+	connect := "CONNECT %s HTTP/1.1\r\nHost: %s\r\nX-Daiv-Client: browser\r\n\r\n"
+	if _, err := fmt.Fprintf(upstream, connect, target, target); err != nil {
 		_ = upstream.Close()
 		return nil, nil, err
 	}

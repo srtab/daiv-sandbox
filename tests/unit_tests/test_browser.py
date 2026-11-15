@@ -100,8 +100,9 @@ class FakeContainer:
         return Mock(exit_code=exit_code, output=(stdout, stderr))
 
 
-def _launch_ok(urls=(), tabs="none") -> tuple[int, bytes, bytes]:
-    return 0, json.dumps({"browser_ws_path": WS_PATH, "restored_urls": list(urls), "tabs": tabs}).encode(), b""
+def _launch_ok(urls=(), tabs="none", extension=f"{EXTENSION_ROOT}/{DIGEST}") -> tuple[int, bytes, bytes]:
+    report = {"browser_ws_path": WS_PATH, "restored_urls": list(urls), "tabs": tabs, "extension": extension}
+    return 0, json.dumps(report).encode(), b""
 
 
 @pytest.fixture
@@ -301,6 +302,54 @@ async def test_start_is_idempotent_while_the_browser_runs(client, pump):
     assert response.profile == "restored"
     assert response.restored_urls == ["http://localhost:3000/"]
     assert [cmd for cmd, _ in browser.exec_calls[launches:]] == [["python3", "-I", "/opt/daiv/launch.py", "--probe"]]
+
+
+def _running_browser(client, *, extension: str) -> FakeContainer:
+    browser = _new_browser(client)
+    browser.status = "running"
+    browser.files[f"{EXTENSION_ROOT}/{DIGEST}/manifest.json"] = b"{}"
+    browser.exec_results["launch.py:probe"] = _launch_ok(tabs="running", extension=extension)
+    browser.exec_results["save_tabs.py"] = (0, json.dumps({"saved_urls": ["http://localhost:3000/"]}).encode(), b"")
+    browser.exec_results["launch.py"] = _launch_ok(["http://localhost:3000/"], tabs="ok")
+    client.containers.list.return_value = [browser]
+    return browser
+
+
+def _scripts_run(browser: FakeContainer) -> list[str]:
+    return [PurePosixPath(next(p for p in cmd if p.endswith(".py"))).name for cmd, _ in browser.exec_calls]
+
+
+async def test_a_running_browser_on_another_extension_is_relaunched_on_the_requested_one(client, pump):
+    browser = _running_browser(client, extension=f"{EXTENSION_ROOT}/{'0' * 64}")
+
+    response = await BrowserManager().start(_sandbox(), _request(), None)
+
+    assert response.started is True
+    assert response.profile == "restored"
+    assert response.restored_urls == ["http://localhost:3000/"]
+    assert _scripts_run(browser) == ["launch.py", "save_tabs.py", "launch.py"]
+    launch_cmd = browser.exec_calls[-1][0]
+    assert launch_cmd[launch_cmd.index("--extension") + 1] == f"{EXTENSION_ROOT}/{DIGEST}"
+
+
+async def test_a_new_extension_that_was_not_sent_leaves_the_running_browser_alone(client, pump):
+    browser = _running_browser(client, extension=f"{EXTENSION_ROOT}/{'0' * 64}")
+    del browser.files[f"{EXTENSION_ROOT}/{DIGEST}/manifest.json"]
+
+    with pytest.raises(ExtensionMissingError):
+        await BrowserManager().start(_sandbox(), _request(), None)
+
+    assert _scripts_run(browser) == ["launch.py"]
+
+
+async def test_a_running_browser_takes_new_limits_without_a_relaunch(client, pump):
+    browser = _running_browser(client, extension=f"{EXTENSION_ROOT}/{DIGEST}")
+
+    response = await BrowserManager().start(_sandbox(), _request(memory_bytes=2 << 30), None)
+
+    assert response.started is False
+    assert client.api._post_json.call_args.kwargs["data"]["Memory"] == 2 << 30
+    assert _scripts_run(browser) == ["launch.py"]
 
 
 async def test_a_running_container_whose_chromium_died_is_relaunched(client, pump):
