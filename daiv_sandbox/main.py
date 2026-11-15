@@ -710,10 +710,13 @@ async def browser_cdp(websocket: WebSocket, session_id: str) -> None:
         await asyncio.wait([tunnel])
     finally:
         tunnel.cancel()
-        await asyncio.gather(tunnel, return_exceptions=True)
-        await stream.close()
-        with contextlib.suppress(Exception):
-            await websocket.close(code=1000)
+        try:
+            await asyncio.gather(tunnel, return_exceptions=True)
+        finally:
+            # An anyio cancel scope re-cancels every await here, the gather included.
+            await stream.close()
+            with contextlib.suppress(Exception):
+                await websocket.close(code=1000)
 
 
 async def _pump_cdp(websocket: WebSocket, stream, session_id: str) -> None:
