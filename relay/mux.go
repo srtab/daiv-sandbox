@@ -151,8 +151,7 @@ func (s *stream) readLoop() {
 			s.mu.Lock()
 			s.window -= n
 			s.mu.Unlock()
-			payload := append([]byte(nil), buf[:n]...)
-			if sendErr := s.m.send(frame{kind: frameData, stream: s.id, payload: payload}); sendErr != nil {
+			if sendErr := s.m.send(frame{kind: frameData, stream: s.id, payload: buf[:n]}); sendErr != nil {
 				s.reset(false)
 				return
 			}
@@ -314,6 +313,23 @@ func (m *mux) dispatch(f frame) bool {
 		return false
 	}
 	return true
+}
+
+// demux reads frames until the pipe ends; control sees each frame first and returns true for one it consumed.
+func (m *mux) demux(in io.Reader, control func(frame) bool) error {
+	defer m.closeAll()
+	for {
+		f, err := readFrame(in)
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !control(f) {
+			m.dispatch(f)
+		}
+	}
 }
 
 func (m *mux) closeAll() {

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
@@ -52,28 +52,21 @@ func (l *listener) accept(ln net.Listener) {
 }
 
 func (l *listener) demux(in io.Reader) error {
-	defer l.m.closeAll()
-	for {
-		f, err := readFrame(in)
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if l.m.dispatch(f) {
-			continue
-		}
-		if f.kind == frameOpenOK || f.kind == frameOpenFail {
-			l.m.mu.Lock()
-			ch := l.m.pending[f.stream]
-			delete(l.m.pending, f.stream)
-			l.m.mu.Unlock()
-			if ch != nil {
-				ch <- f.kind == frameOpenOK
-			}
-		}
+	return l.m.demux(in, l.control)
+}
+
+func (l *listener) control(f frame) bool {
+	if f.kind != frameOpenOK && f.kind != frameOpenFail {
+		return false
 	}
+	l.m.mu.Lock()
+	ch := l.m.pending[f.stream]
+	delete(l.m.pending, f.stream)
+	l.m.mu.Unlock()
+	if ch != nil {
+		ch <- f.kind == frameOpenOK
+	}
+	return true
 }
 
 func isLoopback(host string) bool {
@@ -182,19 +175,38 @@ func dialThroughProxy(proxy, host string, port uint16) (net.Conn, []byte, error)
 		return nil, nil, err
 	}
 	br := bufio.NewReader(upstream)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	code, err := readConnectReply(br)
 	if err != nil {
 		_ = upstream.Close()
 		return nil, nil, err
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if code != 200 {
 		_ = upstream.Close()
-		return nil, nil, fmt.Errorf("%w: proxy answered %d", errRefused, resp.StatusCode)
+		return nil, nil, fmt.Errorf("%w: proxy answered %d", errRefused, code)
 	}
 	_ = upstream.SetDeadline(time.Time{})
 	buffered, _ := br.Peek(br.Buffered())
 	return upstream, append([]byte(nil), buffered...), nil
+}
+
+// readConnectReply returns the proxy's CONNECT status code. Not http.ReadResponse: net/http adds ~1.3 MB to a
+// binary copied into every sandbox.
+func readConnectReply(br *bufio.Reader) (int, error) {
+	tp := textproto.NewReader(br)
+	line, err := tp.ReadLine()
+	if err != nil {
+		return 0, err
+	}
+	proto, rest, _ := strings.Cut(line, " ")
+	codeText, _, _ := strings.Cut(rest, " ")
+	code, err := strconv.Atoi(codeText)
+	if err != nil || len(codeText) != 3 || !strings.HasPrefix(proto, "HTTP/1.") {
+		return 0, fmt.Errorf("malformed CONNECT reply %q", line)
+	}
+	if _, err := tp.ReadMIMEHeader(); err != nil {
+		return 0, err
+	}
+	return code, nil
 }
 
 func pipe(a, b net.Conn) {

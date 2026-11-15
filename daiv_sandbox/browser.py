@@ -18,6 +18,7 @@ import stat
 import tarfile
 import time
 import zipfile
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
@@ -35,12 +36,14 @@ from daiv_sandbox.sessions import (
     SANDBOX_HOME,
     TYPE_BROWSER,
     SandboxDockerSession,
+    _normalize_tar_member_name,
     egress_token,
+    read_container_file,
 )
 
 if TYPE_CHECKING:
     from docker import DockerClient
-    from docker.models.containers import Container
+    from docker.models.containers import Container, ExecResult
 
 logger = logging.getLogger("daiv_sandbox.browser")
 
@@ -64,23 +67,30 @@ _MAX_EXTENSION_BYTES = 64 << 20
 
 
 class BrowserError(Exception):
-    """A browser start that failed for a reason the caller can be told about."""
+    """A browser start that failed for a reason the caller can be told about, as ``status_code`` and ``detail``
+    (the message when ``detail`` is None)."""
+
+    status_code: int = HTTPStatus.INTERNAL_SERVER_ERROR
+    detail: str | None = None
 
 
 class ExtensionMissingError(BrowserError):
-    pass
+    status_code = HTTPStatus.PRECONDITION_FAILED
+    detail = "extension missing"
 
 
 class ExtensionInvalidError(BrowserError):
-    pass
+    status_code = HTTPStatus.UNPROCESSABLE_CONTENT
 
 
 class BrowserNotReadyError(BrowserError):
-    pass
+    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+    detail = "browser not ready in time"
 
 
 class BrowserImageUnavailableError(BrowserError):
-    pass
+    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+    detail = "browser image unavailable"
 
 
 class RunningBrowser(NamedTuple):
@@ -88,82 +98,75 @@ class RunningBrowser(NamedTuple):
     extension: str | None
 
 
-def _browser_labels(session_id: str) -> list[str]:
-    return [f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_BROWSER}", f"{BROWSER_SESSION_LABEL}={session_id}"]
+def _browser_labels(session_id: str) -> dict[str, str]:
+    return {DAIV_SANDBOX_TYPE_LABEL: TYPE_BROWSER, BROWSER_SESSION_LABEL: session_id}
 
 
 def find_browser(client: DockerClient, session_id: str) -> Container | None:
-    found = client.containers.list(all=True, filters={"label": _browser_labels(session_id)})
+    labels = [f"{key}={value}" for key, value in _browser_labels(session_id).items()]
+    found = client.containers.list(all=True, filters={"label": labels})
     return found[0] if found else None
 
 
-def remove_browser(client: DockerClient, session_id: str) -> bool:
-    """Force-remove the session's browser container and its profile; True if one existed."""
-    removed = False
-    for container in client.containers.list(all=True, filters={"label": _browser_labels(session_id)}):
-        with contextlib.suppress(NotFound):
-            container.remove(force=True, v=True)
-            removed = True
-    if removed:
-        logger.info("Browser: removed the browser container of session %s", session_id)
-    return removed
-
-
-def _file_tar(members: list[tuple[str, bytes | None, int, int]]) -> bytes:
-    """A tar of ``(name, content or None for a directory, mode, uid)`` members, owned by uid:uid and dated now
+def _file_tar(files: list[tuple[str, bytes, int]], *, uid: int) -> bytes:
+    """A tar of ``(path, content, mode)`` files and their parent directories, owned by uid:uid and dated now
     (``put_archive`` keeps the mtime, and TarInfo's default would date them 1970)."""
     buf = io.BytesIO()
     now = int(time.time())
+    dirs: set[str] = set()
+
+    def member(name: str, mode: int) -> tarfile.TarInfo:
+        info = tarfile.TarInfo(name)
+        info.mode = mode
+        info.uid = info.gid = uid
+        info.mtime = now
+        return info
+
     with tarfile.open(fileobj=buf, mode="w") as tar:
-        for name, content, mode, uid in members:
-            info = tarfile.TarInfo(name)
-            info.mode = mode
-            info.uid = info.gid = uid
-            info.mtime = now
-            if content is None:
-                info.type = tarfile.DIRTYPE
-                tar.addfile(info)
-            else:
-                info.size = len(content)
-                tar.addfile(info, io.BytesIO(content))
+        for path, content, mode in files:
+            parts = path.split("/")
+            for depth in range(1, len(parts)):
+                parent = "/".join(parts[:depth])
+                if parent not in dirs:
+                    dirs.add(parent)
+                    info = member(parent, 0o755)
+                    info.type = tarfile.DIRTYPE
+                    tar.addfile(info)
+            info = member(path, mode)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
     return buf.getvalue()
+
+
+def _put_file(container: Container, path: str, content: bytes, *, root: str, mode: int, uid: int) -> bool:
+    """Write one file at ``path``, creating its missing parent directories below ``root``."""
+    return container.put_archive(root, _file_tar([(posixpath.relpath(path, root), content, mode)], uid=uid))
 
 
 def extension_tar(archive: bytes, digest: str) -> bytes:
     """Repack the extension zip as a tar rooted at ``<digest>/``, refusing links and paths that escape it."""
-    members: list[tuple[str, bytes | None, int, int]] = [(digest, None, 0o755, BROWSER_UID)]
-    dirs = {digest}
+    files: list[tuple[str, bytes, int]] = []
     total = 0
     try:
         with zipfile.ZipFile(io.BytesIO(archive)) as zf:
             for info in zf.infolist():
                 if info.is_dir():
                     continue
-                name = info.filename
-                normalized = posixpath.normpath(name)
-                if (
-                    name.startswith("/")
-                    or "\\" in name
-                    or normalized in {".", ".."}
-                    or normalized.startswith("../")
-                    or stat.S_ISLNK(info.external_attr >> 16)
-                ):
-                    raise ExtensionInvalidError(f"extension archive has an unsafe member: {name!r}")
+                try:
+                    name = _normalize_tar_member_name(info.filename)
+                except ValueError:
+                    name = None
+                if name is None or "\\" in info.filename or stat.S_ISLNK(info.external_attr >> 16):
+                    raise ExtensionInvalidError(f"extension archive has an unsafe member: {info.filename!r}")
                 total += info.file_size
                 if total > _MAX_EXTENSION_BYTES:
                     raise ExtensionInvalidError("extension archive is too large")
-                parts = normalized.split("/")
-                for depth in range(1, len(parts)):
-                    parent = posixpath.join(digest, *parts[:depth])
-                    if parent not in dirs:
-                        dirs.add(parent)
-                        members.append((parent, None, 0o755, BROWSER_UID))
-                members.append((posixpath.join(digest, normalized), zf.read(info), 0o644, BROWSER_UID))
+                files.append((f"{digest}/{name}", zf.read(info), 0o644))
     except zipfile.BadZipFile as exc:
         raise ExtensionInvalidError("extension archive is not a zip file") from exc
-    if not any(name == f"{digest}/manifest.json" for name, *_ in members):
+    if not any(path == f"{digest}/manifest.json" for path, *_ in files):
         raise ExtensionInvalidError("extension archive has no manifest.json")
-    return _file_tar(members)
+    return _file_tar(files, uid=BROWSER_UID)
 
 
 def _path_exists(container: Container, path: str) -> bool:
@@ -176,14 +179,9 @@ def _path_exists(container: Container, path: str) -> bool:
     return True
 
 
-def _read_single_file(container: Container, path: str) -> bytes:
-    bits, _stat = container.get_archive(path)
-    with tarfile.open(fileobj=io.BytesIO(b"".join(bits))) as tar:
-        member = next(m for m in tar.getmembers() if m.isfile())
-        extracted = tar.extractfile(member)
-        if extracted is None:
-            raise RuntimeError(f"browser: {path} is not a regular file")
-        return extracted.read()
+async def _run_script(browser: Container, script: str, *args: str, timeout: float | None = None) -> ExecResult:
+    run = asyncio.to_thread(browser.exec_run, ["python3", "-I", script, *args], user=BROWSER_USER, demux=True)
+    return await asyncio.wait_for(run, timeout)
 
 
 class BrowserManager:
@@ -203,15 +201,13 @@ class BrowserManager:
     def find(self, session_id: str) -> Container | None:
         return find_browser(self.client, session_id)
 
-    # --- start ------------------------------------------------------------------------------------
-
     async def start(
         self, sandbox: Container, request: BrowserStartRequest, extension_archive: bytes | None
     ) -> BrowserStartResponse:
         session_id = sandbox.id
         existing = await asyncio.to_thread(self.find, session_id)
         if existing is not None and existing.status == "running":
-            running = await asyncio.to_thread(self._probe, existing)
+            running = await self._probe(existing)
             if running is not None and running.extension == f"{EXTENSION_ROOT}/{request.extension_sha256}":
                 await asyncio.to_thread(self._apply_limits, existing, request)
                 if not self._pump_alive(session_id):
@@ -245,7 +241,8 @@ class BrowserManager:
                 await asyncio.to_thread(browser.start)
             await self._restart_pump(sandbox, browser)
             launch = await self._launch(browser, request.extension_sha256, ca_staged=ca_staged)
-            await asyncio.to_thread(self._write_marker, sandbox)
+            if created:
+                await asyncio.to_thread(self._write_marker, sandbox)
         except BaseException:
             await self._stop_pump(session_id)
             if created:
@@ -272,7 +269,7 @@ class BrowserManager:
         return response
 
     def _create(self, sandbox: Container, request: BrowserStartRequest) -> Container:
-        labels = {DAIV_SANDBOX_TYPE_LABEL: TYPE_BROWSER, BROWSER_SESSION_LABEL: sandbox.id}
+        labels = _browser_labels(sandbox.id)
         kwargs: dict = {
             "image": settings.BROWSER_IMAGE,
             "detach": True,
@@ -326,16 +323,14 @@ class BrowserManager:
         if not (egress_token(sandbox) and settings.egress_enabled and settings.EGRESS_CA_CERT_FILE):
             return False
         cert = Path(settings.EGRESS_CA_CERT_FILE).read_bytes()
-        relative = posixpath.relpath(BROWSER_CA_PATH, BROWSER_HOME)
-        tar = _file_tar([(posixpath.dirname(relative), None, 0o755, BROWSER_UID), (relative, cert, 0o644, BROWSER_UID)])
-        if not browser.put_archive(BROWSER_HOME, tar):
+        if not _put_file(browser, BROWSER_CA_PATH, cert, root=BROWSER_HOME, mode=0o644, uid=BROWSER_UID):
             raise RuntimeError(f"browser: failed to stage the egress CA into {browser.short_id}")
         return True
 
     def _relay_bytes(self, browser: Container) -> bytes:
         image_id = browser.attrs.get("Image", "")
         if image_id not in self._relay_binary:
-            self._relay_binary[image_id] = _read_single_file(browser, IMAGE_RELAY_PATH)
+            self._relay_binary[image_id] = read_container_file(browser, IMAGE_RELAY_PATH)
         return self._relay_binary[image_id]
 
     def _install_relay(self, sandbox: Container, browser: Container) -> None:
@@ -346,8 +341,7 @@ class BrowserManager:
         copied = self._relays.get(sandbox.id) == image_id
         if copied and self._sandbox_file_size(sandbox, SANDBOX_RELAY_PATH) == len(relay):
             return
-        tar = _file_tar([(".daiv", None, 0o755, settings.RUN_UID), (".daiv/relay", relay, 0o755, settings.RUN_UID)])
-        if not sandbox.put_archive(SANDBOX_HOME, tar):
+        if not _put_file(sandbox, SANDBOX_RELAY_PATH, relay, root=SANDBOX_HOME, mode=0o755, uid=settings.RUN_UID):
             raise RuntimeError(f"browser: failed to copy daiv-relay into sandbox {sandbox.short_id}")
         self._relays[sandbox.id] = image_id
 
@@ -360,8 +354,7 @@ class BrowserManager:
         return decode_json_header(response.headers["X-Docker-Container-Path-Stat"]).get("size")
 
     def _write_marker(self, sandbox: Container) -> None:
-        tar = _file_tar([(".daiv", None, 0o755, settings.RUN_UID), (".daiv/browser", b"", 0o644, settings.RUN_UID)])
-        if not sandbox.put_archive(SANDBOX_HOME, tar):
+        if not _put_file(sandbox, SANDBOX_BROWSER_MARKER, b"", root=SANDBOX_HOME, mode=0o644, uid=settings.RUN_UID):
             logger.warning("Browser: could not write the browser marker into sandbox %s", sandbox.short_id)
 
     def _egress_proxy_address(self, sandbox: Container) -> str | None:
@@ -371,8 +364,8 @@ class BrowserManager:
         ip = EgressProxyManager(self.client).proxy_internal_ip(token)
         return f"{ip}:{settings.EGRESS_PROXY_PORT}"
 
-    def _probe(self, browser: Container) -> RunningBrowser | None:
-        result = browser.exec_run(["python3", "-I", LAUNCH_SCRIPT, "--probe"], user=BROWSER_USER, demux=True)
+    async def _probe(self, browser: Container) -> RunningBrowser | None:
+        result = await _run_script(browser, LAUNCH_SCRIPT, "--probe")
         if result.exit_code != 0:
             return None
         stdout, _stderr = result.output
@@ -384,13 +377,11 @@ class BrowserManager:
 
     async def _launch(self, browser: Container, digest: str, *, ca_staged: bool) -> dict:
         timeout = settings.BROWSER_START_TIMEOUT_SECONDS
-        cmd = ["python3", "-I", LAUNCH_SCRIPT, "--extension", f"{EXTENSION_ROOT}/{digest}", "--timeout", str(timeout)]
+        args = ["--extension", f"{EXTENSION_ROOT}/{digest}", "--timeout", str(timeout)]
         if ca_staged:
-            cmd += ["--ca", BROWSER_CA_PATH]
+            args += ["--ca", BROWSER_CA_PATH]
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(browser.exec_run, cmd, user=BROWSER_USER, demux=True), timeout=timeout + 10
-            )
+            result = await _run_script(browser, LAUNCH_SCRIPT, *args, timeout=timeout + 10)
         except TimeoutError as exc:
             raise BrowserNotReadyError("the browser did not become ready in time") from exc
         stdout, stderr = result.output
@@ -404,14 +395,13 @@ class BrowserManager:
         except ValueError as exc:
             raise RuntimeError("browser launch reported no DevTools endpoint") from exc
 
-    # --- relay pump -------------------------------------------------------------------------------
-
     def _pump_alive(self, session_id: str) -> bool:
         pump = self._pumps.get(session_id)
         return pump is not None and pump.alive
 
     async def _restart_pump(self, sandbox: Container, browser: Container) -> None:
-        await self._stop_pump(sandbox.id)
+        session_id = sandbox.id
+        await self._stop_pump(session_id)
         await asyncio.to_thread(self._install_relay, sandbox, browser)
         proxy = await asyncio.to_thread(self._egress_proxy_address, sandbox)
         pump = RelayPump(
@@ -422,8 +412,8 @@ class BrowserManager:
             browser_user=BROWSER_USER,
         )
         await pump.start(egress_proxy=proxy)
-        self._pumps[sandbox.id] = pump
-        pump.on_exit(lambda: self._forget_pump(sandbox.id, pump))
+        self._pumps[session_id] = pump
+        pump.on_exit(lambda: self._forget_pump(session_id, pump))
 
     def _forget_pump(self, session_id: str, pump: RelayPump) -> None:
         """A pump that exits on its own most often means its sandbox or browser was removed, by the reaper or
@@ -438,8 +428,6 @@ class BrowserManager:
         if pump is not None:
             await pump.stop()
 
-    # --- CDP tunnels --------------------------------------------------------------------------------
-
     def track_tunnel(self, session_id: str, task: asyncio.Task) -> None:
         self._tunnels.setdefault(session_id, set()).add(task)
         task.add_done_callback(lambda done: self._tunnels.get(session_id, set()).discard(done))
@@ -450,8 +438,6 @@ class BrowserManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-
-    # --- stop and remove ----------------------------------------------------------------------------
 
     async def stop(self, session_id: str, *, force: bool = False) -> BrowserStopResponse:
         """Save the open tabs, close Chromium so its profile flushes, then stop (or, with force, remove) it."""
@@ -477,20 +463,9 @@ class BrowserManager:
             logger.error("Browser: the browser of session %s had been killed for memory", session_id)
         return BrowserStopResponse(saved_urls=saved_urls, oom_killed=oom_killed)
 
-    async def remove(self, session_id: str) -> None:
-        await self.close_tunnels(session_id)
-        await self._stop_pump(session_id)
-        self._state.pop(session_id, None)
-        await asyncio.to_thread(remove_browser, self.client, session_id)
-
     async def _save_and_close(self, browser: Container) -> list[str]:
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    browser.exec_run, ["python3", "-I", SAVE_TABS_SCRIPT, "--close"], user=BROWSER_USER, demux=True
-                ),
-                timeout=_SAVE_TABS_TIMEOUT_SECONDS,
-            )
+            result = await _run_script(browser, SAVE_TABS_SCRIPT, "--close", timeout=_SAVE_TABS_TIMEOUT_SECONDS)
             stdout, stderr = result.output
             if stderr:
                 logger.warning("Browser: closing %s: %s", browser.short_id, stderr.decode(errors="replace").strip())

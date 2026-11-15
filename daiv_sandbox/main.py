@@ -21,22 +21,13 @@ from redis.asyncio import Redis
 
 from daiv_sandbox import __version__
 from daiv_sandbox.activity import NoopSessionActivityTracker, RedisSessionActivityTracker
-from daiv_sandbox.browser import (
-    BROWSER_USER,
-    DEVTOOLS_PORT,
-    BrowserImageUnavailableError,
-    BrowserManager,
-    BrowserNotReadyError,
-    ExtensionInvalidError,
-    ExtensionMissingError,
-    probe_browser_image,
-)
+from daiv_sandbox.browser import BROWSER_USER, DEVTOOLS_PORT, BrowserError, BrowserManager, probe_browser_image
 from daiv_sandbox.config import settings
 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, SessionBusyError
 from daiv_sandbox.logs import LOGGING_CONFIG
 from daiv_sandbox.reaper import start_reaper
-from daiv_sandbox.relay import open_exec_stream
+from daiv_sandbox.relay import forward, open_exec_stream
 from daiv_sandbox.schemas import (
     BrowserStartRequest,
     BrowserStartResponse,
@@ -489,10 +480,7 @@ async def close_session(
         # a member of the session's egress network, which suspend and teardown take down.
         browser_manager: BrowserManager = request.app.state.browser_manager
         try:
-            if force:
-                await browser_manager.remove(session_id)
-            else:
-                await browser_manager.stop(session_id)
+            await browser_manager.stop(session_id, force=force)
         except Exception:
             logger.exception("Browser: failed to close the browser of session %s", session_id)
 
@@ -645,19 +633,9 @@ async def start_browser(
     async with _workspace_executor(http_request, session_id) as cmd_executor:
         try:
             return await browser_manager.start(cmd_executor.container, start_request, archive)
-        except ExtensionMissingError as exc:
-            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="extension missing") from exc
-        except ExtensionInvalidError as exc:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
-        except BrowserImageUnavailableError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="browser image unavailable"
-            ) from exc
-        except BrowserNotReadyError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="browser not ready in time"
-            ) from exc
-        except HTTPException, SessionUnavailableError:
+        except BrowserError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail or str(exc)) from exc
+        except SessionUnavailableError:
             raise
         except APIError as exc:
             logger.exception("Browser: Docker failed to start the browser of session %s", session_id)
@@ -752,17 +730,16 @@ async def _pump_cdp(websocket: WebSocket, stream, session_id: str) -> None:
             if message.get("bytes"):
                 await stream.write(message["bytes"])
 
-    async def browser_to_client() -> None:
-        async for chunk in stream.stdout_chunks():
-            await websocket.send_bytes(chunk)
-
     async def keep_session_alive() -> None:
         while True:
             await activity.touch(session_id)
             await asyncio.sleep(_CDP_ACTIVITY_SECONDS)
 
-    jobs = (client_to_browser, browser_to_client, keep_session_alive)
-    tasks = [asyncio.create_task(job(), name=job.__name__) for job in jobs]
+    tasks = [
+        asyncio.create_task(client_to_browser(), name="client_to_browser"),
+        asyncio.create_task(forward(stream, websocket.send_bytes), name="browser_to_client"),
+        asyncio.create_task(keep_session_alive(), name="keep_session_alive"),
+    ]
     try:
         done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:

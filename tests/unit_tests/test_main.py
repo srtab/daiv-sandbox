@@ -2059,21 +2059,19 @@ def test_stop_browser_returns_conflict_when_session_is_locked(client, monkeypatc
 
 def test_close_session_stops_the_browser_before_the_sandbox(client, browser_manager):
     calls = []
-    browser_manager.stop.side_effect = lambda session_id: calls.append(("browser", session_id))
+    browser_manager.stop.side_effect = lambda session_id, force: calls.append(("browser", session_id, force))
     with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
         cls.return_value.client.containers.get.return_value = Mock(labels={})
         cls.return_value.stop_container.side_effect = lambda: calls.append(("sandbox", None))
         assert client.delete("/session/sbx/").status_code == 204
-    assert calls == [("browser", "sbx"), ("sandbox", None)]
-    browser_manager.remove.assert_not_called()
+    assert calls == [("browser", "sbx", False), ("sandbox", None)]
 
 
 def test_force_close_removes_the_browser(client, browser_manager):
     with patch("daiv_sandbox.main.SandboxDockerSession") as cls:
         cls.return_value.client.containers.get.return_value = Mock(labels={})
         assert client.delete("/session/sbx/?force=true").status_code == 204
-    browser_manager.remove.assert_awaited_once_with("sbx")
-    browser_manager.stop.assert_not_called()
+    browser_manager.stop.assert_awaited_once_with("sbx", force=True)
 
 
 def test_a_failed_browser_close_still_closes_the_sandbox(client, browser_manager):

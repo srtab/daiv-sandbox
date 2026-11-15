@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/binary"
-	"errors"
 	"io"
 	"net"
 	"strconv"
@@ -26,32 +25,29 @@ func newServer(m *mux) *server {
 }
 
 func (s *server) demux(in io.Reader) error {
-	defer s.m.closeAll()
-	for {
-		f, err := readFrame(in)
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil
+	return s.m.demux(in, s.control)
+}
+
+// control records a reset of a stream still dialing (then lets the mux reset it too) and starts each open.
+func (s *server) control(f frame) bool {
+	switch f.kind {
+	case frameReset:
+		s.mu.Lock()
+		if _, ok := s.dialing[f.stream]; ok {
+			s.dialing[f.stream] = true
 		}
-		if err != nil {
-			return err
-		}
-		if f.kind == frameReset {
-			s.mu.Lock()
-			if _, ok := s.dialing[f.stream]; ok {
-				s.dialing[f.stream] = true
-			}
-			s.mu.Unlock()
-		}
-		if s.m.dispatch(f) {
-			continue
-		}
-		if f.kind == frameOpen && len(f.payload) == 2 {
+		s.mu.Unlock()
+		return false
+	case frameOpen:
+		if len(f.payload) == 2 {
 			s.mu.Lock()
 			s.dialing[f.stream] = false
 			s.mu.Unlock()
 			go s.open(f.stream, binary.BigEndian.Uint16(f.payload))
 		}
+		return true
 	}
+	return false
 }
 
 func (s *server) open(id uint32, port uint16) {

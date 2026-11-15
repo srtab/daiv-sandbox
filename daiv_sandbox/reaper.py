@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 
 from docker.errors import NotFound
 
-from daiv_sandbox.browser import remove_browser
 from daiv_sandbox.config import settings
 from daiv_sandbox.egress.manager import EgressProxyManager
 from daiv_sandbox.locks import SessionBusyError
@@ -91,11 +90,6 @@ async def _remove_guarded(container, lock_manager, *, precondition=_still_stoppe
             # v=True: else a base_image VOLUME leaks one anonymous volume per session (see
             # SandboxDockerSession.remove_container).
             await asyncio.to_thread(container.remove, force=True, v=True)
-            # Before the triad: the browser is a member of the egress network teardown removes.
-            try:
-                await asyncio.to_thread(remove_browser, container.client, container.id)
-            except Exception:
-                logger.exception("Reaper: removed container %s but failed to remove its browser", container.id)
             if token := egress_token(container):
                 try:
                     manager = EgressProxyManager(SandboxDockerSession._get_shared_client())

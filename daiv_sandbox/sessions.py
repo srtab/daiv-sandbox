@@ -343,6 +343,34 @@ def _normalize_tar_member_name(name: str) -> str | None:
     return None if normalized in {"", "."} else normalized
 
 
+def read_container_file(container: Container, path: str) -> bytes:
+    """Return the raw bytes of a single file via the Docker archive API.
+
+    Raises FileNotFoundError when the path does not exist, and IsADirectoryError when it is a
+    directory. A genuinely empty file returns ``b""`` (it is not treated as missing).
+    """
+    try:
+        bits, _stat = container.get_archive(path)
+    except NotFound as exc:
+        # get_archive raises docker.errors.NotFound for a missing path (it is NOT a
+        # FileNotFoundError); translate so endpoints' FileNotFoundError handling works.
+        raise FileNotFoundError(path) from exc
+    raw = b"".join(bits)
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tf:
+        members = tf.getmembers()
+        if members and members[0].isdir():
+            # get_archive on a directory returns its whole subtree; refuse rather than return an
+            # arbitrary inner file's bytes as if they were this path's content.
+            raise IsADirectoryError(path)
+        files = [m for m in members if m.isfile()]
+        if not files:
+            raise FileNotFoundError(path)
+        extracted = tf.extractfile(files[0])
+        if extracted is None:
+            raise FileNotFoundError(path)
+        return extracted.read()
+
+
 def _symlink_target_is_safe(name: str, linkname: str, seen_symlinks: set[str]) -> bool:
     """
     Whether a symlink member may be preserved: its target must be relative and *lexically*
@@ -1039,31 +1067,7 @@ class SandboxDockerSession:
                 raise RuntimeError(f"Failed to write {self.container.short_id}:{canonical}")
 
     def read_file_bytes(self, path: str) -> bytes:
-        """Return the raw bytes of a single file via the Docker archive API.
-
-        Raises FileNotFoundError when the path does not exist, and IsADirectoryError when it is a
-        directory. A genuinely empty file returns ``b""`` (it is not treated as missing).
-        """
-        try:
-            bits, _stat = self.container.get_archive(path)
-        except NotFound as exc:
-            # get_archive raises docker.errors.NotFound for a missing path (it is NOT a
-            # FileNotFoundError); translate so endpoints' FileNotFoundError handling works.
-            raise FileNotFoundError(path) from exc
-        raw = b"".join(bits)
-        with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tf:
-            members = tf.getmembers()
-            if members and members[0].isdir():
-                # get_archive on a directory returns its whole subtree; refuse rather than return an
-                # arbitrary inner file's bytes as if they were this path's content.
-                raise IsADirectoryError(path)
-            files = [m for m in members if m.isfile()]
-            if not files:
-                raise FileNotFoundError(path)
-            extracted = tf.extractfile(files[0])
-            if extracted is None:
-                raise FileNotFoundError(path)
-            return extracted.read()
+        return read_container_file(self.container, path)
 
     def list_dir(self, path: str) -> list[DirEntry]:
         """List one directory level. Uses `ls -1Ap` (portable; dirs get a trailing '/').

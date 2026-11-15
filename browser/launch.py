@@ -145,12 +145,13 @@ def install_ca(ca_path: str) -> None:
     subprocess.run(["certutil", "-A", "-d", db, "-n", "daiv-egress", "-t", "C,,", "-i", ca_path], check=True)
 
 
-def wait_until(deadline: float, check) -> bool:
+def wait_until(deadline: float, check):
+    """The first truthy result of ``check`` before ``deadline``, polled every 0.1 s; None if it never is."""
     while time.monotonic() < deadline:
-        if check():
-            return True
+        if result := check():
+            return result
         time.sleep(0.1)
-    return False
+    return None
 
 
 def running_extension(proc: Path = Path("/proc")) -> str | None:
@@ -184,11 +185,11 @@ def main() -> int:
     args = parser.parse_args()
 
     version = devtools_version()
-    if args.probe or version is not None:
-        if version is None:
-            return NOT_RUNNING_EXIT
+    if version is not None:
         report(version, [], "running", running_extension())
         return 0
+    if args.probe:
+        return NOT_RUNNING_EXIT
     if not args.extension:
         parser.error("--extension is required to launch")
 
@@ -212,14 +213,12 @@ def main() -> int:
             start_new_session=True,
             close_fds=True,
         )
-    while time.monotonic() < deadline:
-        version = devtools_version()
-        if version is not None:
-            report(version, urls, tabs, args.extension)
-            return 0
-        time.sleep(0.1)
-    print("Chromium did not open its DevTools port in time", file=sys.stderr)
-    return TIMEOUT_EXIT
+    version = wait_until(deadline, devtools_version)
+    if version is None:
+        print("Chromium did not open its DevTools port in time", file=sys.stderr)
+        return TIMEOUT_EXIT
+    report(version, urls, tabs, args.extension)
+    return 0
 
 
 if __name__ == "__main__":

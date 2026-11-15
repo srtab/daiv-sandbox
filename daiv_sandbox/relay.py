@@ -29,7 +29,6 @@ _READ_CHUNK = 64 * 1024
 
 @dataclass
 class ExecStream:
-    exec_id: str
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     label: str
@@ -63,15 +62,15 @@ class ExecStream:
 async def open_exec_stream(client: DockerClient, container_id: str, cmd: list[str], *, user: str) -> ExecStream:
     def _start():
         exec_id = client.api.exec_create(container_id, cmd, stdin=True, stdout=True, stderr=True, user=user)["Id"]
-        return exec_id, client.api.exec_start(exec_id, socket=True)
+        return client.api.exec_start(exec_id, socket=True)
 
-    exec_id, sock = await asyncio.to_thread(_start)
+    sock = await asyncio.to_thread(_start)
     raw = getattr(sock, "_sock", sock)
     reader, writer = await asyncio.open_connection(sock=raw)
-    return ExecStream(exec_id=exec_id, reader=reader, writer=writer, label=f"{cmd[0]} {cmd[1]}")
+    return ExecStream(reader=reader, writer=writer, label=f"{cmd[0]} {cmd[1]}")
 
 
-async def _forward(source: ExecStream, sink_write: Callable[[bytes], Awaitable[object]]) -> None:
+async def forward(source: ExecStream, sink_write: Callable[[bytes], Awaitable[object]]) -> None:
     async for chunk in source.stdout_chunks():
         await sink_write(chunk)
 
@@ -111,8 +110,8 @@ class RelayPump:
 
     async def _run(self, serve: ExecStream, listen: ExecStream) -> None:
         directions = [
-            asyncio.create_task(_forward(serve, listen.write)),
-            asyncio.create_task(_forward(listen, serve.write)),
+            asyncio.create_task(forward(serve, listen.write)),
+            asyncio.create_task(forward(listen, serve.write)),
         ]
         try:
             await asyncio.wait(directions, return_when=asyncio.FIRST_COMPLETED)

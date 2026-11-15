@@ -473,22 +473,22 @@ async def test_a_failed_tab_save_still_stops_the_browser(client, pump):
     browser.stop.assert_called_once()
 
 
-async def test_stop_and_remove_close_the_sessions_cdp_tunnels(client, pump):
+@pytest.mark.parametrize("force", [False, True])
+async def test_stop_closes_the_sessions_cdp_tunnels(client, pump, force):
     manager = BrowserManager()
-    for close in (manager.stop, manager.remove):
-        tunnel = asyncio.create_task(asyncio.sleep(3600))
-        manager.track_tunnel(SANDBOX_ID, tunnel)
-        await close(SANDBOX_ID)
-        assert tunnel.cancelled()
+    tunnel = asyncio.create_task(asyncio.sleep(3600))
+    manager.track_tunnel(SANDBOX_ID, tunnel)
+    await manager.stop(SANDBOX_ID, force=force)
+    assert tunnel.cancelled()
 
 
-async def test_remove_stops_the_relay_pump_and_removes_the_container(client, pump):
+async def test_forced_stop_stops_the_relay_pump_and_removes_the_container(client, pump):
     browser = _new_browser(client)
     manager = BrowserManager()
     await manager.start(_sandbox(), _request(), EXTENSION)
     client.containers.list.return_value = [browser]
 
-    await manager.remove(SANDBOX_ID)
+    await manager.stop(SANDBOX_ID, force=True)
 
     pump.return_value.stop.assert_awaited()
     browser.remove.assert_called_with(force=True, v=True)
