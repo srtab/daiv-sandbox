@@ -20,7 +20,7 @@ from daiv_sandbox.browser import (
 )
 from daiv_sandbox.config import settings
 from daiv_sandbox.locks import SessionBusyError
-from daiv_sandbox.main import app
+from daiv_sandbox.main import app, browser_cdp
 from daiv_sandbox.schemas import BrowserStartRequest, BrowserStartResponse, BrowserStopResponse, RunResult
 from daiv_sandbox.sessions import EXTRA_REPOS_ROOT, SANDBOX_ROOT, SKILLS_ROOT, SessionUnavailableError
 
@@ -2004,7 +2004,8 @@ def test_start_browser_of_an_unknown_session_is_404(client, browser_manager, bro
         (ExtensionMissingError("extension missing"), 412, "extension missing"),
         (BrowserNotReadyError("slow"), 503, "browser not ready in time"),
         (BrowserImageUnavailableError("gone"), 503, "browser image unavailable"),
-        (RuntimeError("docker said: /var/run/docker.sock refused"), 500, "browser failed to start"),
+        (APIError("docker said: /var/run/docker.sock refused"), 503, "browser unavailable"),
+        (RuntimeError("launch exited 1"), 500, "browser failed to start"),
     ],
 )
 def test_start_browser_maps_failures_to_short_reasons(
@@ -2039,11 +2040,16 @@ def test_stop_browser_returns_what_the_manager_saved(client, browser_manager, fo
     browser_manager.stop.assert_awaited_once_with("sbx", force=force)
 
 
-def test_stop_browser_failure_is_a_short_500(client, browser_manager):
-    browser_manager.stop.side_effect = APIError("boom")
+@pytest.mark.parametrize(
+    ("error", "status_code", "detail"),
+    [(APIError("daemon fault"), 503, "browser unavailable"), (RuntimeError("boom"), 500, "browser failed to stop")],
+    ids=["docker-fault", "other"],
+)
+def test_stop_browser_maps_failures_to_short_reasons(client, browser_manager, error, status_code, detail):
+    browser_manager.stop.side_effect = error
     response = client.delete("/session/sbx/browser/")
-    assert response.status_code == 500
-    assert response.json() == {"detail": "browser failed to stop"}
+    assert response.status_code == status_code
+    assert response.json() == {"detail": detail}
 
 
 def test_stop_browser_returns_conflict_when_session_is_locked(client, monkeypatch):
@@ -2137,6 +2143,28 @@ def test_cdp_tunnel_refuses_a_bad_key_before_accepting(client, running_browser, 
         pass
     assert exc.value.code == 4403
     running_browser[1].assert_not_called()
+
+
+async def test_a_cancelled_cdp_handler_stays_cancelled_and_stops_its_tunnel(browser_manager):
+    stream = _EchoStream()
+    websocket = Mock(headers={"X-API-Key": settings.API_KEY.get_secret_value()}, app=app)
+    websocket.accept = AsyncMock()
+    websocket.close = AsyncMock()
+    websocket.receive = AsyncMock(side_effect=lambda: asyncio.Event().wait())
+    browser_manager.find.return_value = Mock(id="browser-id", status="running")
+    tunnels = []
+    browser_manager.track_tunnel.side_effect = lambda _session_id, task: tunnels.append(task)
+
+    with patch("daiv_sandbox.main.open_exec_stream", new=AsyncMock(return_value=stream)):
+        handler = asyncio.create_task(browser_cdp(websocket, "sbx"))
+        while not tunnels:
+            await asyncio.sleep(0)
+        handler.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await handler
+
+    assert tunnels[0].cancelled()
+    assert stream.closed
 
 
 @pytest.mark.parametrize("browser", [None, Mock(id="b", status="exited")])

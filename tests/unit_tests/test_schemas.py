@@ -89,13 +89,19 @@ def test_sandbox_capabilities_default_to_no_browser():
 def test_browser_start_request_rejects_a_digest_that_is_not_lowercase_sha256(digest):
     """The digest names a directory in the browser container, so anything but 64 hex characters is refused."""
     with pytest.raises(ValidationError):
-        BrowserStartRequest(memory_bytes=1, cpus=1.0, extension_sha256=digest)
+        BrowserStartRequest(memory_bytes=256 << 20, cpus=1.0, extension_sha256=digest)
 
 
-@pytest.mark.parametrize(("memory_bytes", "cpus"), [(0, 1.0), (1, 0.0), (-1, 1.0), (1, -0.5)])
-def test_browser_start_request_rejects_non_positive_limits(memory_bytes, cpus):
+@pytest.mark.parametrize(
+    ("memory_bytes", "cpus"), [(0, 1.0), ((256 << 20) - 1, 1.0), (256 << 20, 0.0), (256 << 20, 0.24), (-1, -0.5)]
+)
+def test_browser_start_request_rejects_limits_below_what_a_browser_needs(memory_bytes, cpus):
     with pytest.raises(ValidationError):
         BrowserStartRequest(memory_bytes=memory_bytes, cpus=cpus, extension_sha256=_SHA)
+
+
+def test_browser_start_request_accepts_the_smallest_limits():
+    BrowserStartRequest(memory_bytes=256 << 20, cpus=0.25, extension_sha256=_SHA)
 
 
 def test_browser_start_response_rejects_an_unknown_profile_state():

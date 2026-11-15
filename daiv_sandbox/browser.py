@@ -16,11 +16,13 @@ import logging
 import posixpath
 import stat
 import tarfile
+import time
 import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from docker.errors import APIError, ImageNotFound, NotFound
+from docker.utils import decode_json_header
 
 from daiv_sandbox.config import settings
 from daiv_sandbox.egress.manager import EgressProxyManager
@@ -108,13 +110,16 @@ def remove_browser(client: DockerClient, session_id: str) -> bool:
 
 
 def _file_tar(members: list[tuple[str, bytes | None, int, int]]) -> bytes:
-    """A tar of ``(name, content or None for a directory, mode, uid)`` members, owned by uid:uid."""
+    """A tar of ``(name, content or None for a directory, mode, uid)`` members, owned by uid:uid and dated now
+    (``put_archive`` keeps the mtime, and TarInfo's default would date them 1970)."""
     buf = io.BytesIO()
+    now = int(time.time())
     with tarfile.open(fileobj=buf, mode="w") as tar:
         for name, content, mode, uid in members:
             info = tarfile.TarInfo(name)
             info.mode = mode
             info.uid = info.gid = uid
+            info.mtime = now
             if content is None:
                 info.type = tarfile.DIRTYPE
                 tar.addfile(info)
@@ -189,6 +194,7 @@ class BrowserManager:
         self._tunnels: dict[str, set[asyncio.Task]] = {}
         self._state: dict[str, BrowserStartResponse] = {}
         self._relay_binary: dict[str, bytes] = {}
+        self._relays: dict[str, str] = {}
 
     @property
     def client(self) -> DockerClient:
@@ -333,12 +339,25 @@ class BrowserManager:
         return self._relay_binary[image_id]
 
     def _install_relay(self, sandbox: Container, browser: Container) -> None:
-        tar = _file_tar([
-            (".daiv", None, 0o755, settings.RUN_UID),
-            (".daiv/relay", self._relay_bytes(browser), 0o755, settings.RUN_UID),
-        ])
+        """Copy daiv-relay into the sandbox, unless this service already copied this image's relay there and a
+        file of its size is still in place."""
+        relay = self._relay_bytes(browser)
+        image_id = browser.attrs.get("Image", "")
+        copied = self._relays.get(sandbox.id) == image_id
+        if copied and self._sandbox_file_size(sandbox, SANDBOX_RELAY_PATH) == len(relay):
+            return
+        tar = _file_tar([(".daiv", None, 0o755, settings.RUN_UID), (".daiv/relay", relay, 0o755, settings.RUN_UID)])
         if not sandbox.put_archive(SANDBOX_HOME, tar):
             raise RuntimeError(f"browser: failed to copy daiv-relay into sandbox {sandbox.short_id}")
+        self._relays[sandbox.id] = image_id
+
+    def _sandbox_file_size(self, sandbox: Container, path: str) -> int | None:
+        """The size of a file in the container, from Docker's archive stat, without downloading it."""
+        api = self.client.api
+        response = api.head(api._url("/containers/{0}/archive", sandbox.id), params={"path": path})
+        if response.status_code != 200:
+            return None
+        return decode_json_header(response.headers["X-Docker-Container-Path-Stat"]).get("size")
 
     def _write_marker(self, sandbox: Container) -> None:
         tar = _file_tar([(".daiv", None, 0o755, settings.RUN_UID), (".daiv/browser", b"", 0o644, settings.RUN_UID)])
@@ -407,8 +426,12 @@ class BrowserManager:
         pump.on_exit(lambda: self._forget_pump(sandbox.id, pump))
 
     def _forget_pump(self, session_id: str, pump: RelayPump) -> None:
+        """A pump that exits on its own most often means its sandbox or browser was removed, by the reaper or
+        an egress teardown, which never call this manager; drop what the manager keeps for that session."""
         if self._pumps.get(session_id) is pump:
             del self._pumps[session_id]
+            self._state.pop(session_id, None)
+            self._relays.pop(session_id, None)
 
     async def _stop_pump(self, session_id: str) -> None:
         pump = self._pumps.pop(session_id, None)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -233,6 +234,54 @@ func TestAStreamNobodyReadsDoesNotStallTheOthers(t *testing.T) {
 		t.Fatalf("SOCKS reply %d, want success", code)
 	}
 	assertEcho(t, conn, strings.Repeat("y", 3*maxPayload))
+}
+
+func TestAStreamResetWhileItDialsIsClosedAndNeverOpened(t *testing.T) {
+	in, feed := io.Pipe()
+	outR, outW := io.Pipe()
+	srv := newServer(newMux(outW))
+	release := make(chan struct{})
+	local, remote := net.Pipe()
+	srv.dial = func(uint16) (net.Conn, error) {
+		<-release
+		return local, nil
+	}
+	go func() { _ = srv.demux(in) }()
+	frames := make(chan frame, 4)
+	go func() {
+		for {
+			f, err := readFrame(outR)
+			if err != nil {
+				return
+			}
+			frames <- f
+		}
+	}()
+
+	for _, f := range []frame{
+		{kind: frameOpen, stream: 1, payload: portPayload(8080)},
+		{kind: frameReset, stream: 1},
+		{kind: frameClose, stream: 99},
+	} {
+		if err := writeFrame(feed, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(release)
+
+	_ = remote.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := remote.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("the dialled connection was left open: %v", err)
+	}
+	select {
+	case f := <-frames:
+		t.Fatalf("a reset stream was answered with %+v", f)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if srv.m.lookup(1) != nil {
+		t.Fatal("a reset stream was registered")
+	}
+	feed.Close()
 }
 
 func TestAPeerThatSendsPastItsWindowIsReset(t *testing.T) {

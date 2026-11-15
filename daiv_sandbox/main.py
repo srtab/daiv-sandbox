@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import sentry_sdk
-from docker.errors import NotFound
+from docker.errors import APIError, NotFound
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, Security, UploadFile, WebSocket, status
 from fastapi import Path as FastAPIPath
 from fastapi.responses import JSONResponse
@@ -631,7 +631,7 @@ async def start_browser(
 
     Responds 404 for an unknown session, 409 when the session is busy, 412 when the archive was left out but the
     container holds no extension with that digest, 422 for an invalid request or extension archive, 503 when the
-    browser image is unavailable or Chromium is not ready in time, and 500 otherwise.
+    browser image is unavailable, Chromium is not ready in time or Docker fails, and 500 otherwise.
     """
     try:
         start_request = BrowserStartRequest.model_validate_json(request)
@@ -659,6 +659,9 @@ async def start_browser(
             ) from exc
         except HTTPException, SessionUnavailableError:
             raise
+        except APIError as exc:
+            logger.exception("Browser: Docker failed to start the browser of session %s", session_id)
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="browser unavailable") from exc
         except Exception as exc:
             logger.exception("Browser: failed to start the browser of session %s", session_id)
             raise HTTPException(
@@ -676,12 +679,15 @@ async def stop_browser(
     """
     Save the open tabs' URLs to the browser profile, close Chromium and stop the browser container, keeping the
     profile. ``?force=true`` removes the container and its profile instead. A session or browser that is already
-    gone answers 200 with empty values.
+    gone answers 200 with empty values; a Docker fault answers 503.
     """
     browser_manager: BrowserManager = http_request.app.state.browser_manager
     async with http_request.app.state.session_lock_manager.acquire(session_id):
         try:
             return await browser_manager.stop(session_id, force=force)
+        except APIError as exc:
+            logger.exception("Browser: Docker failed to stop the browser of session %s", session_id)
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="browser unavailable") from exc
         except Exception as exc:
             logger.exception("Browser: failed to stop the browser of session %s", session_id)
             raise HTTPException(
@@ -721,10 +727,12 @@ async def browser_cdp(websocket: WebSocket, session_id: str) -> None:
     tunnel = asyncio.create_task(_pump_cdp(websocket, stream, session_id))
     browser_manager.track_tunnel(session_id, tunnel)
     try:
-        await tunnel
-    except asyncio.CancelledError:
-        pass
+        # wait, not await: close_tunnels cancelling the tunnel ends this handler normally, and cancelling the
+        # handler itself still propagates.
+        await asyncio.wait([tunnel])
     finally:
+        tunnel.cancel()
+        await asyncio.gather(tunnel, return_exceptions=True)
         await stream.close()
         with contextlib.suppress(Exception):
             await websocket.close(code=1000)

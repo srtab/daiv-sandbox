@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -181,6 +182,7 @@ def test_extension_tar_roots_the_extension_at_its_digest_owned_by_the_browser_us
     assert set(members) == {DIGEST, f"{DIGEST}/js", f"{DIGEST}/manifest.json", f"{DIGEST}/js/service-worker.js"}
     assert all(m.uid == 1000 and m.gid == 1000 for m in members.values())
     assert members[f"{DIGEST}/js"].isdir()
+    assert all(m.mtime > 0 for m in members.values())
 
 
 @pytest.mark.parametrize(
@@ -539,3 +541,37 @@ async def test_a_pump_that_exits_on_its_own_is_forgotten(client, pump):
     exit_callbacks[0]()
 
     assert SANDBOX_ID not in manager._pumps
+    assert SANDBOX_ID not in manager._state
+    assert SANDBOX_ID not in manager._relays
+
+
+def _path_stat(size: int) -> Mock:
+    stat = base64.b64encode(json.dumps({"name": "relay", "size": size}).encode()).decode()
+    return Mock(status_code=200, headers={"X-Docker-Container-Path-Stat": stat})
+
+
+def test_the_relay_is_copied_once_per_sandbox_and_browser_image(client):
+    sandbox, browser = _sandbox(), _new_browser(client)
+    client.api.head.return_value = _path_stat(len(b"\x7fELF"))
+    manager = BrowserManager()
+
+    manager._install_relay(sandbox, browser)
+    manager._install_relay(sandbox, browser)
+    assert len(sandbox.puts) == 1
+
+    browser.attrs["Image"] = "sha256:newer"
+    browser.files["/usr/local/bin/daiv-relay"] = b"\x7fELF2"
+    client.api.head.return_value = _path_stat(len(b"\x7fELF2"))
+    manager._install_relay(sandbox, browser)
+    assert len(sandbox.puts) == 2
+
+
+def test_a_relay_removed_from_the_sandbox_is_copied_again(client):
+    sandbox, browser = _sandbox(), _new_browser(client)
+    manager = BrowserManager()
+    manager._install_relay(sandbox, browser)
+
+    client.api.head.return_value = Mock(status_code=404, headers={})
+    manager._install_relay(sandbox, browser)
+
+    assert len(sandbox.puts) == 2

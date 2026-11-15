@@ -491,13 +491,14 @@ applied to it in place. A browser running another extension saves its tabs and i
 running. `profile` is `empty` on the session's first start,
 `restored` when the profile came back, and `reset` when it could not be read or the browser container had been
 removed by something other than the service. Errors: `404` unknown session, `409` session busy, `412` archive left out
-but no extension with that digest in the container, `422` invalid request or archive, `503` browser image unavailable or Chromium not ready within
+but no extension with that digest in the container, `422` invalid request or archive, `503` browser image unavailable, a Docker fault, or Chromium not ready within
 `DAIV_SANDBOX_BROWSER_START_TIMEOUT_SECONDS`, `500` otherwise.
 
 `DELETE /session/{id}/browser/` saves the open tabs' URLs, closes Chromium so its profile is flushed, and stops the
 container, answering `{"saved_urls": [...], "oom_killed": bool}`. `oom_killed` is set when Docker recorded an OOM kill
 in the browser container; under `runsc`, gVisor kills the page's process inside its sandbox and Docker records none,
-so it stays `false`. A session or browser that is already gone answers `200` with empty values.
+so it stays `false`. A session or browser that is already gone answers `200` with empty values; a Docker fault
+answers `503`.
 
 #### The CDP tunnel
 
