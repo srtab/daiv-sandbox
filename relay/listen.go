@@ -32,6 +32,10 @@ const (
 
 var errRefused = errors.New("destination refused")
 
+// browserClientMarker makes the egress proxy require Fetch metadata before it injects a credential; addon.py
+// matches it as BROWSER_CLIENT_HEADER and BROWSER_CLIENT from egress/constants.py.
+const browserClientMarker = "X-Daiv-Client: browser"
+
 type listener struct {
 	m           *mux
 	egressProxy string
@@ -168,8 +172,7 @@ func dialThroughProxy(proxy, host string, port uint16) (net.Conn, []byte, error)
 	}
 	_ = upstream.SetDeadline(time.Now().Add(handshakeTimeout))
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
-	// The marker makes the egress proxy require Fetch metadata before it injects a credential (see addon.py).
-	connect := "CONNECT %s HTTP/1.1\r\nHost: %s\r\nX-Daiv-Client: browser\r\n\r\n"
+	connect := "CONNECT %s HTTP/1.1\r\nHost: %s\r\n" + browserClientMarker + "\r\n\r\n"
 	if _, err := fmt.Fprintf(upstream, connect, target, target); err != nil {
 		_ = upstream.Close()
 		return nil, nil, err

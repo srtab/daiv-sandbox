@@ -28,6 +28,7 @@ from daiv_sandbox.browser import (
 )
 from daiv_sandbox.config import settings
 from daiv_sandbox.schemas import BrowserStartRequest
+from daiv_sandbox.sessions import BROWSER_SESSION_LABEL, DAIV_SANDBOX_TYPE_LABEL, TYPE_BROWSER
 
 SANDBOX_ID = "a" * 64
 WS_PATH = "/devtools/browser/4f1c"
@@ -372,7 +373,7 @@ async def test_an_egress_session_stages_the_ca_and_relays_through_its_proxy(clie
     monkeypatch.setattr(settings, "EGRESS_CA_KEY_FILE", str(ca))
     browser = _new_browser(client)
     with patch("daiv_sandbox.browser.EgressProxyManager") as mgr_cls:
-        mgr_cls._internal_network_name.return_value = "daiv-egress-tok123"
+        mgr_cls.internal_network_name.return_value = "daiv-egress-tok123"
         mgr_cls.return_value.proxy_internal_ip.return_value = "10.0.0.2"
         await BrowserManager().start(_sandbox(labels={"daiv.sandbox.egress": "tok123"}), _request(), EXTENSION)
 
@@ -455,6 +456,13 @@ async def test_stop_with_force_removes_the_container_and_its_profile(client, pum
 
     browser.remove.assert_called_once_with(force=True, v=True)
     assert browser.exec_calls == []
+
+
+async def test_stop_looks_up_only_this_sessions_browser(client, pump):
+    await BrowserManager().stop(SANDBOX_ID)
+
+    labels = [f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_BROWSER}", f"{BROWSER_SESSION_LABEL}={SANDBOX_ID}"]
+    client.containers.list.assert_called_once_with(all=True, filters={"label": labels})
 
 
 async def test_stop_of_a_session_without_a_browser_answers_empty(client, pump):

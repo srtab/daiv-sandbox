@@ -1970,6 +1970,22 @@ def test_start_browser_passes_the_request_and_extension_to_the_manager(
     assert archive == b"PK-zip"
 
 
+def test_start_browser_refuses_an_oversized_archive_before_reading_it(
+    mock_session, client, browser_manager, browser_available, monkeypatch
+):
+    monkeypatch.setattr("daiv_sandbox.main.MAX_EXTENSION_BYTES", 4)
+
+    response = client.post(
+        f"/session/{mock_session.session_id}/browser/",
+        data={"request": _BROWSER_REQUEST},
+        files={"extension_archive": ("extension.zip", b"PK-zip", "application/zip")},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "extension archive is too large"
+    browser_manager.start.assert_not_awaited()
+
+
 def test_start_browser_without_an_archive_passes_none(mock_session, client, browser_manager, browser_available):
     browser_manager.start.return_value = _BROWSER_STARTED
     response = client.post(f"/session/{mock_session.session_id}/browser/", data={"request": _BROWSER_REQUEST})

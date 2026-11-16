@@ -75,13 +75,13 @@ class EgressProxyManager:
         self.client = client
 
     @staticmethod
-    def _internal_network_name(token: str) -> str:
+    def internal_network_name(token: str) -> str:
         """The per-session internal network name. Single source of truth so callers that need to
         resolve the proxy's IP on it (see proxy_internal_ip) can't drift from create_network."""
         return f"daiv-egress-{token}"
 
     def create_network(self, token: str) -> str:
-        name = self._internal_network_name(token)
+        name = self.internal_network_name(token)
         self.client.networks.create(
             name=name,
             driver="bridge",
@@ -191,7 +191,7 @@ class EgressProxyManager:
 
         The IP is read after ensure_proxy_running, so a just-restarted proxy reports its fresh endpoint
         IP (Docker releases the endpoint IP while stopped)."""
-        network_name = self._internal_network_name(token)
+        network_name = self.internal_network_name(token)
         proxy = self.ensure_proxy_running(token)
         nets = proxy.attrs["NetworkSettings"]["Networks"]
         ip = nets.get(network_name, {}).get("IPAddress")

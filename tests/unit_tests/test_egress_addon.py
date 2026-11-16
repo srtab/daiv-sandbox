@@ -2,11 +2,13 @@ import contextlib
 import json
 import logging
 import types
+from pathlib import Path
 
 import pytest
 
 from daiv_sandbox.egress import addon as addon_mod
 from daiv_sandbox.egress.addon import EgressAddon
+from daiv_sandbox.egress.constants import BROWSER_CLIENT, BROWSER_CLIENT_HEADER
 from daiv_sandbox.egress.policy import REASON_METHOD_NOT_ALLOWED, BlockReason
 
 
@@ -35,7 +37,7 @@ def _flow(host="github.com", method="GET", path="/", client_conn=None, **request
 def _browser_tunnel(addon, host="gitlab.com"):
     """The client connection of a CONNECT that daiv-relay sent for the browser."""
     connect = _flow(host=host, method="CONNECT", client_conn=types.SimpleNamespace(id="browser-connection"))
-    connect.request.headers["X-Daiv-Client"] = "browser"
+    connect.request.headers[BROWSER_CLIENT_HEADER] = BROWSER_CLIENT
     addon.http_connect(connect)
     assert connect.response is None
     return connect.client_conn
@@ -423,3 +425,8 @@ def test_request_passes_path_to_policy(tmp_path):
     a.requestheaders(other)
     assert scoped.request.headers["Authorization"] == "S"
     assert other.request.headers["Authorization"] == "M"
+
+
+def test_the_relay_sends_the_marker_the_addon_matches():
+    listen_go = (Path(__file__).resolve().parents[2] / "relay" / "listen.go").read_text()
+    assert f'"{BROWSER_CLIENT_HEADER}: {BROWSER_CLIENT}"' in listen_go

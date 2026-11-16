@@ -4,7 +4,10 @@ from pathlib import Path
 
 import pytest
 
-BROWSER_DIR = Path(__file__).resolve().parents[2] / "browser"
+from daiv_sandbox.browser import DEVTOOLS_PORT
+
+REPO = Path(__file__).resolve().parents[2]
+BROWSER_DIR = REPO / "browser"
 
 
 def _load(name: str):
@@ -51,6 +54,15 @@ def test_the_probe_reads_the_running_chromiums_extension_from_its_command_line(t
 
     assert launch.running_extension(tmp_path) == "/opt/daiv/extension/ab"
     assert launch.running_extension(tmp_path / "self") is None
+
+
+def test_the_scripts_and_the_relay_use_the_services_ports():
+    assert launch.DEVTOOLS_PORT == save_tabs.DEVTOOLS_PORT == DEVTOOLS_PORT
+    assert f'"127.0.0.1:{launch.RELAY_PORT}"' in (REPO / "relay" / "main.go").read_text()
+
+
+def test_a_launch_wipes_the_extension_state_and_service_workers():
+    assert {"Extension State", "Extension Scripts", "Service Worker"} <= set(launch.EXECUTABLE_STATE)
 
 
 @pytest.mark.parametrize("name", launch.EXECUTABLE_STATE)

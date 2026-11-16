@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import io
 import json
@@ -18,6 +19,7 @@ import stat
 import tarfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple
@@ -62,7 +64,10 @@ BROWSER_CA_PATH = f"{BROWSER_HOME}/.daiv/egress-ca.crt"
 
 _LAUNCH_TIMEOUT_EXIT = 5
 _SAVE_TABS_TIMEOUT_SECONDS = 15
-_MAX_EXTENSION_BYTES = 64 << 20
+MAX_EXTENSION_BYTES = 64 << 20
+# A script exec holds its thread until the script exits (up to the start timeout), so it stays off asyncio's
+# default pool, which carries every other Docker call.
+_SCRIPT_EXECUTOR = ThreadPoolExecutor(max_workers=32, thread_name_prefix="browser-script")
 
 
 class BrowserError(Exception):
@@ -98,6 +103,7 @@ class RunningBrowser(NamedTuple):
 
 
 def _browser_labels(session_id: str) -> dict[str, str]:
+    # session_id is the sandbox's full container id: the reaper's orphan sweep compares it with cmd-executor ids.
     return {DAIV_SANDBOX_TYPE_LABEL: TYPE_BROWSER, BROWSER_SESSION_LABEL: session_id}
 
 
@@ -162,7 +168,7 @@ def extension_tar(archive: bytes, digest: str) -> bytes:
                 ):
                     raise ExtensionInvalidError(f"extension archive has an unsafe member: {name!r}")
                 total += info.file_size
-                if total > _MAX_EXTENSION_BYTES:
+                if total > MAX_EXTENSION_BYTES:
                     raise ExtensionInvalidError("extension archive is too large")
                 files.append((f"{digest}/{normalized}", zf.read(info), 0o644))
     except zipfile.BadZipFile as exc:
@@ -183,7 +189,10 @@ def _path_exists(container: Container, path: str) -> bool:
 
 
 async def _run_script(browser: Container, script: str, *args: str, timeout: float | None = None) -> ExecResult:
-    run = asyncio.to_thread(browser.exec_run, ["python3", "-I", script, *args], user=BROWSER_USER, demux=True)
+    cmd = ["python3", "-I", script, *args]
+    run = asyncio.get_running_loop().run_in_executor(
+        _SCRIPT_EXECUTOR, functools.partial(browser.exec_run, cmd, user=BROWSER_USER, demux=True)
+    )
     return await asyncio.wait_for(run, timeout)
 
 
@@ -286,7 +295,7 @@ class BrowserManager:
         token = egress_token(sandbox)
         if token:
             labels[EGRESS_SESSION_LABEL] = token
-            kwargs["network"] = EgressProxyManager._internal_network_name(token)
+            kwargs["network"] = EgressProxyManager.internal_network_name(token)
         else:
             kwargs["network_mode"] = "none"
         try:

@@ -21,7 +21,14 @@ from redis.asyncio import Redis
 
 from daiv_sandbox import __version__
 from daiv_sandbox.activity import NoopSessionActivityTracker, RedisSessionActivityTracker
-from daiv_sandbox.browser import BROWSER_USER, DEVTOOLS_PORT, BrowserError, BrowserManager, probe_browser_image
+from daiv_sandbox.browser import (
+    BROWSER_USER,
+    DEVTOOLS_PORT,
+    MAX_EXTENSION_BYTES,
+    BrowserError,
+    BrowserManager,
+    probe_browser_image,
+)
 from daiv_sandbox.config import settings
 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 from daiv_sandbox.locks import NoopSessionLockManager, RedisSessionLockManager, SessionBusyError
@@ -627,6 +634,8 @@ async def start_browser(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="request is invalid") from exc
     if not http_request.app.state.browser_available:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="browser image unavailable")
+    if extension_archive is not None and (extension_archive.size or 0) > MAX_EXTENSION_BYTES:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="extension archive is too large")
     archive = await extension_archive.read() if extension_archive is not None else None
 
     browser_manager: BrowserManager = http_request.app.state.browser_manager
