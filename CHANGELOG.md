@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A timed-out command's `output` keeps what it printed before it was killed, followed by `Command timed out after {N}s and was killed.`. Detect timeouts with `timed_out` rather than the message.
 - Sandboxes run with Docker's init as PID 1, so orphaned processes are reaped.
 - `DAIV_SANDBOX_SESSION_GRACE_SECONDS` defaults to 6h (was 12h) and `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` to `30` (was `50`).
-- Bumped `fastapi[standard]` to 0.163.1 (0.163.0 adds opt-in `Depends(max_concurrency=...)`; 0.163.1 fixes OpenAPI for nested computed fields — no behavioral impact on this app's basic route usage), `pydantic-settings` to 2.16.3 (extends `secrets_dir` symlink hardening from `NestedSecretsSettingsSource` to the plain `SecretsSettingsSource`; safe — the app's `/run/secrets` entries are plain files, not symlinks), `sentry-sdk` to 2.75.0 (adds Amazon Bedrock integration and cron `@monitor` skip; no changes to `init`/`dsn`/`enable_logs`/sample rates/`send_default_pii`), `ruff` to 0.17.5, `pytest-asyncio` to 1.5.0, and `prek` to 0.5.11. `pydantic` remains 2.14.3, `ipython` 9.18.1, and `urllib3` 2.8.0 (unchanged).
+- Bumped `fastapi[standard]` to 0.163.1 (no behavioral impact; basic route usage only), `pydantic-settings` to 2.16.3 (extends `secrets_dir` symlink hardening to plain `SecretsSettingsSource`; safe — `/run/secrets` entries are plain files), `sentry-sdk` to 2.75.0 (no changes to `init`/`dsn`/`enable_logs`/sample rates`/`send_default_pii`), `ruff` to 0.17.5, `pytest-asyncio` to 1.5.0, and `prek` to 0.5.11.
 
 ### Fixed
 
