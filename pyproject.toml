@@ -34,7 +34,7 @@ dev = [
   "prek>=0.4.10",
   "pyopenssl==26.4.0",
   "pyproject-fmt==2.30.6",
-  "pytest-asyncio==1.4.1.post1",
+  "pytest-asyncio==1.5.0",
   "pytest-cov==7.1.0",
   "pytest-env==1.8.5",
   "pytest-mock==3.17.0",
