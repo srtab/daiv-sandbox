@@ -1,4 +1,5 @@
 import base64
+import time
 
 import pytest
 
@@ -224,6 +225,97 @@ def test_edit_roundtrip_and_bash_sees_it(client, workspace_session):
 
     run = client.post(f"/session/{sid}/", json={"commands": ["cat /workspace/tmp/e.txt"]})
     assert "ALPHA beta ALPHA" in run.json()["results"][0]["output"], run.text
+
+
+def _stat_mtimes(client, sid: str, *paths: str) -> list[int]:
+    run = client.post(f"/session/{sid}/", json={"commands": [f"stat -c %Y {p}" for p in paths]})
+    assert run.status_code == 200, run.text
+    results = run.json()["results"]
+    assert all(r["exit_code"] == 0 for r in results), results
+    return [int(r["output"].strip()) for r in results]
+
+
+def test_write_and_edit_land_with_current_mtime(client, workspace_session):
+    """put_archive extracts each member's mtime verbatim, so mtime-based tools (make, CPython's .pyc
+    check) only see an fs/write or fs/edit if the file lands dated now rather than 1970."""
+    sid = workspace_session
+    path = "/workspace/tmp/stamped.txt"
+
+    before_write = int(time.time())
+    w = client.post(
+        f"/session/{sid}/fs/write",
+        json={"path": path, "content": base64.b64encode(b"alpha beta\n").decode(), "mode": 0o644},
+    )
+    assert w.status_code == 200 and w.json()["ok"] is True, w.text
+    after_write = int(time.time())
+    [written] = _stat_mtimes(client, sid, path)
+    assert before_write <= written <= after_write
+
+    before_edit = int(time.time())
+    e = client.post(
+        f"/session/{sid}/fs/edit", json={"path": path, "old": "alpha", "new": "ALPHA", "replace_all": False}
+    )
+    assert e.status_code == 200, e.text
+    after_edit = int(time.time())
+    [edited] = _stat_mtimes(client, sid, path)
+    assert before_edit <= edited <= after_edit
+
+
+def test_seed_keeps_archive_member_mtime(client, sandbox_session):
+    """Seeded files keep the mtime their archive carries (git archive stamps the commit time); a member
+    dated 0 and a synthesized parent dir, which have no meaningful time, land dated now."""
+    sid = sandbox_session(base_image="alpine:latest")
+    dated = make_tar_gz({"pkg/dated.py": b"x = 1\n"}, mtime=1_600_000_000)
+    undated = make_tar_gz({"undated.md": b"# skill\n"})
+    before = int(time.time())
+    seed = client.post(
+        f"/session/{sid}/seed/",
+        files={
+            "repo_archive": ("repo.tar.gz", dated, "application/gzip"),
+            "skills_archive": ("skills.tar.gz", undated, "application/gzip"),
+        },
+    )
+    assert seed.status_code == 200, seed.text
+    after = int(time.time())
+
+    dated_mtime, pkg_mtime, undated_mtime = _stat_mtimes(
+        client, sid, "/workspace/repo/pkg/dated.py", "/workspace/repo/pkg", "/workspace/skills/undated.md"
+    )
+    assert dated_mtime == 1_600_000_000
+    assert before <= pkg_mtime <= after
+    assert before <= undated_mtime <= after
+
+
+def test_edit_invalidates_bytecode_of_seeded_module(client, sandbox_session):
+    """CPython reuses a .pyc whose recorded source mtime and size still match, so a same-size fs/edit
+    of a seeded module must move its mtime or the old code keeps running."""
+    sid = sandbox_session(base_image="python:3.12-bookworm")
+    seed = client.post(
+        f"/session/{sid}/seed/",
+        files={
+            "repo_archive": (
+                "repo.tar.gz",
+                make_tar_gz({"mod.py": b"X = 1\n"}, mtime=1_600_000_000),
+                "application/gzip",
+            )
+        },
+    )
+    assert seed.status_code == 200, seed.text
+    import_cmd = "cd /workspace/repo && python -c 'import mod; print(mod.X)'"
+
+    first = client.post(f"/session/{sid}/", json={"commands": [import_cmd]})
+    assert first.status_code == 200, first.text
+    assert first.json()["results"][0]["output"].strip() == "1", first.json()
+
+    e = client.post(
+        f"/session/{sid}/fs/edit",
+        json={"path": "/workspace/repo/mod.py", "old": "X = 1", "new": "X = 2", "replace_all": False},
+    )
+    assert e.status_code == 200, e.text
+
+    second = client.post(f"/session/{sid}/", json={"commands": [import_cmd]})
+    assert second.status_code == 200, second.text
+    assert second.json()["results"][0]["output"].strip() == "2", second.json()
 
 
 def test_ls_traversal_above_tmp_is_rejected(client, workspace_session):

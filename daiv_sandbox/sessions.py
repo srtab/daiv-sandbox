@@ -401,6 +401,8 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
 
     - Ownership is stamped to the sandbox uid/gid.
     - Permissions are normalized similar to: chmod -R a+rX,u+w
+    - Members keep their mtime (``put_archive`` extracts it verbatim); a member dated 0 (``TarInfo``'s
+      default) and every synthesized directory are dated now instead of 1970.
     - A sandbox-owned entry is synthesized for every missing ancestor directory, so extraction
       never auto-creates a root-owned (sandbox-unwritable) intermediate directory.
 
@@ -415,6 +417,7 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
     seen_dirs: set[str] = set()
     seen_symlinks: set[str] = set()
     total_members = 0
+    now = int(time.time())
     skipped: list[str] = []
 
     def _skip(member_name: str, detail: str) -> None:
@@ -425,7 +428,7 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
         parts = name.split("/")[:-1]
         return any("/".join(parts[:i]) in seen_symlinks for i in range(1, len(parts) + 1))
 
-    def _emit_dir(out_tf: tarfile.TarFile, dirpath: str, mode: int) -> None:
+    def _emit_dir(out_tf: tarfile.TarFile, dirpath: str, mode: int, mtime: float) -> None:
         info = tarfile.TarInfo(name=dirpath)
         info.type = tarfile.DIRTYPE
         info.size = 0
@@ -434,7 +437,7 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
         info.gid = gid
         info.uname = ""
         info.gname = ""
-        info.mtime = 0
+        info.mtime = mtime
         out_tf.addfile(info)
         seen_dirs.add(dirpath)
 
@@ -446,7 +449,7 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
         for i in range(1, len(parts) + 1):
             ancestor = "/".join(parts[:i])
             if ancestor and ancestor not in seen_dirs:
-                _emit_dir(out_tf, ancestor, 0o755)
+                _emit_dir(out_tf, ancestor, 0o755, now)
 
     try:
         with tarfile.open(fileobj=in_stream, mode="r:*") as in_tf, tarfile.open(fileobj=out_stream, mode="w") as out_tf:
@@ -459,6 +462,7 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
                 if not (member.isfile() or member.isdir() or member.issym()):
                     _skip(member.name, f"unsupported type {member.type!r}; only files/dirs/symlinks are allowed")
                     continue
+                mtime = member.mtime or now
 
                 if _traverses_symlink(normalized_name):
                     _skip(member.name, "path traverses a symlinked directory")
@@ -492,7 +496,7 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
                     out_info.gid = gid
                     out_info.uname = ""
                     out_info.gname = ""
-                    out_info.mtime = 0
+                    out_info.mtime = mtime
                     out_tf.addfile(out_info)
                     seen_symlinks.add(normalized_name)
                     continue
@@ -511,7 +515,7 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
 
                 if member.isdir():
                     if normalized_name not in seen_dirs:  # not already emitted as a synthesized ancestor
-                        _emit_dir(out_tf, normalized_name, mode)
+                        _emit_dir(out_tf, normalized_name, mode, mtime)
                     continue
 
                 # Regular file
@@ -524,7 +528,7 @@ def _sanitize_archive_stream(in_stream: IO[bytes], out_stream: IO[bytes], *, uid
                 out_info.gid = gid
                 out_info.uname = ""
                 out_info.gname = ""
-                out_info.mtime = 0
+                out_info.mtime = mtime
                 out_info.mode = mode
                 out_info.type = tarfile.REGTYPE
                 out_info.size = member.size

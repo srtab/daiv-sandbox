@@ -7,13 +7,14 @@ import tempfile
 from pathlib import Path
 
 
-def make_tar_gz(files: dict[str, bytes]) -> bytes:
-    """Build a gzip-compressed tar archive from ``files`` and return raw bytes."""
+def make_tar_gz(files: dict[str, bytes], *, mtime: int = 0) -> bytes:
+    """Build a gzip-compressed tar archive from ``files`` (each member dated ``mtime``) and return raw bytes."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for name, content in files.items():
             ti = tarfile.TarInfo(name)
             ti.size = len(content)
+            ti.mtime = mtime
             tf.addfile(ti, io.BytesIO(content))
     return buf.getvalue()
 
