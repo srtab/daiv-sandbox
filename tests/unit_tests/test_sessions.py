@@ -745,23 +745,61 @@ def _sanitize_tar(build) -> tuple[tarfile.TarFile, int]:
     return tarfile.open(fileobj=out_buf), skipped
 
 
-def _add_symlink(tf: tarfile.TarFile, name: str, target: str) -> None:
+def _add_symlink(tf: tarfile.TarFile, name: str, target: str, *, mtime: int = 0) -> None:
     sym = tarfile.TarInfo(name=name)
     sym.type = tarfile.SYMTYPE
     sym.linkname = target
+    sym.mtime = mtime
     tf.addfile(sym)
 
 
-def _add_file(tf: tarfile.TarFile, name: str, content: bytes = b"hello") -> None:
+def _add_file(tf: tarfile.TarFile, name: str, content: bytes = b"hello", *, mtime: int = 0) -> None:
     info = tarfile.TarInfo(name=name)
     info.size = len(content)
+    info.mtime = mtime
     tf.addfile(info, io.BytesIO(content))
 
 
-def _add_dir(tf: tarfile.TarFile, name: str) -> None:
+def _add_dir(tf: tarfile.TarFile, name: str, *, mtime: int = 0) -> None:
     info = tarfile.TarInfo(name=name)
     info.type = tarfile.DIRTYPE
+    info.mtime = mtime
     tf.addfile(info)
+
+
+def test_sanitize_archive_stream_keeps_member_mtimes():
+    """put_archive extracts each member's mtime verbatim, so files, dirs and symlinks must keep the
+    time their archive carries (git archive stamps the commit time)."""
+
+    def build(tf):
+        _add_dir(tf, "pkg", mtime=1_600_000_000)
+        _add_file(tf, "pkg/mod.py", mtime=1_600_000_001)
+        _add_symlink(tf, "pkg/link.py", "mod.py", mtime=1_600_000_002)
+
+    out_tf, skipped = _sanitize_tar(build)
+    with out_tf:
+        mtimes = {m.name: m.mtime for m in out_tf.getmembers()}
+    assert mtimes == {"pkg": 1_600_000_000, "pkg/mod.py": 1_600_000_001, "pkg/link.py": 1_600_000_002}
+    assert skipped == 0
+
+
+def test_sanitize_archive_stream_dates_undated_and_synthesized_members_now():
+    """A member dated 0 (TarInfo's default) and a synthesized ancestor dir have no meaningful time;
+    they land dated now rather than 1970, which mtime-based tools read as older than any build."""
+
+    def build(tf):
+        _add_dir(tf, "explicit")
+        _add_file(tf, "synth/sub/mod.py")
+        _add_symlink(tf, "synth/link.py", "sub/mod.py")
+
+    before = int(time.time())
+    out_tf, skipped = _sanitize_tar(build)
+    after = int(time.time())
+    with out_tf:
+        mtimes = {m.name: m.mtime for m in out_tf.getmembers()}
+    assert set(mtimes) == {"explicit", "synth", "synth/sub", "synth/sub/mod.py", "synth/link.py"}
+    assert all(before <= mtime <= after for mtime in mtimes.values()), mtimes
+    assert skipped == 0
 
 
 def test_sanitize_archive_stream_preserves_in_tree_symlinks():
@@ -1013,7 +1051,8 @@ def test_sanitize_archive_stream_preserves_explicit_dir_entry_once():
 def test_write_file_ships_sanitized_single_file_via_put_archive(mock_docker_client):
     """write_file (default, create_only=False) ships one sanitized file straight to put_archive — no
     copy_to_container, no chmod/chown round-trips. The member lands under the right parent stamped
-    with RUN_UID:RUN_GID (put_archive preserves the tar's uid/gid/mode, so no post-copy fix-up)."""
+    with RUN_UID:RUN_GID and dated now (put_archive preserves the tar's uid/gid/mode/mtime, so no
+    post-copy fix-up, and a same-size fs/edit still invalidates CPython's .pyc)."""
     captured: dict = {}
 
     def fake_put(path, stream):
@@ -1025,7 +1064,9 @@ def test_write_file_ships_sanitized_single_file_via_put_archive(mock_docker_clie
     s.execute_command = Mock()
     s.container.put_archive = Mock(side_effect=fake_put)
 
+    before = int(time.time())
     s.write_file(f"{SANDBOX_ROOT}/sub/dir/foo.py", b"print('hi')\n", mode=0o755)
+    after = int(time.time())
 
     # create_only=False: parent assumed to exist (edit's read-modify-write) → no exec round-trip.
     s.execute_command.assert_not_called()
@@ -1038,6 +1079,7 @@ def test_write_file_ships_sanitized_single_file_via_put_archive(mock_docker_clie
         assert m.name == "foo.py" and m.isfile()
         assert m.uid == settings.RUN_UID and m.gid == settings.RUN_GID
         assert (m.mode & 0o7777) == 0o755
+        assert before <= m.mtime <= after
         assert tf.extractfile(m).read() == b"print('hi')\n"
 
 

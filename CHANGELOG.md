@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Files written by `fs/write` and `fs/edit` are dated with the current time, and seeded files keep the mtime their archive carries. They were all dated 1970-01-01, so a same-size edit left Python running stale `.pyc` bytecode and `make` missed changes.
 - A command that exceeds its `timeout` is killed with every process it started; it used to keep running after the response, alongside the session's next request.
 - With `intercept="credentialed"`, a host is intercepted when any of its rules injects a secret or restricts methods, not only the first matching one.
 - Requests to `localhost`, `127.0.0.1` and `::1` from an egress sandbox no longer go through the proxy and fail with `502`.
