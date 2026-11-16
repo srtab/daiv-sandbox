@@ -1051,7 +1051,8 @@ def test_sanitize_archive_stream_preserves_explicit_dir_entry_once():
 def test_write_file_ships_sanitized_single_file_via_put_archive(mock_docker_client):
     """write_file (default, create_only=False) ships one sanitized file straight to put_archive — no
     copy_to_container, no chmod/chown round-trips. The member lands under the right parent stamped
-    with RUN_UID:RUN_GID (put_archive preserves the tar's uid/gid/mode, so no post-copy fix-up)."""
+    with RUN_UID:RUN_GID and dated now (put_archive preserves the tar's uid/gid/mode/mtime, so no
+    post-copy fix-up, and a same-size fs/edit still invalidates CPython's .pyc)."""
     captured: dict = {}
 
     def fake_put(path, stream):
@@ -1063,7 +1064,9 @@ def test_write_file_ships_sanitized_single_file_via_put_archive(mock_docker_clie
     s.execute_command = Mock()
     s.container.put_archive = Mock(side_effect=fake_put)
 
+    before = int(time.time())
     s.write_file(f"{SANDBOX_ROOT}/sub/dir/foo.py", b"print('hi')\n", mode=0o755)
+    after = int(time.time())
 
     # create_only=False: parent assumed to exist (edit's read-modify-write) → no exec round-trip.
     s.execute_command.assert_not_called()
@@ -1076,28 +1079,8 @@ def test_write_file_ships_sanitized_single_file_via_put_archive(mock_docker_clie
         assert m.name == "foo.py" and m.isfile()
         assert m.uid == settings.RUN_UID and m.gid == settings.RUN_GID
         assert (m.mode & 0o7777) == 0o755
+        assert before <= m.mtime <= after
         assert tf.extractfile(m).read() == b"print('hi')\n"
-
-
-def test_write_file_lands_with_current_mtime(mock_docker_client):
-    """fs/write and fs/edit both go through write_file; the shipped member must be dated now, or a
-    same-size edit leaves CPython's .pyc check and make treating the file as unchanged."""
-    captured: dict = {}
-
-    def fake_put(path, stream):
-        captured["tar_bytes"] = stream.read()
-        return True
-
-    s = _session_with_container()
-    s.container.put_archive = Mock(side_effect=fake_put)
-
-    before = int(time.time())
-    s.write_file(f"{SANDBOX_ROOT}/mod.py", b"X = 1\n", mode=0o644)
-    after = int(time.time())
-
-    with tarfile.open(fileobj=io.BytesIO(captured["tar_bytes"])) as tf:
-        [member] = tf.getmembers()
-    assert before <= member.mtime <= after
 
 
 def test_copy_to_container_streams_sanitized_output_to_put_archive(mock_docker_client):
