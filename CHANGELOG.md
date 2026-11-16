@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A timed-out command's `output` keeps what it printed before it was killed, followed by `Command timed out after {N}s and was killed.`. Detect timeouts with `timed_out` rather than the message.
 - Sandboxes run with Docker's init as PID 1, so orphaned processes are reaped.
 - `DAIV_SANDBOX_SESSION_GRACE_SECONDS` defaults to 6h (was 12h) and `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` to `30` (was `50`).
-- Bumped `fastapi[standard]` to 0.162.2, `pydantic` to 2.14.3, `pydantic-settings` to 2.16.2, `sentry-sdk` to 2.74.0, `ipython` to 9.18.1, and `urllib3` to 2.8.0.
+- Bumped `fastapi[standard]` to 0.163.1 (no behavioral impact; basic route usage only), `pydantic-settings` to 2.16.3 (extends `secrets_dir` symlink hardening to plain `SecretsSettingsSource`; safe — `/run/secrets` entries are plain files), `sentry-sdk` to 2.75.0 (no changes to `init`/`dsn`/`enable_logs`/sample rates`/`send_default_pii`), `ruff` to 0.17.5, `pytest-asyncio` to 1.5.0, and `prek` to 0.5.11.
 
 ### Fixed
 
