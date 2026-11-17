@@ -100,7 +100,7 @@ def test_egress_defaults():
 
 
 def test_egress_proxy_image_default():
-    assert settings.EGRESS_PROXY_IMAGE.endswith("daiv-sandbox-egress:latest")
+    assert Settings.model_fields["EGRESS_PROXY_IMAGE"].default == "ghcr.io/srtab/daiv-sandbox-egress:0.6.0"
 
 
 @pytest.mark.parametrize("field", ["EGRESS_PROXY_PORT", "EGRESS_PROXY_CPUS", "EGRESS_PROXY_MEMORY_BYTES"])

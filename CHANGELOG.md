@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - A headless browser per session, for DAIV's browser tools: `POST /session/{id}/browser/` starts it, `DELETE /session/{id}/browser/` saves its open tabs and stops it, and `WS /session/{id}/browser/cdp` tunnels to its DevTools port. It reaches the sandbox's loopback through `daiv-relay` and everything else through the session's egress proxy. `GET /-/capabilities/` reports `{"browser": true}` once the browser image is present. New settings: `DAIV_SANDBOX_BROWSER_IMAGE` (default `ghcr.io/srtab/daiv-sandbox-browser:0.6.0`) and `DAIV_SANDBOX_BROWSER_START_TIMEOUT_SECONDS` (default `20`). Each running browser takes about 300 MB.
-- `path_prefix` on egress rules, to scope a rule (and its injected secret) to request paths under a prefix, so one host can carry a different credential per repository. **Upgrade note:** update the egress sidecar image together with the service; an older sidecar ignores `path_prefix` and applies the rule to every path.
+- `path_prefix` on egress rules, to scope a rule (and its injected secret) to request paths under a prefix, so one host can carry a different credential per repository. **Upgrade note:** if you override `DAIV_SANDBOX_EGRESS_PROXY_IMAGE`, update it together with the service; an older sidecar ignores `path_prefix` and applies the rule to every path.
 - `repos_archive` on `POST /session/{id}/seed/`, extracted into `/workspace/repos`, for sessions spanning several repositories.
 - `timed_out` field on run-command results.
 - Egress config installs and sidecar policy reloads are logged with a digest of the config, so a refresh can be traced end to end.
@@ -21,7 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A timed-out command's `output` keeps what it printed before it was killed, followed by `Command timed out after {N}s and was killed.`. Detect timeouts with `timed_out` rather than the message.
 - Sandboxes run with Docker's init as PID 1, so orphaned processes are reaped.
 - `DAIV_SANDBOX_SESSION_GRACE_SECONDS` defaults to 6h (was 12h) and `DAIV_SANDBOX_MAX_STOPPED_SESSIONS` to `30` (was `50`).
-- Bumped `fastapi[standard]` to 0.163.1 (no behavioral impact; basic route usage only), `pydantic-settings` to 2.16.3 (extends `secrets_dir` symlink hardening to plain `SecretsSettingsSource`; safe — `/run/secrets` entries are plain files), `sentry-sdk` to 2.75.0 (no changes to `init`/`dsn`/`enable_logs`/sample rates`/`send_default_pii`), `ruff` to 0.17.5, `pytest-asyncio` to 1.5.0, and `prek` to 0.5.11.
+- `DAIV_SANDBOX_EGRESS_PROXY_IMAGE` defaults to `ghcr.io/srtab/daiv-sandbox-egress:0.6.0` (was `:latest`). The sidecar image is pulled only when missing, so a cached `:latest` kept an upgraded service on the old sidecar. `make build-egress-proxy` now tags its build `:dev`.
+- Bumped `fastapi[standard]` to 0.163.1 (no behavioral impact; basic route usage only), `pydantic-settings` to 2.16.3 (extends `secrets_dir` symlink hardening to plain `SecretsSettingsSource`; safe — `/run/secrets` entries are plain files), `sentry-sdk` to 2.75.0 (no changes to `init`/`dsn`/`enable_logs`/sample rates/`send_default_pii`), `ruff` to 0.17.5, `pytest-asyncio` to 1.5.0, and `prek` to 0.5.11.
 
 ### Fixed
 

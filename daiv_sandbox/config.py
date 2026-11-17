@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     # built as a triad (internal network + mitmdump sidecar + sandbox) and the sandbox reaches the
     # internet only through the sidecar. A POST /session/ carrying an egress block without the CA is rejected (400).
     # See the "Network Egress Proxy" section of the README.
-    EGRESS_PROXY_IMAGE: str = "ghcr.io/srtab/daiv-sandbox-egress:latest"
+    EGRESS_PROXY_IMAGE: str = "ghcr.io/srtab/daiv-sandbox-egress:0.6.0"
     EGRESS_PROXY_PORT: int = Field(default=8080, gt=0)
     # The sidecar runs trusted code (not untrusted), so it stays on runc even when sandboxes use runsc;
     # runc also avoids gVisor's embedded-DNS quirks for the proxy's own upstream resolution.

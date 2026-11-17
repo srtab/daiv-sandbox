@@ -20,7 +20,7 @@ help:
 	@echo "  make lint-fix             - Fix linting and formatting issues"
 	@echo "  make lint-typing          - Run type checking with mypy"
 	@echo "  make run                  - Run the application"
-	@echo "  make build-egress-proxy   - Build the per-session egress proxy sidecar image"
+	@echo "  make build-egress-proxy   - Build the egress proxy sidecar image (ghcr.io/srtab/daiv-sandbox-egress:dev)"
 	@echo "  make build-browser        - Build the browser image (ghcr.io/srtab/daiv-sandbox-browser:dev)"
 	@echo "  make test-relay           - Run daiv-relay's Go tests (in a golang container)"
 
@@ -51,7 +51,7 @@ run:
 	uv run fastapi dev daiv_sandbox/main.py --reload --port 8888
 
 build-egress-proxy:  ## Build the per-session egress proxy sidecar image
-	docker build -f egress_proxy/Dockerfile -t ghcr.io/srtab/daiv-sandbox-egress:latest .
+	docker build -f egress_proxy/Dockerfile -t ghcr.io/srtab/daiv-sandbox-egress:dev .
 
 build-browser:  ## Build the browser image run beside a session's sandbox
 	docker build -t ghcr.io/srtab/daiv-sandbox-browser:dev -f browser/Dockerfile .
