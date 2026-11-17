@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A headless browser per session, for DAIV's browser tools: `POST /session/{id}/browser/` starts it, `DELETE /session/{id}/browser/` saves its open tabs and stops it, and `WS /session/{id}/browser/cdp` tunnels to its DevTools port. It reaches the sandbox's loopback through `daiv-relay` and everything else through the session's egress proxy. `GET /-/capabilities/` reports `{"browser": true}` once the browser image is present. New settings: `DAIV_SANDBOX_BROWSER_IMAGE` (default `ghcr.io/srtab/daiv-sandbox-browser:0.6.0`) and `DAIV_SANDBOX_BROWSER_START_TIMEOUT_SECONDS` (default `20`). Each running browser takes about 300 MB.
 - `path_prefix` on egress rules, to scope a rule (and its injected secret) to request paths under a prefix, so one host can carry a different credential per repository. **Upgrade note:** update the egress sidecar image together with the service; an older sidecar ignores `path_prefix` and applies the rule to every path.
 - `repos_archive` on `POST /session/{id}/seed/`, extracted into `/workspace/repos`, for sessions spanning several repositories.
 - `timed_out` field on run-command results.
@@ -38,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The egress proxy evaluates its policy against the connection's real destination rather than the `Host` header, which let a request to another host receive a credential.
 - Requests with a body over 256 KiB no longer bypass the egress policy.
+- The egress proxy no longer injects a secret into a request another origin's page sent (`Sec-Fetch-Site` `cross-site` or `same-site`, or a foreign `Origin`), and the session's browser gets secrets only over `https`. **Upgrade note:** the browser rule needs the egress sidecar and browser images from this release.
 
 ## [0.5.0] - 2026-09-01
 

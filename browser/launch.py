@@ -1,0 +1,225 @@
+"""Start Chromium detached on the session's profile and report its DevTools endpoint as JSON.
+
+Runs inside the browser container, as the browser user, through a daiv-sandbox exec.
+"""
+
+import argparse
+import hashlib
+import json
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+PROFILE = Path("/profile")
+TABS_FILE = PROFILE / ".daiv-tabs.json"
+CHROMIUM = "/usr/bin/chromium"
+DEVTOOLS_PORT = 39222
+RELAY_PORT = 39223
+TIMEOUT_EXIT = 5
+NOT_RUNNING_EXIT = 3
+WEB_SCHEMES = ("http://", "https://")
+EXECUTABLE_STATE = (
+    "DNR Extension Rules",
+    "Extension Rules",
+    "Extension Scripts",
+    "Extension State",
+    "Local Extension Settings",
+    "Managed Extension Settings",
+    "Service Worker",
+    "Sync Extension Settings",
+)
+
+# Stagehand's own launcher defaults, minus --remote-allow-origins=*, which would let any page drive the browser.
+STAGEHAND_FLAGS = [
+    "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,"
+    "CalculateNativeWinOcclusion,InterestFeedContentSuggestions,"
+    "CertificateTransparencyComponentUpdater,AutofillServerCommunication,"
+    "PrivacySandboxSettings4,RenderDocument",
+    "--disable-component-extensions-with-background-pages",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-client-side-phishing-detection",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--disable-default-apps",
+    "--mute-audio",
+    "--no-default-browser-check",
+    "--no-first-run",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+    "--disable-ipc-flooding-protection",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--force-fieldtrials=*BackgroundTracing/default/",
+    "--disable-hang-monitor",
+    "--disable-prompt-on-repost",
+    "--disable-domain-reliability",
+    "--propagate-iph-for-testing",
+    "--enable-features=WebMCP,WebMCPTesting,DevToolsWebMCPSupport",
+    "--window-size=1280,800",
+]
+
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def extension_id(path: str) -> str:
+    """The id Chromium gives an unpacked extension: its absolute path's sha256, first 32 hex digits mapped to a-p."""
+    digest = hashlib.sha256(str(Path(path).resolve()).encode()).hexdigest()[:32]
+    return "".join(chr(ord("a") + int(char, 16)) for char in digest)
+
+
+def chromium_argv(extension: str, urls: list[str]) -> list[str]:
+    return [
+        CHROMIUM,
+        "--headless=new",
+        f"--user-data-dir={PROFILE}",
+        f"--load-extension={extension}",
+        "--enable-unsafe-extension-debugging",
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={DEVTOOLS_PORT}",
+        f"--remote-allow-origins=chrome-extension://{extension_id(extension)}",
+        f"--proxy-server=socks5://127.0.0.1:{RELAY_PORT}",
+        f"--proxy-bypass-list=<-loopback>;127.0.0.1:{DEVTOOLS_PORT}",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        *STAGEHAND_FLAGS,
+        *(urls or ["about:blank"]),
+    ]
+
+
+def read_tabs() -> tuple[list[str], str]:
+    try:
+        raw = TABS_FILE.read_text()
+    except FileNotFoundError:
+        return [], "none"
+    except OSError:
+        return [], "unreadable"
+    try:
+        urls = json.loads(raw)
+    except ValueError:
+        return [], "unreadable"
+    if not isinstance(urls, list) or not all(isinstance(url, str) for url in urls):
+        return [], "unreadable"
+    return [url for url in urls if url.lower().startswith(WEB_SCHEMES)], "ok"
+
+
+def wipe_executable_state() -> None:
+    """Remove what the profile keeps that could run code in a later run, which may be another person's: the
+    extension's stored scripts, request rules and storage, and the sites' service workers. Cookies and site storage
+    stay."""
+    for name in EXECUTABLE_STATE:
+        shutil.rmtree(PROFILE / "Default" / name, ignore_errors=True)
+
+
+def devtools_version() -> dict | None:
+    try:
+        with _OPENER.open(f"http://127.0.0.1:{DEVTOOLS_PORT}/json/version", timeout=1) as response:
+            return json.load(response)
+    except (OSError, ValueError):
+        return None
+
+
+def ws_path(version: dict) -> str:
+    return urllib.parse.urlsplit(version["webSocketDebuggerUrl"]).path
+
+
+def port_open(port: int) -> bool:
+    with socket.socket() as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def install_ca(ca_path: str) -> None:
+    nssdb = Path.home() / ".pki" / "nssdb"
+    nssdb.mkdir(parents=True, exist_ok=True)
+    db = f"sql:{nssdb}"
+    if not (nssdb / "cert9.db").exists():
+        subprocess.run(["certutil", "-N", "-d", db, "--empty-password"], check=True)
+    subprocess.run(["certutil", "-D", "-d", db, "-n", "daiv-egress"], check=False, capture_output=True)
+    subprocess.run(["certutil", "-A", "-d", db, "-n", "daiv-egress", "-t", "C,,", "-i", ca_path], check=True)
+
+
+def wait_until(deadline: float, check):
+    """The first truthy result of ``check`` before ``deadline``, polled every 0.1 s; None if it never is."""
+    while time.monotonic() < deadline:
+        if result := check():
+            return result
+        time.sleep(0.1)
+    return None
+
+
+def running_extension(proc: Path = Path("/proc")) -> str | None:
+    """The ``--load-extension`` path of the running Chromium, read from its command line. Chromium honours the
+    last occurrence, and Debian's wrapper puts an empty one of its own first."""
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        values = [arg.removeprefix(b"--load-extension=") for arg in argv if arg.startswith(b"--load-extension=")]
+        if values:
+            return values[-1].decode(errors="replace")
+    return None
+
+
+def report(version: dict, urls: list[str], tabs: str, extension: str | None) -> None:
+    print(
+        json.dumps({"browser_ws_path": ws_path(version), "restored_urls": urls, "tabs": tabs, "extension": extension})
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--extension")
+    parser.add_argument("--timeout", type=float, default=20.0)
+    parser.add_argument("--ca")
+    parser.add_argument("--probe", action="store_true")
+    args = parser.parse_args()
+
+    version = devtools_version()
+    if version is not None:
+        report(version, [], "running", running_extension())
+        return 0
+    if args.probe:
+        return NOT_RUNNING_EXIT
+    if not args.extension:
+        parser.error("--extension is required to launch")
+
+    deadline = time.monotonic() + args.timeout
+    if args.ca:
+        install_ca(args.ca)
+    urls, tabs = read_tabs()
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        (PROFILE / name).unlink(missing_ok=True)
+    wipe_executable_state()
+    if not wait_until(deadline, lambda: port_open(RELAY_PORT)):
+        print("the relay is not listening", file=sys.stderr)
+        return TIMEOUT_EXIT
+
+    with (Path.home() / "chromium.log").open("wb") as log:
+        subprocess.Popen(  # noqa: S603
+            chromium_argv(args.extension, urls),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+            close_fds=True,
+        )
+    version = wait_until(deadline, devtools_version)
+    if version is None:
+        print("Chromium did not open its DevTools port in time", file=sys.stderr)
+        return TIMEOUT_EXIT
+    report(version, urls, tabs, args.extension)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

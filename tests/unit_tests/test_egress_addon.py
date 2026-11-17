@@ -2,11 +2,13 @@ import contextlib
 import json
 import logging
 import types
+from pathlib import Path
 
 import pytest
 
 from daiv_sandbox.egress import addon as addon_mod
 from daiv_sandbox.egress.addon import EgressAddon
+from daiv_sandbox.egress.constants import BROWSER_CLIENT, BROWSER_CLIENT_HEADER
 from daiv_sandbox.egress.policy import REASON_METHOD_NOT_ALLOWED, BlockReason
 
 
@@ -25,10 +27,20 @@ def _write_cfg(tmp_path, **kw):
     return str(path)
 
 
-def _flow(host="github.com", method="GET", path="/", **request_fields):
+def _flow(host="github.com", method="GET", path="/", client_conn=None, **request_fields):
     request = types.SimpleNamespace(host=host, host_header=host, method=method, headers={}, path=path)
     vars(request).update(request_fields)
-    return types.SimpleNamespace(request=request, response=None)
+    client_conn = client_conn or types.SimpleNamespace(id="sandbox-connection")
+    return types.SimpleNamespace(request=request, response=None, client_conn=client_conn)
+
+
+def _browser_tunnel(addon, host="gitlab.com"):
+    """The client connection of a CONNECT that daiv-relay sent for the browser."""
+    connect = _flow(host=host, method="CONNECT", client_conn=types.SimpleNamespace(id="browser-connection"))
+    connect.request.headers[BROWSER_CLIENT_HEADER] = BROWSER_CLIENT
+    addon.http_connect(connect)
+    assert connect.response is None
+    return connect.client_conn
 
 
 @pytest.fixture(autouse=True)
@@ -122,6 +134,75 @@ def test_request_with_matching_or_absent_host_header_injects(tmp_path, host_head
     flow = _flow(host="gitlab.com", host_header=host_header)
     a.requestheaders(flow)
     assert flow.response is None
+    assert flow.request.headers["Authorization"] == "Bearer secret"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Sec-Fetch-Site": "cross-site"},
+        {"Sec-Fetch-Site": "same-site"},
+        {"Origin": "https://evil.example"},
+        {"Origin": "https://gitlab.com:8443"},
+        {"Origin": "null"},
+        {"Sec-Fetch-Site": "same-origin", "Origin": "http://gitlab.com"},
+    ],
+    ids=["cross-site", "same-site", "other-origin", "other-port", "opaque-origin", "other-scheme"],
+)
+def test_a_request_another_origins_page_sent_goes_out_without_the_secret(tmp_path, caplog, headers):
+    a = EgressAddon(_gitlab_cfg(tmp_path))
+    flow = _flow(host="gitlab.com", scheme="https", port=443, headers={**headers, "Authorization": "page-supplied"})
+    with caplog.at_level(logging.INFO, logger="daiv_sandbox.egress"):
+        a.requestheaders(flow)
+    assert flow.response is None
+    assert "Authorization" not in flow.request.headers
+    assert "did not inject Authorization for gitlab.com" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("headers", "port"),
+    [
+        ({}, 443),
+        ({"Sec-Fetch-Site": "none"}, 443),
+        ({"Sec-Fetch-Site": "same-origin", "Origin": "https://gitlab.com"}, 443),
+        ({"Origin": "https://GitLab.com:8443"}, 8443),
+    ],
+    ids=["not-a-browser", "typed-navigation", "same-origin", "same-origin-on-its-port"],
+)
+def test_a_request_from_its_own_origin_or_no_browser_gets_the_secret(tmp_path, headers, port):
+    a = EgressAddon(_gitlab_cfg(tmp_path))
+    flow = _flow(host="gitlab.com", scheme="https", port=port, headers=dict(headers))
+    a.requestheaders(flow)
+    assert flow.request.headers["Authorization"] == "Bearer secret"
+
+
+def test_a_browser_request_without_fetch_metadata_goes_out_without_the_secret(tmp_path, caplog):
+    """Chromium sends Sec-Fetch-* only to https, so a plain-http request could be any page's."""
+    a = EgressAddon(_gitlab_cfg(tmp_path))
+    flow = _flow(host="gitlab.com", scheme="http", port=80, client_conn=_browser_tunnel(a))
+    with caplog.at_level(logging.INFO, logger="daiv_sandbox.egress"):
+        a.requestheaders(flow)
+    assert flow.response is None
+    assert "Authorization" not in flow.request.headers
+    assert "did not inject Authorization for gitlab.com" in caplog.text
+
+
+@pytest.mark.parametrize("site", ["same-origin", "none"])
+def test_a_browser_request_its_own_origin_sent_gets_the_secret(tmp_path, site):
+    a = EgressAddon(_gitlab_cfg(tmp_path))
+    flow = _flow(
+        host="gitlab.com", scheme="https", port=443, client_conn=_browser_tunnel(a), headers={"Sec-Fetch-Site": site}
+    )
+    a.requestheaders(flow)
+    assert flow.request.headers["Authorization"] == "Bearer secret"
+
+
+def test_a_closed_browser_connection_is_forgotten(tmp_path):
+    a = EgressAddon(_gitlab_cfg(tmp_path))
+    browser = _browser_tunnel(a)
+    a.client_disconnected(browser)
+    flow = _flow(host="gitlab.com", scheme="https", port=443, client_conn=browser)
+    a.requestheaders(flow)
     assert flow.request.headers["Authorization"] == "Bearer secret"
 
 
@@ -344,3 +425,8 @@ def test_request_passes_path_to_policy(tmp_path):
     a.requestheaders(other)
     assert scoped.request.headers["Authorization"] == "S"
     assert other.request.headers["Authorization"] == "M"
+
+
+def test_the_relay_sends_the_marker_the_addon_matches():
+    listen_go = (Path(__file__).resolve().parents[2] / "relay" / "listen.go").read_text()
+    assert f'"{BROWSER_CLIENT_HEADER}: {BROWSER_CLIENT}"' in listen_go

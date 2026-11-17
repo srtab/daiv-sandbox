@@ -10,7 +10,9 @@ from daiv_sandbox.config import settings
 from daiv_sandbox.egress.manager import EgressProxyManager
 from daiv_sandbox.locks import SessionBusyError
 from daiv_sandbox.sessions import (
+    BROWSER_SESSION_LABEL,
     DAIV_SANDBOX_TYPE_LABEL,
+    TYPE_BROWSER,
     TYPE_CMD_EXECUTOR,
     TYPE_EGRESS_NETWORK,
     TYPE_EGRESS_PROXY,
@@ -186,10 +188,40 @@ async def _reap_once(
     # below reclaims it — once the triad outlives grace_seconds, not necessarily in this tick.
     await _reap_idle_running_sessions(client, lock_manager, activity, now=now, idle_seconds=idle_seconds)
 
+    # Before the triad sweep, so an orphaned browser no longer holds its network.
+    await _reap_orphan_browsers(client)
+
     # Sweep orphan triads unconditionally, NOT gated on settings.egress_enabled: an operator who disables
     # egress (removes the CA files) while triads from earlier sessions still exist would otherwise strand
     # those proxy containers + internal networks forever. It is a cheap no-op when nothing is labelled.
     await _reap_orphan_triads(client, now=now, grace_seconds=grace_seconds)
+
+
+async def _reap_orphan_browsers(client) -> None:
+    """Remove browser containers whose sandbox no longer exists.
+
+    A browser is created only for an existing sandbox and is labelled with its id, so a missing sandbox means
+    the browser can never be used again; there is no start-time race to guard against.
+    """
+    browsers = await asyncio.to_thread(
+        client.containers.list, all=True, filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_BROWSER}"}
+    )
+    if not browsers:
+        return
+    cmd_executors = await asyncio.to_thread(
+        client.containers.list, all=True, filters={"label": f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}"}
+    )
+    live_sessions = {c.id for c in cmd_executors}
+    for browser in browsers:
+        if browser.labels.get(BROWSER_SESSION_LABEL) in live_sessions:
+            continue
+        logger.info("Reaper: removing orphaned browser container %s (no sandbox)", browser.id)
+        try:
+            await asyncio.to_thread(browser.remove, force=True, v=True)
+        except NotFound:
+            pass
+        except Exception:
+            logger.exception("Reaper: failed to remove orphaned browser container %s", browser.id)
 
 
 async def _reap_orphan_triads(client, *, now, grace_seconds: int) -> None:

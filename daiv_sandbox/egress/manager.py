@@ -14,6 +14,7 @@ from daiv_sandbox.sessions import (
     DAIV_SANDBOX_TYPE_LABEL,
     EGRESS_SESSION_LABEL,
     SANDBOX_CA_BUNDLE,
+    TYPE_BROWSER,
     TYPE_CMD_EXECUTOR,
     TYPE_EGRESS_NETWORK,
     TYPE_EGRESS_PROXY,
@@ -74,13 +75,13 @@ class EgressProxyManager:
         self.client = client
 
     @staticmethod
-    def _internal_network_name(token: str) -> str:
+    def internal_network_name(token: str) -> str:
         """The per-session internal network name. Single source of truth so callers that need to
         resolve the proxy's IP on it (see proxy_internal_ip) can't drift from create_network."""
         return f"daiv-egress-{token}"
 
     def create_network(self, token: str) -> str:
-        name = self._internal_network_name(token)
+        name = self.internal_network_name(token)
         self.client.networks.create(
             name=name,
             driver="bridge",
@@ -190,7 +191,7 @@ class EgressProxyManager:
 
         The IP is read after ensure_proxy_running, so a just-restarted proxy reports its fresh endpoint
         IP (Docker releases the endpoint IP while stopped)."""
-        network_name = self._internal_network_name(token)
+        network_name = self.internal_network_name(token)
         proxy = self.ensure_proxy_running(token)
         nets = proxy.attrs["NetworkSettings"]["Networks"]
         ip = nets.get(network_name, {}).get("IPAddress")
@@ -253,8 +254,8 @@ class EgressProxyManager:
 
     def teardown(self, token: str) -> None:
         # v=True: the mitmproxy base image declares VOLUME on the confdir, so without it each proxy
-        # leaks one anonymous volume.
-        proxies = self._list(TYPE_EGRESS_PROXY, token)
+        # leaks one anonymous volume. A browser left on the network would make its removal fail.
+        proxies = self._list(TYPE_EGRESS_PROXY, token) + self._list(TYPE_BROWSER, token)
         self._best_effort(proxies, lambda proxy: proxy.remove(force=True, v=True), "remove")
         networks = self.client.networks.list(filters={"label": f"{EGRESS_SESSION_LABEL}={token}"})
         self._best_effort(networks, lambda net: net.remove(), "remove")
@@ -280,14 +281,14 @@ class EgressProxyManager:
         proxies = self._list(TYPE_EGRESS_PROXY, token)
         self._best_effort(proxies, lambda proxy: proxy.stop(timeout=settings.STOP_TIMEOUT_SECONDS), "stop")
         networks = self.client.networks.list(filters={"label": f"{EGRESS_SESSION_LABEL}={token}"})
-        members = proxies + self._list(TYPE_CMD_EXECUTOR, token)
+        members = proxies + self._list(TYPE_CMD_EXECUTOR, token) + self._list(TYPE_BROWSER, token)
         for network in networks:
             self._best_effort(members, lambda member, net=network: net.disconnect(member, force=True), "disconnect")
         self._best_effort(networks, lambda net: net.remove(), "remove")
 
     def resume(self, token: str) -> str:
         """Rebuild what ``suspend`` released and return the internal network's name: recreate the
-        network if it is gone, and reattach the sidecar and the sandbox to it.
+        network if it is gone, and reattach the sidecar, the sandbox and the session's browser to it.
 
         Idempotent, so both entry points (a sandbox restart in SandboxDockerSession._get_container and a
         sidecar restart in ``ensure_proxy_running``) can call it without coordinating; the attachment
@@ -300,7 +301,8 @@ class EgressProxyManager:
         """
         networks = self.client.networks.list(filters={"label": f"{EGRESS_SESSION_LABEL}={token}"})
         network = networks[0] if networks else self.client.networks.get(self.create_network(token))
-        for member in self._list(TYPE_EGRESS_PROXY, token) + self._list(TYPE_CMD_EXECUTOR, token):
+        members = self._list(TYPE_EGRESS_PROXY, token) + self._list(TYPE_CMD_EXECUTOR, token)
+        for member in members + self._list(TYPE_BROWSER, token):
             self._attach(network, member)
         return network.name
 

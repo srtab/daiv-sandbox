@@ -109,3 +109,21 @@ def test_egress_proxy_numeric_settings_reject_nonpositive(field):
     sidecar, so reject it at boot (matching the gt=0 discipline on the reaper/timeout settings)."""
     with pytest.raises(ValidationError):
         Settings(**{field: 0})
+
+
+def test_browser_defaults():
+    assert Settings.model_fields["BROWSER_IMAGE"].default == "ghcr.io/srtab/daiv-sandbox-browser:0.6.0"
+    assert settings.BROWSER_START_TIMEOUT_SECONDS == 20
+
+
+def test_browser_settings_read_the_environment(monkeypatch):
+    monkeypatch.setenv("DAIV_SANDBOX_BROWSER_IMAGE", "ghcr.io/srtab/daiv-sandbox-browser:dev")
+    monkeypatch.setenv("DAIV_SANDBOX_BROWSER_START_TIMEOUT_SECONDS", "45")
+    s = Settings()
+    assert s.BROWSER_IMAGE == "ghcr.io/srtab/daiv-sandbox-browser:dev"
+    assert s.BROWSER_START_TIMEOUT_SECONDS == 45
+
+
+def test_browser_start_timeout_must_be_positive():
+    with pytest.raises(ValidationError):
+        Settings(BROWSER_START_TIMEOUT_SECONDS=0)

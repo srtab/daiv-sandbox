@@ -12,10 +12,18 @@ from daiv_sandbox.reaper import (
     _parse_docker_timestamp,
     _reap_idle_running_sessions,
     _reap_once,
+    _reap_orphan_browsers,
     _reap_orphan_triads,
     _remove_guarded,
 )
-from daiv_sandbox.sessions import DAIV_SANDBOX_TYPE_LABEL, EGRESS_SESSION_LABEL, TYPE_CMD_EXECUTOR, TYPE_EGRESS_PROXY
+from daiv_sandbox.sessions import (
+    BROWSER_SESSION_LABEL,
+    DAIV_SANDBOX_TYPE_LABEL,
+    EGRESS_SESSION_LABEL,
+    TYPE_BROWSER,
+    TYPE_CMD_EXECUTOR,
+    TYPE_EGRESS_PROXY,
+)
 
 
 def test_parse_nanosecond_timestamp_truncates_to_micros():
@@ -56,7 +64,22 @@ def test_list_stopped_filters_out_running():
 
 
 def _container(cid: str, *, status: str = "exited", finished_at: str = ""):
-    return Mock(id=cid, status=status, labels={}, attrs={"State": {"FinishedAt": finished_at}}, remove=Mock())
+    client = Mock()
+    client.containers.list.return_value = []
+    return Mock(
+        id=cid, status=status, labels={}, attrs={"State": {"FinishedAt": finished_at}}, remove=Mock(), client=client
+    )
+
+
+def _sandboxes_only(containers):
+    """containers.list side effect: every sandbox listing sees *containers*, and there are no browsers."""
+
+    def _list(filters=None, **kwargs):
+        if (filters or {}).get("label") == f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_BROWSER}":
+            return []
+        return list(containers)
+
+    return _list
 
 
 def _stopped_container(cid: str, finished_at: str):
@@ -130,7 +153,7 @@ async def test_reap_once_removes_only_aged_out():
     old = _stopped_container("old", "2026-05-31T00:00:00Z")  # >12h before NOW
     fresh = _stopped_container("fresh", "2026-06-01T11:59:00Z")  # 1m before NOW
     client = Mock()
-    client.containers.list.return_value = [old, fresh]
+    client.containers.list.side_effect = _sandboxes_only([old, fresh])
     client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
     await _reap_once(
@@ -153,7 +176,7 @@ async def test_reap_once_lru_evicts_oldest_beyond_cap():
     c2 = _stopped_container("c2", "2026-06-01T11:30:00Z")
     c3 = _stopped_container("c3", "2026-06-01T11:50:00Z")
     client = Mock()
-    client.containers.list.return_value = [c3, c1, c2]  # unsorted on purpose
+    client.containers.list.side_effect = _sandboxes_only([c3, c1, c2])  # unsorted on purpose
     client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
     await _reap_once(
@@ -176,7 +199,7 @@ async def test_reap_once_max_stopped_zero_evicts_all():
     c1 = _stopped_container("c1", "2026-06-01T11:00:00Z")  # within grace
     c2 = _stopped_container("c2", "2026-06-01T11:30:00Z")  # within grace
     client = Mock()
-    client.containers.list.return_value = [c1, c2]
+    client.containers.list.side_effect = _sandboxes_only([c1, c2])
     client.networks.list.return_value = []  # orphan-triad sweep runs every tick now (see _reap_once)
 
     await _reap_once(
@@ -344,16 +367,16 @@ _OLD = "2026-05-31T00:00:00Z"  # >12h before NOW
 _FRESH = "2026-06-01T11:59:00Z"  # 1m before NOW
 
 
-def _egress_client(*, proxies=(), cmd_execs=(), networks=()):
-    """A Mock client that routes containers.list by its label filter (egress proxies vs cmd-executors)."""
+def _egress_client(*, proxies=(), cmd_execs=(), networks=(), browsers=()):
+    """A Mock client that routes containers.list by its type label filter."""
+    by_label = {
+        f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_EGRESS_PROXY}": proxies,
+        f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}": cmd_execs,
+        f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_BROWSER}": browsers,
+    }
 
     def _containers_list(all=True, filters=None):  # noqa: A002 - mirrors docker SDK kwarg name
-        label = (filters or {}).get("label")
-        if label == f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_EGRESS_PROXY}":
-            return list(proxies)
-        if label == f"{DAIV_SANDBOX_TYPE_LABEL}={TYPE_CMD_EXECUTOR}":
-            return list(cmd_execs)
-        return []
+        return list(by_label.get((filters or {}).get("label"), ()))
 
     client = MagicMock()
     client.containers.list.side_effect = _containers_list
@@ -664,3 +687,69 @@ async def test_reap_once_runs_idle_sweep():
     )
 
     idle.remove.assert_called_once_with(force=True, v=True)
+
+
+# --- Browser containers ---------------------------------------------------------
+
+
+async def test_orphan_browser_sweep_removes_browsers_whose_sandbox_is_gone():
+    live = MagicMock(id="live-sandbox")
+    kept = MagicMock(labels={BROWSER_SESSION_LABEL: "live-sandbox"})
+    orphan = MagicMock(labels={BROWSER_SESSION_LABEL: "gone-sandbox"})
+    unlabelled = MagicMock(labels={})
+
+    await _reap_orphan_browsers(_egress_client(browsers=[kept, orphan, unlabelled], cmd_execs=[live]))
+
+    kept.remove.assert_not_called()
+    orphan.remove.assert_called_once_with(force=True, v=True)
+    unlabelled.remove.assert_called_once_with(force=True, v=True)
+
+
+async def test_orphan_browser_sweep_keeps_going_after_a_failed_removal():
+    first = MagicMock(labels={BROWSER_SESSION_LABEL: "gone-1"})
+    first.remove.side_effect = APIError("daemon busy")
+    second = MagicMock(labels={BROWSER_SESSION_LABEL: "gone-2"})
+
+    await _reap_orphan_browsers(_egress_client(browsers=[first, second]))
+
+    second.remove.assert_called_once_with(force=True, v=True)
+
+
+async def test_reap_once_removes_the_browser_of_a_reaped_sandbox():
+    sandbox = _stopped_container("sbx", "2026-05-31T00:00:00Z")
+    browser = MagicMock(labels={BROWSER_SESSION_LABEL: "sbx"})
+    sandboxes = [sandbox]
+    sandbox.remove.side_effect = lambda **kw: sandboxes.remove(sandbox)
+    client = _egress_client(cmd_execs=sandboxes, browsers=[browser])
+
+    await _reap_once(
+        client,
+        NoopSessionLockManager(),
+        now=NOW,
+        grace_seconds=43200,
+        max_stopped=50,
+        activity=NoopSessionActivityTracker(),
+        idle_seconds=0,
+    )
+
+    sandbox.remove.assert_called_once_with(force=True, v=True)
+    browser.remove.assert_called_once_with(force=True, v=True)
+
+
+async def test_reap_once_sweeps_orphan_browsers_before_orphan_triads():
+    client = _egress_client(browsers=[MagicMock(labels={BROWSER_SESSION_LABEL: "gone"})])
+    calls = []
+    with (
+        patch("daiv_sandbox.reaper._reap_orphan_browsers", new=AsyncMock(side_effect=lambda c: calls.append("b"))),
+        patch("daiv_sandbox.reaper._reap_orphan_triads", new=AsyncMock(side_effect=lambda c, **kw: calls.append("t"))),
+    ):
+        await _reap_once(
+            client,
+            NoopSessionLockManager(),
+            now=NOW,
+            grace_seconds=43200,
+            max_stopped=50,
+            activity=NoopSessionActivityTracker(),
+            idle_seconds=0,
+        )
+    assert calls == ["b", "t"]

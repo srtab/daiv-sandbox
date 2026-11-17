@@ -14,6 +14,9 @@ the two sides. To refresh the dump:
 import json
 
 from daiv_sandbox.schemas import (
+    BrowserStartRequest,
+    BrowserStartResponse,
+    BrowserStopResponse,
     EgressConfigRequest,
     EgressPolicy,
     EgressRule,
@@ -37,6 +40,7 @@ from daiv_sandbox.schemas import (
     RunRequest,
     RunResponse,
     RunResult,
+    SandboxCapabilities,
     StartSessionRequest,
     StartSessionResponse,
 )
@@ -67,6 +71,10 @@ _TYPES = [
     EgressSecret,
     EgressPolicy,
     EgressConfigRequest,
+    SandboxCapabilities,
+    BrowserStartRequest,
+    BrowserStartResponse,
+    BrowserStopResponse,
 ]
 
 

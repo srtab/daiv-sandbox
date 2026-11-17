@@ -1,6 +1,6 @@
 [project]
 name = "daiv-sandbox"
-version = "0.5.0"
+version = "0.6.0"
 description = "Runtime sandbox to empower DAIV agents to run arbitrary commands."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -86,6 +86,8 @@ lint.select = [
   "W",
 ]
 lint.ignore = [ "N812", "S101" ]
+# Scripts run inside the browser image: CLIs that print JSON and run Chromium/certutil.
+lint.per-file-ignores."browser/*.py" = [ "S404", "S603", "S607", "T20" ]
 lint.isort.known-first-party = [
   "daiv_sandbox",
 ]
@@ -97,6 +99,8 @@ lint.isort.section-order = [
   "local-folder",
 ]
 lint.isort.split-on-trailing-comma = false
+# The browser image runs Debian trixie's python3 (3.13), which lacks 3.14-only syntax.
+per-file-target-version."browser/*.py" = "py313"
 
 [tool.pyproject-fmt]
 keep_full_version = true
@@ -121,3 +125,5 @@ ini_options.asyncio_mode = "auto"
 
 [tool.pytest_env]
 DAIV_SANDBOX_API_KEY = "notsosecret"
+# The locally built image (`make build-browser`): the release tag is not published from a branch.
+DAIV_SANDBOX_BROWSER_IMAGE = "ghcr.io/srtab/daiv-sandbox-browser:dev"
