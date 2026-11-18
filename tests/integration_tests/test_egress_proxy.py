@@ -341,3 +341,40 @@ def test_repeated_provision_takes_effect_after_a_request_has_cached_the_policy(d
         if sandbox is not None:
             sandbox.remove(force=True)
         mgr.teardown(token)
+
+
+def test_restarted_proxy_accepts_connections_once_its_ip_is_returned(docker_client):
+    """A warm-stopped sidecar is restarted on its session's next request, and that request's command goes
+    straight to the address it gets back, with no retry. One curl must reach the policy (the addon's 403 for
+    an unlisted host), not a proxy that is running but not yet listening ("Couldn't connect to server")."""
+    if not _image_present(docker_client, settings.EGRESS_PROXY_IMAGE):
+        pytest.skip("egress proxy image not built; run `make build-egress-proxy`")
+
+    token = uuid.uuid4().hex[:12]
+    mgr = EgressProxyManager(docker_client)
+    sandbox = None
+    try:
+        combined, _ = _self_signed_ca()
+        net = mgr.create_network(token)
+        proxy = mgr.start_proxy(token, net, ca_pem=combined)
+        mgr.provision(
+            token,
+            json.dumps({
+                "policy": {"default": "deny", "intercept": "credentialed", "rules": []},
+                "secrets": {},
+            }).encode(),
+        )
+        sandbox = docker_client.containers.run("curlimages/curl:latest", command="sleep 60", detach=True, network=net)
+        proxy.stop(timeout=settings.STOP_TIMEOUT_SECONDS)
+
+        env = exec_proxy_env(mgr.proxy_internal_ip(token), settings.EGRESS_PROXY_PORT)
+        result = sandbox.exec_run(
+            ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10", "https://www.iana.org"],
+            environment=env,
+        )
+
+        assert "403" in result.output.decode(), result.output.decode()
+    finally:
+        if sandbox is not None:
+            sandbox.remove(force=True)
+        mgr.teardown(token)

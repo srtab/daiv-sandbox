@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 from docker.errors import APIError, ImageNotFound, NotFound
 
+from daiv_sandbox.config import settings
 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 from daiv_sandbox.sessions import EGRESS_SESSION_LABEL, TYPE_EGRESS_NETWORK, TYPE_EGRESS_PROXY, SessionUnavailableError
 
@@ -448,6 +449,7 @@ def test_proxy_internal_ip_restarts_stopped_proxy_and_reresolves(monkeypatch):
     mgr = EgressProxyManager(Mock())
     proxy = _proxy_with_ip("")  # stopped: Docker releases the endpoint IP
     proxy.status = "exited"
+    proxy.exec_run.return_value = Mock(exit_code=0, output=b"")  # listening once restarted
 
     def _reload():
         # docker-py refreshes .attrs on reload(), not on restart(): the fresh endpoint IP only appears
@@ -500,6 +502,7 @@ def test_ensure_proxy_running_restarts_stopped_proxy(monkeypatch):
     mgr = EgressProxyManager(Mock())
     proxy = Mock()
     proxy.status = "exited"
+    proxy.exec_run.return_value = Mock(exit_code=0, output=b"")  # listening once restarted
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
     monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
 
@@ -514,6 +517,7 @@ def test_ensure_proxy_running_rebuilds_the_network_before_restarting(monkeypatch
     mgr = EgressProxyManager(Mock())
     proxy = Mock()
     proxy.status = "exited"
+    proxy.exec_run.return_value = Mock(exit_code=0, output=b"")  # listening once restarted
     calls = []
     monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
     monkeypatch.setattr(mgr, "resume", lambda token: calls.append("resume"))
@@ -562,6 +566,59 @@ def test_ensure_proxy_running_raises_session_unavailable_when_restart_fails(monk
 
     with pytest.raises(SessionUnavailableError):
         mgr.ensure_proxy_running("tok123")
+
+
+def _probe_command(proxy: Mock) -> str:
+    """The shell-free argv of the readiness probe ensure_proxy_running ran in the sidecar, joined."""
+    return " ".join(proxy.exec_run.call_args.args[0])
+
+
+def test_ensure_proxy_running_waits_for_the_restarted_proxy_to_listen(monkeypatch):
+    """A restarted sidecar is running long before mitmdump listens. Returning straight after restart() hands
+    callers a proxy that refuses connections, so a resumed session's first command (DAIV's `git fetch`)
+    failed with "Couldn't connect to server". The probe must run after the restart, against the proxy port."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "exited"
+    calls = []
+    proxy.restart.side_effect = lambda: calls.append("restart")
+    proxy.exec_run.side_effect = lambda *a, **kw: calls.append("probe") or Mock(exit_code=0, output=b"")
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
+
+    assert mgr.ensure_proxy_running("tok123") is proxy
+
+    assert calls == ["restart", "probe"]
+    assert str(settings.EGRESS_PROXY_PORT) in _probe_command(proxy)
+    assert str(settings.EGRESS_PROXY_START_TIMEOUT_SECONDS) in _probe_command(proxy)
+
+
+def test_ensure_proxy_running_raises_session_unavailable_when_proxy_never_listens(monkeypatch):
+    """A sidecar that does not listen within the timeout is a retryable 503, not a proxy handed to a caller
+    whose command then fails on a refused connection."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "exited"
+    proxy.exec_run.return_value = Mock(exit_code=1, output=b"")
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
+
+    with pytest.raises(SessionUnavailableError, match="not listening"):
+        mgr.ensure_proxy_running("tok123")
+
+
+def test_ensure_proxy_running_does_not_probe_a_running_proxy(monkeypatch):
+    """The probe is for a fresh restart only: every exec resolves the proxy, so probing a running one would
+    add a Docker exec to each command."""
+    mgr = EgressProxyManager(Mock())
+    proxy = Mock()
+    proxy.status = "running"
+    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
+    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
+
+    mgr.ensure_proxy_running("tok123")
+
+    proxy.exec_run.assert_not_called()
 
 
 def _provision_ready_mgr(monkeypatch, *, status: str = "running"):
@@ -638,7 +695,9 @@ def test_provision_warm_restarts_stopped_proxy_then_writes(monkeypatch):
 
     proxy.restart.assert_called_once()
     proxy.put_archive.assert_called_once()
-    proxy.exec_run.assert_called_once()
+    probe, install = proxy.exec_run.call_args_list
+    assert probe.args[0][0] == "python3"
+    assert install.args[0][:2] == ["sh", "-c"]
 
 
 def test_provision_raises_session_unavailable_when_restart_fails(monkeypatch):
