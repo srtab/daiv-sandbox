@@ -357,13 +357,7 @@ def test_restarted_proxy_accepts_connections_once_its_ip_is_returned(docker_clie
         combined, _ = _self_signed_ca()
         net = mgr.create_network(token)
         proxy = mgr.start_proxy(token, net, ca_pem=combined)
-        mgr.provision(
-            token,
-            json.dumps({
-                "policy": {"default": "deny", "intercept": "credentialed", "rules": []},
-                "secrets": {},
-            }).encode(),
-        )
+        mgr.provision(token, _policy_allowing("example.com"))
         sandbox = docker_client.containers.run("curlimages/curl:latest", command="sleep 60", detach=True, network=net)
         proxy.stop(timeout=settings.STOP_TIMEOUT_SECONDS)
 

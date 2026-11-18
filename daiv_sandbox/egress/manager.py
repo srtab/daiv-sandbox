@@ -45,18 +45,13 @@ def _next_install_stamp_ns() -> int:
 
 LOOPBACK_HOSTS = "localhost,127.0.0.1,::1"
 
-# Runs in the sidecar (Python 3.13): exits 0 once the proxy port accepts, 1 at the deadline.
 _LISTEN_PROBE = """
 import socket, sys, time
 port, deadline = int(sys.argv[1]), time.monotonic() + float(sys.argv[2])
-while True:
-    try:
-        socket.create_connection(("127.0.0.1", port), timeout=1).close()
-        sys.exit(0)
-    except OSError:
-        if time.monotonic() >= deadline:
-            sys.exit(1)
-        time.sleep(0.1)
+while socket.socket().connect_ex(("127.0.0.1", port)):
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    time.sleep(0.1)
 """
 
 
@@ -187,9 +182,6 @@ class EgressProxyManager:
         ``resume`` is gated on the proxy actually being down, which keeps it off the hot path: a running
         proxy proves its network still exists, so there is nothing to rebuild. A stopped one may have
         been suspended, and the restart below would fail with "network <id> not found" without it.
-
-        A restarted proxy is returned only once it accepts connections (``_wait_until_listening``): the
-        container runs well before mitmdump listens, and the caller's next command goes straight to it.
         """
         try:
             proxy = self._proxy(token)
@@ -206,7 +198,8 @@ class EgressProxyManager:
 
     @staticmethod
     def _wait_until_listening(proxy: Container, token: str) -> None:
-        """Block until the proxy accepts connections on its port, or raise a retryable SessionUnavailableError.
+        """Block until a restarted proxy accepts connections (the container runs well before mitmdump
+        listens), or raise a retryable SessionUnavailableError.
 
         The probe runs inside the sidecar against its own loopback: the service is not necessarily on a
         network that reaches the proxy, but it can always exec into it."""
