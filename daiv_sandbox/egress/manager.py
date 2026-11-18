@@ -45,6 +45,15 @@ def _next_install_stamp_ns() -> int:
 
 LOOPBACK_HOSTS = "localhost,127.0.0.1,::1"
 
+_LISTEN_PROBE = """
+import socket, sys, time
+port, deadline = int(sys.argv[1]), time.monotonic() + float(sys.argv[2])
+while socket.socket().connect_ex(("127.0.0.1", port)):
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    time.sleep(0.1)
+"""
+
 
 def exec_proxy_env(proxy_ip: str, port: int) -> dict[str, str]:
     """Env injected into sandbox execs so clients route through the proxy and trust the CA bundle."""
@@ -182,9 +191,22 @@ class EgressProxyManager:
                 self.resume(token)
                 proxy.restart()
                 proxy.reload()  # restart() does not refresh attrs; reload() surfaces the fresh IP/state
+                self._wait_until_listening(proxy, token)
         except APIError as exc:
             raise SessionUnavailableError(token, f"egress proxy unavailable ({exc})") from exc
         return proxy
+
+    @staticmethod
+    def _wait_until_listening(proxy: Container, token: str) -> None:
+        """Block until a restarted proxy accepts connections (the container runs well before mitmdump
+        listens), or raise a retryable SessionUnavailableError.
+
+        The probe runs inside the sidecar against its own loopback: the service is not necessarily on a
+        network that reaches the proxy, but it can always exec into it."""
+        port, timeout = settings.EGRESS_PROXY_PORT, settings.EGRESS_PROXY_START_TIMEOUT_SECONDS
+        result = proxy.exec_run(["python3", "-c", _LISTEN_PROBE, str(port), str(timeout)])
+        if result.exit_code != 0:
+            raise SessionUnavailableError(token, f"resumed: egress proxy not listening on port {port} after {timeout}s")
 
     def proxy_internal_ip(self, token: str) -> str:
         """Resolve the proxy's IP on the session's internal network, warm-restarting it if stopped.

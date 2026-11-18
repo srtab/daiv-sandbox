@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 from docker.errors import APIError, ImageNotFound, NotFound
 
+from daiv_sandbox.config import settings
 from daiv_sandbox.egress.manager import EgressProxyManager, exec_proxy_env
 from daiv_sandbox.sessions import EGRESS_SESSION_LABEL, TYPE_EGRESS_NETWORK, TYPE_EGRESS_PROXY, SessionUnavailableError
 
@@ -448,6 +449,7 @@ def test_proxy_internal_ip_restarts_stopped_proxy_and_reresolves(monkeypatch):
     mgr = EgressProxyManager(Mock())
     proxy = _proxy_with_ip("")  # stopped: Docker releases the endpoint IP
     proxy.status = "exited"
+    proxy.exec_run.return_value = Mock(exit_code=0, output=b"")  # listening once restarted
 
     def _reload():
         # docker-py refreshes .attrs on reload(), not on restart(): the fresh endpoint IP only appears
@@ -497,11 +499,7 @@ def test_ensure_proxy_running_restarts_stopped_proxy(monkeypatch):
     """A warm-stopped session's sidecar (stopped by a non-force close, or an OOM / daemon restart) is
     warm-restarted on access so a caller that needs it running — provision on an egress refresh —
     self-heals instead of failing. Same restart-on-access as proxy_internal_ip."""
-    mgr = EgressProxyManager(Mock())
-    proxy = Mock()
-    proxy.status = "exited"
-    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
-    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
+    mgr, proxy = _provision_ready_mgr(monkeypatch, status="exited")
 
     assert mgr.ensure_proxy_running("tok123") is proxy
     proxy.restart.assert_called_once()
@@ -511,11 +509,8 @@ def test_ensure_proxy_running_restarts_stopped_proxy(monkeypatch):
 def test_ensure_proxy_running_rebuilds_the_network_before_restarting(monkeypatch):
     """The sidecar of a suspended session has no network to come back to, so resume must run BEFORE the
     restart — reversed, the restart fails with "network <id> not found" and the session is stuck."""
-    mgr = EgressProxyManager(Mock())
-    proxy = Mock()
-    proxy.status = "exited"
+    mgr, proxy = _provision_ready_mgr(monkeypatch, status="exited")
     calls = []
-    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
     monkeypatch.setattr(mgr, "resume", lambda token: calls.append("resume"))
     proxy.restart.side_effect = lambda: calls.append("restart")
 
@@ -540,15 +535,13 @@ def test_ensure_proxy_running_skips_the_rebuild_for_a_running_proxy(monkeypatch)
 
 
 def test_ensure_proxy_running_leaves_running_proxy_untouched(monkeypatch):
-    """A proxy already running is returned without a needless restart."""
-    mgr = EgressProxyManager(Mock())
-    proxy = Mock()
-    proxy.status = "running"
-    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
-    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
+    """A proxy already running is returned without a needless restart or readiness probe: every exec
+    resolves the proxy, so a probe here would add a Docker exec to each command."""
+    mgr, proxy = _provision_ready_mgr(monkeypatch)
 
     assert mgr.ensure_proxy_running("tok123") is proxy
     proxy.restart.assert_not_called()
+    proxy.exec_run.assert_not_called()
 
 
 def test_ensure_proxy_running_raises_session_unavailable_when_restart_fails(monkeypatch):
@@ -561,6 +554,32 @@ def test_ensure_proxy_running_raises_session_unavailable_when_restart_fails(monk
     monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
 
     with pytest.raises(SessionUnavailableError):
+        mgr.ensure_proxy_running("tok123")
+
+
+def test_ensure_proxy_running_waits_for_the_restarted_proxy_to_listen(monkeypatch):
+    """A restarted sidecar is running long before mitmdump listens. Returning straight after restart() hands
+    callers a proxy that refuses connections, so a resumed session's first command (DAIV's `git fetch`)
+    failed with "Couldn't connect to server". The probe must run after the restart, against the proxy port."""
+    mgr, proxy = _provision_ready_mgr(monkeypatch, status="exited")
+    calls = []
+    proxy.restart.side_effect = lambda: calls.append("restart")
+    proxy.exec_run.side_effect = lambda *a, **kw: calls.append("probe") or Mock(exit_code=0, output=b"")
+
+    assert mgr.ensure_proxy_running("tok123") is proxy
+
+    assert calls == ["restart", "probe"]
+    port, timeout = settings.EGRESS_PROXY_PORT, settings.EGRESS_PROXY_START_TIMEOUT_SECONDS
+    assert proxy.exec_run.call_args.args[0][-2:] == [str(port), str(timeout)]
+
+
+def test_ensure_proxy_running_raises_session_unavailable_when_proxy_never_listens(monkeypatch):
+    """A sidecar that does not listen within the timeout is a retryable 503, not a proxy handed to a caller
+    whose command then fails on a refused connection."""
+    mgr, proxy = _provision_ready_mgr(monkeypatch, status="exited")
+    proxy.exec_run.return_value = Mock(exit_code=1, output=b"")
+
+    with pytest.raises(SessionUnavailableError, match="not listening"):
         mgr.ensure_proxy_running("tok123")
 
 
@@ -626,19 +645,13 @@ def test_provision_warm_restarts_stopped_proxy_then_writes(monkeypatch):
     """A warm-stopped proxy (the normal warm-reuse state, since a non-force close stops it) is
     warm-restarted by provision and then written — provision no longer 503s on a merely-stopped proxy,
     so an egress refresh on a resumed session succeeds instead of forcing a session recreate."""
-    mgr = EgressProxyManager(Mock())
-    proxy = Mock()
-    proxy.status = "exited"
-    proxy.put_archive.return_value = True
-    proxy.exec_run.return_value = Mock(exit_code=0, output=b"")
-    monkeypatch.setattr(mgr, "_proxy", lambda token: proxy)
-    monkeypatch.setattr(mgr, "resume", lambda token: None)  # network rebuild covered by its own tests
+    mgr, proxy = _provision_ready_mgr(monkeypatch, status="exited")
 
     mgr.provision("tok123", b"{}")
 
     proxy.restart.assert_called_once()
     proxy.put_archive.assert_called_once()
-    proxy.exec_run.assert_called_once()
+    assert proxy.exec_run.call_args.args[0][:2] == ["sh", "-c"]
 
 
 def test_provision_raises_session_unavailable_when_restart_fails(monkeypatch):

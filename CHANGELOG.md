@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A resumed session's first command could fail with `Couldn't connect to server`: a warm-stopped egress sidecar was restarted and its address handed out before the proxy was listening. The restart now waits until the proxy accepts connections, for up to `DAIV_SANDBOX_EGRESS_PROXY_START_TIMEOUT_SECONDS` (new, default `20`).
+
 ## [0.6.0] - 2026-11-17
 
 ### Added
