@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Every browser start failed with `503 browser image unavailable` once the browser image was removed from the host (for example by `docker system prune --all`), while `GET /-/capabilities/` kept reporting `{"browser": true}`. A start that finds the image missing now pulls it, and a failed pull is logged.
 - A resumed session's first command could fail with `Couldn't connect to server`: a warm-stopped egress sidecar was restarted and its address handed out before the proxy was listening. The restart now waits until the proxy accepts connections, for up to `DAIV_SANDBOX_EGRESS_PROXY_START_TIMEOUT_SECONDS` (new, default `20`).
 
 ## [0.6.0] - 2026-11-17
