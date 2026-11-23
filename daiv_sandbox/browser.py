@@ -307,7 +307,6 @@ class BrowserManager:
         return container
 
     def _pull_image(self, image: str) -> None:
-        """Pull an image that was present at startup and has since been removed from the host."""
         logger.warning("Browser: image %s is no longer present; pulling it", image)
         try:
             self.client.images.pull(image)

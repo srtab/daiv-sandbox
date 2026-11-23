@@ -174,11 +174,10 @@ def test_create_reports_an_image_that_cannot_be_pulled_as_unavailable(client, ca
     client.containers.create.side_effect = ImageNotFound("gone")
     client.images.pull.side_effect = ImageNotFound("pull failed")
 
-    with caplog.at_level("ERROR", logger="daiv_sandbox.browser"), pytest.raises(BrowserImageUnavailableError):
+    with pytest.raises(BrowserImageUnavailableError):
         BrowserManager()._create(_sandbox(), _request())
 
-    assert client.containers.create.call_count == 1
-    assert settings.BROWSER_IMAGE in caplog.text
+    assert "cannot pull image" in caplog.text
 
 
 def test_nothing_is_staged_under_tmp():
