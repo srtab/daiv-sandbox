@@ -300,10 +300,20 @@ class BrowserManager:
             kwargs["network_mode"] = "none"
         try:
             container = self.client.containers.create(**kwargs)
-        except ImageNotFound as exc:
-            raise BrowserImageUnavailableError(f"browser image {settings.BROWSER_IMAGE} is not available") from exc
+        except ImageNotFound:
+            self._pull_image(settings.BROWSER_IMAGE)
+            container = self.client.containers.create(**kwargs)
         logger.info("Browser: created container %s for session %s", container.short_id, sandbox.id)
         return container
+
+    def _pull_image(self, image: str) -> None:
+        logger.warning("Browser: image %s is no longer present; pulling it", image)
+        try:
+            self.client.images.pull(image)
+        except APIError as exc:
+            logger.error("Browser: cannot pull image %s: %s", image, exc)
+            raise BrowserImageUnavailableError(f"browser image {image} is not available") from exc
+        logger.info("Browser: pulled image %s", image)
 
     def _apply_limits(self, browser: Container, request: BrowserStartRequest) -> None:
         host_config = browser.attrs.get("HostConfig", {})

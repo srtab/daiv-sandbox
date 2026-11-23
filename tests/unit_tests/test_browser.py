@@ -162,10 +162,22 @@ def test_create_joins_the_sessions_egress_network(client):
     assert "network_mode" not in kwargs
 
 
-def test_create_reports_a_missing_image_as_unavailable(client):
+def test_create_pulls_an_image_that_went_missing_and_creates_the_browser(client):
+    browser = FakeContainer("b" * 64, status="created")
+    client.containers.create.side_effect = [ImageNotFound("gone"), browser]
+
+    assert BrowserManager()._create(_sandbox(), _request()) is browser
+    client.images.pull.assert_called_once_with(settings.BROWSER_IMAGE)
+
+
+def test_create_reports_an_image_that_cannot_be_pulled_as_unavailable(client, caplog):
     client.containers.create.side_effect = ImageNotFound("gone")
+    client.images.pull.side_effect = ImageNotFound("pull failed")
+
     with pytest.raises(BrowserImageUnavailableError):
         BrowserManager()._create(_sandbox(), _request())
+
+    assert "cannot pull image" in caplog.text
 
 
 def test_nothing_is_staged_under_tmp():
